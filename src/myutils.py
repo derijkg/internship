@@ -4,6 +4,7 @@ from collections import Counter
 import logging
 import random
 import requests
+from requests import Session
 import time
 
 # ==============================================================================
@@ -157,12 +158,14 @@ def dict_dupes(list_of_dicts, keys):
 # ==============================================================================
 
 def timed_request(
-    url,
-    delay=None,
-    timeout = 10,
-    headers = None,
+    url: str,
+    session: Session | None = None,
+    method: str ='GET',
+    delay: float | None = None,
+    timeout: int = 10,
+    headers: dict | None = None,
     **kwargs
-    ):
+):
     """Makes a robust, timed HTTP request with error handling.
 
     :param url: The URL to send the request to.
@@ -176,30 +179,43 @@ def timed_request(
     :type timeout: int, optional
     :param headers: A dictionary of HTTP headers. If None, default headers are used.
     :type headers: dict, optional
-    :param ``**kwargs``: Additional keyword arguments to pass to `requests.request`,
+    :param **kwargs: Additional keyword arguments to pass to `requests.request`,
                     such as `json`, `data`, or `params`.
     :return: The `requests.Response` object on a successful request (status 2xx),
             otherwise None.
     :rtype: requests.Response or None
     """
-    if delay is None: delay=random.uniform(1.5,4.5)
-    if headers is None:
-        headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-        }
-    if 'headers' in kwargs: headers.update(kwargs.pop('headers'))
 
+    # delay
+    if delay is None:
+        delay = random.uniform(1.5, 4.5)
     time.sleep(delay)
+
+    # headers
+    request_headers = headers
+    if headers is None and session is None:
+        request_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        }
+
+    # request
+    requester = session if session else requests
     try:
-        response = requests.get(url, timeout=timeout, headers=headers, **kwargs)
+        response = requester.request(
+            method=method, 
+            url=url, 
+            timeout=timeout, 
+            headers=request_headers, 
+            **kwargs
+        )
         response.raise_for_status()
         return response
-    except requests.exceptions.HTTPError as e: 
-        print(e)
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error: {e.response.status_code} for URL {url}. Full error: {e}")
         return None
-    except requests.exceptions.RequestException as e: 
-        print(e)
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed for URL {url}. Error: {e}")
         return None

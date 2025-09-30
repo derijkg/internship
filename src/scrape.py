@@ -6,8 +6,7 @@ import zipfile
 from pathlib import Path
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-# Assuming myutils.py contains sanitize_filename and timed_request
-from .myutils import sanitize_filename, timed_request
+from .myutils import sanitize_filename_new, timed_request
 
 class BaseScraper:
     """A base class for scraping theses from different sources.
@@ -24,19 +23,14 @@ class BaseScraper:
     """
     def __init__(self, source_name: str, base_folder: str = "data"):
         self.source_name = source_name
-        self.folder = Path(base_folder) / self.source_name
-        self.csv_path = self.folder / "metadata.csv"
-        self.zip_path = self.folder / f"{self.source_name}_archive.zip"
+        base_folder = Path(base_folder)
+        self.csv_path = base_folder / "metadata.csv"
+        self.zip_path = base_folder / "archive.zip"
         self.df = self._load_state()
-        
-        ## ADDED: A configurable batch size for saving metadata.
-        # This determines how many items are scraped before progress is saved to the CSV.
         self.metadata_save_batch_size = 100
 
-        # Ensure directories exist
-        self.folder.mkdir(parents=True, exist_ok=True)
 
-    def _load_state(self):
+    def _load_state(self, force=False):
         """Loads the existing metadata CSV into a pandas DataFrame.
 
         If the CSV file specified by `self.csv_path` exists, it is loaded.
@@ -44,15 +38,18 @@ class BaseScraper:
 
         :return: A pandas DataFrame containing the loaded or initial state.
         """
-        if self.csv_path.exists():
+        if self.csv_path.exists() and not force:
             print(f"Found existing data at {self.csv_path}. Loading state.")
             return pd.read_csv(self.csv_path)
         else:
-            print("No existing data found. Starting fresh.")
-            return pd.DataFrame(columns=['id','title','first_name','last_name','college','year','promotors','themes','keywords','text_homepage','page_link','download_link'])
+            if not force:
+                print("No existing data found. Starting fresh.")
+            if force:
+                print("Forcing creation of new dataframe.")
+            return pd.DataFrame(columns=['id','title','first_name','last_name','college','year','promoter','themes','keywords','text_homepage','page_link','download_link', 'downloaded','source'])
 
 
-    def _scrape_all_item_urls(self) -> None:
+    def _scrape_all_item_urls(self) -> None:                                    # specific
         """[Abstract Method] Scrapes the source for all individual item URLs.
 
         Subclasses must implement this method to find all relevant item pages
@@ -63,7 +60,7 @@ class BaseScraper:
         raise NotImplementedError("Subclasses must implement _scrape_all_item_urls")
 
 
-    def _scrape_item_metadata(self, url: str) -> dict | None:
+    def _scrape_item_metadata(self, url: str) -> dict | None:                   # specific
         """[Abstract Method] Scrapes metadata from a single item page.
 
         Subclasses must implement this method to extract metadata (like title,
@@ -138,19 +135,22 @@ class BaseScraper:
             new_urls_count = len(self.df) - initial_count
 
             if new_urls_count > 0:
-                print(f"  -> Added {new_urls_count} new URLs to the dataframe.")
+                print(f"  -> Added {new_urls_count} new items to the dataframe.")
                 self.df.to_csv(self.csv_path, index=False)
                 print(f"  -> State saved to {self.csv_path}")
+                print(f'Turning on gather_metadata since new urls have been found.')
+                gather_metadata=True
             else:
-                print("  -> No new URLs found.")
+                print("  -> No new items found.")
         else:
             print("Skipping Step 1: URL gathering.")
 
         # 2. Scrape metadata for items that are missing it
         if gather_metadata:
             print("\nStep 2: Scraping metadata for items missing it...")
-
-            rows_to_scrape = self.df[self.df['title'].isna() & self.df['page_link'].notna()]
+            essential_cols = ['title','last_name','college','year','keywords','promoter']
+            is_missing_metadata = self.df[essential_cols].isna().any(axis=1)
+            rows_to_scrape = self.df[is_missing_metadata & self.df['page_link'].notna()]
 
             if rows_to_scrape.empty:
                 print("  -> No items require metadata scraping.")
@@ -166,6 +166,8 @@ class BaseScraper:
                     print(f"\nSaving batch of {len(batch)} metadata entries...")
                     update_df = pd.DataFrame(batch).set_index('original_index')
                     self.df.update(update_df)
+                    if 'year' in self.df.columns:
+                        self.df['year'] = self.df['year'].astype('Int64')
                     self.df.to_csv(self.csv_path, index=False)
                     print(f"  -> Progress saved to {self.csv_path}")
 
@@ -196,15 +198,16 @@ class BaseScraper:
                 with zipfile.ZipFile(self.zip_path, 'r') as zipf:
                     existing_zip_files = set(Path(f).stem for f in zipf.namelist())
 
-            to_download = self.df[self.df['download_link'].notna()]
+            to_download = self.df[self.df['download_link'].notna() & (self.df['downloaded'] != True)]
             
             if to_download.empty:
                 print("  -> No files to download.")
             else:
                 success_count = 0
-                for _, row in tqdm(to_download.iterrows(), total=len(to_download), desc="Downloading Files"):
-                    base_filename = f"{row.get('year', 'NA')} - {row.get('last_name', 'NoName')} - {row.get('title', 'NoTitle')}"
-                    safe_filename = sanitize_filename(base_filename)
+                downloaded_this_batch = 0
+                for index, row in tqdm(to_download.iterrows(), total=len(to_download), desc="Downloading Files"):
+                    base_filename = f"{row.get('id', 'NA')}"
+                    safe_filename = sanitize_filename_new(base_filename)
 
                     if safe_filename in existing_zip_files:
                         continue
@@ -212,8 +215,21 @@ class BaseScraper:
                     if self._download_file(row['download_link'], safe_filename):
                         success_count += 1
                         existing_zip_files.add(safe_filename)
+                        self.df.loc[index, 'downloaded'] = True
+                    else:
+                        self.df.loc[index, 'downloaded'] = False
+                    if downloaded_this_batch >= 50:
+                        print(f'\nSaving download progress for {downloaded_this_batch} items to {self.csv_path}...')
+                        self.df.to_csv(self.csv_path, index=False)
+                        downloaded_this_batch = 0
+                if downloaded_this_batch > 0:
+                    print(f'\nSaving final batch of {downloaded_this_batch} item to {self.csv_path}')
+                    self.df.to_csv(self.csv_path, index=False)
+
                 
                 print(f"  -> Downloaded {success_count} new files.")
+                self.df.to_csv(self.csv_path, index=False)
+                print(f' -> state updated and saved to {self.csv_path}')
         else:
             print('Skipping Step 3: File downloading.')
 
@@ -237,6 +253,13 @@ class ScriptiebankScraper(BaseScraper):
         regex patterns specific to the Scriptiebank website structure.
         """
         super().__init__(source_name="scriptiebank")
+        # inherits:
+        #self.source_name = source_name
+        #self.csv_path = base_folder / "metadata.csv"
+        #self.zip_path = base_folder / "archive.zip"
+        #self.df = self._load_state()
+        #self.metadata_save_batch_size = 100
+
         self.base_url = 'https://scriptiebank.be'
         self.url_template = 'https://scriptiebank.be/?page={page_num}'
         self.thesis_url_pattern = re.compile(r"https://scriptiebank\.be/scriptie/\d{4}/[a-zA-Z0-9_:-]+")
@@ -280,6 +303,11 @@ class ScriptiebankScraper(BaseScraper):
 
         if new_urls:
             new_df = pd.DataFrame(new_urls, columns=['page_link'])
+            new_df['source'] = self.source_name
+            last_id = -1
+            if not self.df.empty and 'id' in self.df.columns and self.df['id'].notna().any():
+                last_id = self.df['id'].max()
+            new_df['id'] = range(int(last_id)+1, int(last_id)+1+len(new_df))
             self.df = pd.concat([self.df, new_df], ignore_index=True)
     
     def _scrape_item_metadata(self, url: str) -> dict | None:
@@ -294,6 +322,9 @@ class ScriptiebankScraper(BaseScraper):
         response = timed_request(url)
         if not response:
             return None
+        
+        def _get_text_safe(element):
+            return element.text.strip() if element else None
 
         try:
             soup = BeautifulSoup(response.text, "html.parser")
@@ -305,13 +336,25 @@ class ScriptiebankScraper(BaseScraper):
                 return cont.get_text(strip=True)
 
             download_match = self.download_pattern.search(response.text)
-            
+
+            promoter_container = soup.select_one('div.thesis__promotors')
+            if promoter_container:
+                label_div = promoter_container.find('div', class_='field-label-above')
+                if label_div:
+                    label_div.decompose()
+                raw_names_string = promoter_container.get_text(strip=True)            
+                if raw_names_string:
+                    promoters_list = [name.strip() for name in raw_names_string.split(',')]
             metadata = {
-                "title": soup.find("h1").text.strip(),
-                "first_name": soup.find("div", class_="thesis__first-name").text.strip(),
-                "last_name": soup.find("div", class_="thesis__last-name").text.strip(),
+                "title": _get_text_safe(soup.find("h1")),
+                "first_name": _get_text_safe(soup.find("div", class_="thesis__first-name")),
+                "last_name": _get_text_safe(soup.find("div", class_="thesis__last-name")),
                 "college": label_decompose(soup.find("div", class_="thesis__college")),
-                "year": label_decompose(soup.find("div", class_="thesis__year")),
+                "year": int(label_decompose(soup.find("div", class_="thesis__year"))),
+                'promoter': promoters_list,
+                'themes': [theme.get_text() for theme in soup.select('div.thesis__themes--item a')],
+                'keywords':[keyword.get_text() for keyword in soup.select('div.thesis__keywords--item a')],
+                'text_homepage':[text for tag in soup.select('div.thesis__text p, div.thesis_text h3') if (text:=tag.get_text(strip=True))],
                 "page_link": url,
                 "download_link": self.base_url + download_match.group(0) if download_match else None
             }
@@ -320,6 +363,100 @@ class ScriptiebankScraper(BaseScraper):
             print(f"  -> ERROR parsing metadata for {url}: {e}")
             return None
 
+class BiblioScraper(BaseScraper):
+    """
+    A scraper for theses from the Ghent University Academic Bibliography API.
+    This scraper is designed to be more efficient by fetching all metadata
+    from a single API endpoint rather than scraping individual HTML pages.
+    """
+    def __init__(self):
+        super().__init__(source_name="biblio_ugent")
+        self.api_url = "https://biblio.ugent.be/publication"
+        self.query = 'type=dissertation AND accesslevel="info:eu-repo/semantics/openAccess"'
+
+    def _scrape_all_item_urls(self) -> None:
+        """
+        Fetches all open access dissertation records from the Biblio API
+        and populates the DataFrame with their full metadata at once.
+        This overrides the typical "URL gathering" step with a more direct
+        and efficient data retrieval method.
+        """
+
+        print(f"Requesting all records from Biblio API...")
+        params = {'q': self.query, 'format': 'json', 'n': 10000} # n=10000 is the max limit
+        response = timed_request(self.api_url, params=params)
+        
+        if not response:
+            print("  -> Failed to get a response from the Biblio API.")
+            return
+
+        try:
+            data = response.json()
+        except requests.exceptions.JSONDecodeError:
+            print("  -> Failed to decode JSON from the Biblio API response.")
+            return
+        
+        print(f"  -> API returned {len(data)} records.")
+        print(data)
+        processed_records = []
+        for item in tqdm(data, desc="Processing API records"):
+            # --- Extract Author ---
+            author = item.get('author', [{}])[0]
+            first_name = author.get('first_name')
+            last_name = author.get('last_name')
+
+            # --- Extract Promoter(s) ---
+            promoters_list = [f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+                              for p in item.get('promoter', [])]
+            
+            # --- Extract Download Link ---
+            download_link = None
+            for file_info in item.get('file', []):
+                if file_info.get('kind') == 'fullText' and file_info.get('access') == 'open':
+                    download_link = file_info.get('url')
+                    break # Take the first available open access full text file
+
+            # --- Assemble Metadata ---
+            record = {
+                'id': item.get('_id'),
+                'title': item.get('title'),
+                'first_name': first_name,
+                'last_name': last_name,
+                'college': None,  # Not consistently available in this API endpoint
+                'year': item.get('year'),
+                'promoters': ", ".join(promoters_list) if promoters_list else None,
+                'page_link': f"https://biblio.ugent.be/publication/{item.get('_id')}",
+                'download_link': download_link
+            }
+            processed_records.append(record)
+
+        if not processed_records:
+            print("  -> No new records to add.")
+            return
+
+        # Create a DataFrame from the new records
+        new_df = pd.DataFrame(processed_records)
+
+        # Merge with existing data, avoiding duplicates
+        if not self.df.empty and 'id' in self.df.columns:
+            # Filter out records that are already in the dataframe
+            existing_ids = set(self.df['id'].dropna())
+            new_df = new_df[~new_df['id'].isin(existing_ids)]
+
+        if not new_df.empty:
+            self.df = pd.concat([self.df, new_df], ignore_index=True)
+
+
+    def _scrape_item_metadata(self, url: str) -> dict | None:
+        """
+        This method is not needed for the BiblioScraper because all metadata
+        is retrieved in a single batch from the API in _scrape_all_item_urls.
+        It is implemented to satisfy the abstract base class requirement.
+        """
+        return None
+    
+
+# deprecated
 class GentScraper(BaseScraper):
     """A scraper for theses from the Ghent University Library (lib.ugent.be).
 
