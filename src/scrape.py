@@ -198,18 +198,23 @@ class BaseScraper:
                 with zipfile.ZipFile(self.zip_path, 'r') as zipf:
                     existing_zip_files = set(Path(f).stem for f in zipf.namelist())
 
-            to_download = self.df[self.df['download_link'].notna() & (self.df['downloaded'] != True)]
-            
+            mask = (self.df['download_link'].notna()) & (self.df['downloaded'] != True)
+            to_download = self.df[mask].index
+    
             if to_download.empty:
                 print("  -> No files to download.")
             else:
+                print(f"  -> Found {len(to_download)} items to download.")
                 success_count = 0
                 downloaded_this_batch = 0
-                for index, row in tqdm(to_download.iterrows(), total=len(to_download), desc="Downloading Files"):
+                for index in tqdm(to_download, total=len(to_download), desc="Downloading Files"):
+                    row = self.df.loc[index]
                     base_filename = f"{row.get('id', 'NA')}"
                     safe_filename = sanitize_filename_new(base_filename)
 
                     if safe_filename in existing_zip_files:
+                        self.df.loc[index,'downloaded'] = True
+                        success_count += 1
                         continue
 
                     if self._download_file(row['download_link'], safe_filename):
@@ -218,6 +223,9 @@ class BaseScraper:
                         self.df.loc[index, 'downloaded'] = True
                     else:
                         self.df.loc[index, 'downloaded'] = False
+
+                    downloaded_this_batch += 1
+
                     if downloaded_this_batch >= 50:
                         print(f'\nSaving download progress for {downloaded_this_batch} items to {self.csv_path}...')
                         self.df.to_csv(self.csv_path, index=False)

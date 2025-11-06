@@ -1,3 +1,5 @@
+
+'''
 import os
 import requests
 import json
@@ -5,9 +7,11 @@ from tqdm import tqdm
 import xml.etree.ElementTree as ET
 
 # --- Configuration ---
-GROBID_URL = "http://localhost:8070/api/processFulltextDocument"
-ROOT_DATA_DIR = 'data'
-OUTPUT_FILE = 'academic_dataset_by_chapter.jsonl' # New output file name
+#GROBID_URL = "http://localhost:8070/api/processFulltextDocument"
+#ROOT_DATA_DIR = 'data'
+#OUTPUT_FILE = 'academic_dataset_by_chapter.jsonl' # New output file name
+
+
 
 def parse_xml_grobid(xml_content):
     """
@@ -116,7 +120,6 @@ def parse_pdf_grobid(root_dir, output_path):
 
     print(f"\nProcessing complete. Dataset appended to {output_path}")
 
-# --- Run the Script ---
 if __name__ == '__main__':
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
@@ -124,3 +127,129 @@ if __name__ == '__main__':
 
     # Make sure your GROBID Docker container is running!
     parse_pdf_grobid(ROOT_DATA_DIR, OUTPUT_FILE)
+'''
+
+''' using pypdfium2 to transform pdf to bitmap and nougat small to extract text and layout into markdown'''
+# if it goes wrong:
+# increase scale (resolution of bitmap)
+# use bigger model (nougat-base) or other model like microsoft/layoutlmv3-base
+# use batch processing: rewrite extract_text_from_images (batch_size = 4)
+
+
+import pypdfium2 as pdfium
+from PIL import Image
+from transformers import NougatProcessor, VisionEncoderDecoderModel
+import torch
+import re
+from pathlib import Path
+
+# --- Part 1: PDF to Image Conversion ---
+def convert_pdf_to_images(pdf_path):
+    """Converts each page of a PDF into a PIL Image."""
+    images = []
+    pdf = pdfium.PdfDocument(pdf_path)
+    for i in range(len(pdf)):
+        page = pdf.get_page(i)
+        bitmap = page.render(scale=2) #scale 3 or higher for better resolution
+        pil_image = bitmap.to_pil()
+        images.append(pil_image)
+    return images
+
+# --- Part 2: Model Inference (Image to Markdown) ---
+print("Loading Nougat model and processor...")
+processor = NougatProcessor.from_pretrained("facebook/nougat-small", use_fast=True)
+model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-small")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+print(f"Using device: {device}")
+
+# batch processing
+'''def extract_text_from_images(images, batch_size=4): # Added batch_size parameter
+    """Uses Nougat to extract structured text (Markdown) from a list of images."""
+    all_markdown = ""
+    # Process images in batches
+    for i in range(0, len(images), batch_size):
+        batch_images = images[i : i + batch_size]
+        print(f"Processing pages {i+1}-{i+len(batch_images)}/{len(images)}...")
+
+        # The processor can handle a list of images directly
+        pixel_values = processor(batch_images, return_tensors="pt").pixel_values
+        
+        normalized_pixel_values = pixel_values.to(torch.float32) / 255.0
+
+        outputs = model.generate(
+            normalized_pixel_values.to(device),
+            min_length=1,
+            max_new_tokens=3584,
+            bad_words_ids=[[processor.tokenizer.unk_token_id]],
+        )
+        
+        # Decode each sequence in the batch
+        sequences = processor.batch_decode(outputs, skip_special_tokens=True)
+        for sequence in sequences:
+            processed_sequence = processor.post_process_generation(sequence, fix_markdown=True)
+            all_markdown += processed_sequence + "\n"
+            
+    return all_markdown'''
+
+def extract_text_from_images(images):
+    """Uses Nougat to extract structured text (Markdown) from a list of images."""
+    all_markdown = ""
+    for i, image in enumerate(images):
+        print(f"Processing page {i+1}/{len(images)}...")
+        pixel_values = processor(image, return_tensors="pt").pixel_values
+        normalized_pixel_values = pixel_values.to(torch.float32)/255.0
+        outputs = model.generate(
+            normalized_pixel_values.to(device),
+            min_length=1,
+            max_new_tokens=3584,
+            bad_words_ids=[[processor.tokenizer.unk_token_id]],
+        )
+        sequence = processor.batch_decode(outputs, skip_special_tokens=True)[0]
+        sequence = processor.post_process_generation(sequence, fix_markdown=True)
+        all_markdown += sequence + "\n"
+    return all_markdown
+
+# --- Part 3: Parse Markdown to Extract Chapters ---
+def extract_chapters_from_markdown(markdown_text):
+    """Parses a markdown string to extract chapters based on Level 1 headings."""
+    chapters = {}
+    current_chapter_title = "Introduction"
+    chapter_heading_pattern = re.compile(r"^\s*#\s+(.*)", re.MULTILINE)
+    parts = chapter_heading_pattern.split(markdown_text)
+    
+    if parts:
+        intro_content = parts[0].strip()
+        if intro_content:
+            chapters[current_chapter_title] = intro_content
+    
+    for i in range(1, len(parts), 2):
+        title = parts[i].strip()
+        content = parts[i+1].strip()
+        chapters[title] = content
+        
+    return chapters
+
+
+if __name__ == '__main__':
+    path_pdf = Path('data/test/test_nl.pdf')
+    path_output = Path('data/test/output.md')
+    path_output.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Converting '{path_pdf}' to images...")
+    page_images = convert_pdf_to_images(path_pdf)
+    print("Extracting text with Nougat...")
+    full_markdown_content = extract_text_from_images(page_images)
+
+    with open(path_output, "w", encoding="utf-8") as f:
+        f.write(full_markdown_content)
+    print("\nFull markdown content saved to 'output.md'")
+    
+    print("Parsing markdown to extract chapters...")
+    extracted_chapters = extract_chapters_from_markdown(full_markdown_content)
+    
+    print("\n--- Extracted Chapters ---")
+    for title, content in extracted_chapters.items():
+        print(f"\n✅ CHAPTER: {title}")
+        print(content[:300] + "...")

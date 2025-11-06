@@ -1,5 +1,5 @@
 [project]
-name = "myutils_geert"
+name = "myutils_geran"
 version = "0.1.0"
 
 [tool.setuptools]
