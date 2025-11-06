@@ -7,27 +7,6 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-
-'''
-# On Debian/Ubuntu
-sudo apt-get update && sudo apt-get install pandoc
-
-# On RHEL/CentOS
-sudo yum install pandoc
-
-pip install --upgrade marker-pdf torch torchvision torchaudio tqdm
-'''
-# --- Helper Functions ---
-
-def check_system_dependency(name: str):
-    """Check if a command-line tool is available in the system's PATH."""
-    try:
-        subprocess.run([name, '--version'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print(f"Error: System dependency '{name}' not found.", file=sys.stderr)
-        print("Please install it using your system's package manager (e.g., 'sudo apt-get install pandoc').", file=sys.stderr)
-        sys.exit(1)
-
 def detect_gpus() -> int:
     """Detects the number of available NVIDIA GPUs using torch."""
     print("INFO: Detecting available GPUs...")
