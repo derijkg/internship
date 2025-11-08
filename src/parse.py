@@ -4,34 +4,42 @@ import zipfile
 import shutil
 import sys
 from pathlib import Path
+import torch
 
 # --- Configuration ---
-ZIP_FILE_PATH = Path("../data/archive.zip")
-OUTPUT_ZIP = Path("path/to/your/final_markdown_archive.zip")
+ZIP_FILE_PATH = Path("data/archive.zip")
+OUTPUT_ZIP = Path("data/output_md.zip")
 
-TEMP_MD = Path("../data/marker_output")
-TEMP_EXTRACTION_DIR = Path("temp_pdf_extraction")
+TEMP_MD = Path("data/temp/marker_output")
+TEMP_EXTRACTION_DIR = Path("data/temp/temp_pdf_extraction")
+
+LIMIT_FILES_TO = 5
+
+MARKER_CONFIG = {
+    
+}
 # ---------------------
 
-def zip_markdown_output(source_dir, zip_path):
+def zip_output_files(source_dir, zip_path):
     """
-    Finds all .md files in the source_dir and adds them to a zip archive.
+    Finds all .md and .json files in the source_dir and adds them to a zip archive.
 
     Args:
-        source_dir (str): The directory containing the markdown files.
-        zip_path (str): The path for the final output zip file.
+        source_dir (Path): The directory containing the output files.
+        zip_path (Path): The path for the final output zip file.
     """
     print(f"\nCreating zip archive at: {zip_path}")
     found_files = 0
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(source_dir):
-            for file in files:
-                if file.endswith(".md"):
-                    file_path = os.path.join(root, file)
-                    # The 'arcname' argument prevents storing the full directory structure.
-                    zipf.write(file_path, arcname=file)
-                    found_files += 1
-    print(f"Successfully added {found_files} markdown files to the zip archive.")
+        # Use pathlib's rglob for a cleaner way to find files
+        for file_path in source_dir.rglob("*.md"):
+            zipf.write(file_path, arcname=file_path.name)
+            found_files += 1
+        for file_path in source_dir.rglob("*.json"):
+            zipf.write(file_path, arcname=file_path.name)
+            found_files += 1
+            
+    print(f"Successfully added {found_files} markdown and json files to the zip archive.")
 
 
 def main():
@@ -54,16 +62,39 @@ def main():
     print("Setup complete. Directories are ready.")
 
     try:
-        # --- Step 2: Extract the ZIP File ---
-        print(f"Extracting PDFs from '{ZIP_FILE_PATH}' to '{TEMP_EXTRACTION_DIR}'...")
+        # --- Step 2: Extract a Subset or All of the PDF Files ---
+        print(f"Opening '{ZIP_FILE_PATH}' to find PDFs...")
         with zipfile.ZipFile(ZIP_FILE_PATH, 'r') as zip_ref:
-            zip_ref.extractall(TEMP_EXTRACTION_DIR)
+            # Get a list of all PDF files, ignoring other file types
+            pdf_files_in_zip = [f for f in zip_ref.namelist() if f.lower().endswith(".pdf")]
+
+            if LIMIT_FILES_TO and LIMIT_FILES_TO > 0:
+                print(f"LIMIT_FILES_TO is set to {LIMIT_FILES_TO}. Extracting a subset of files.")
+                files_to_extract = pdf_files_in_zip[:LIMIT_FILES_TO]
+            else:
+                print("Processing all PDF files in the archive.")
+                files_to_extract = pdf_files_in_zip
+
+            if not files_to_extract:
+                print("Error: No PDF files found in the zip archive.")
+                sys.exit(1)
+
+            print(f"Extracting {len(files_to_extract)} PDF(s) to '{TEMP_EXTRACTION_DIR}'...")
+            for pdf_file in files_to_extract:
+                zip_ref.extract(pdf_file, TEMP_EXTRACTION_DIR)
         print("Extraction complete.")
 
         # --- Step 3: Construct and Run the Marker Command ---
-        command = ["marker", TEMP_EXTRACTION_DIR, TEMP_MD]
+        command = [
+            "marker",
+            '--disable_image_extraction',
+            str(TEMP_EXTRACTION_DIR)
+        ]
+        
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "0"
+        env['TORCH_DEVICE'] = 'cuda'
+        env['OUTPUT_DIR'] = str(TEMP_MD)
 
         print("\nStarting Marker conversion...")
         print(f"Running command: {' '.join(command)}")
@@ -71,7 +102,7 @@ def main():
         print("\nMarker conversion successfully completed!")
 
         # --- Step 4: Zip the Markdown Results ---
-        zip_markdown_output(TEMP_MD, OUTPUT_ZIP)
+        zip_output_files(TEMP_MD, OUTPUT_ZIP)
 
     except FileNotFoundError:
         print("\nError: 'marker' command not found.")

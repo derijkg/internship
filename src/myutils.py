@@ -153,6 +153,258 @@ def dict_dupes(list_of_dicts, keys):
 
 
 
+#  DATAFRAMECLEANER
+import pandas as pd
+import numpy as np
+import re
+
+class DataFrameCleaner:
+    """
+    A class to encapsulate a pandas DataFrame and apply a series of
+    common cleaning operations.
+
+    Attributes:
+        df (pd.DataFrame): The DataFrame being cleaned.
+    """
+
+    def __init__(self, dataframe):
+        """
+        Initializes the cleaner with a DataFrame.
+
+        Args:
+            dataframe (pd.DataFrame): The DataFrame to be cleaned.
+                                      A copy is made to avoid side effects.
+        """
+        self.df = dataframe.copy()
+        print("DataFrameCleaner initialized. A copy of the original DataFrame has been made.")
+        
+        print('Setting display.max_rows to None')
+        pd.set_option('display.max_rows', None)
+
+        patterns = [
+                r'(?i)^nan$', #case insensitive nan
+                r'(?i)^(?:n\/?a|null|none|<none>|not reported|unknown|undefined|missing)$',
+                r'^(?:-+$|/+$)',
+                r'^\?+$',
+                r'^(?:-99|-9999|999|9999)$',
+            ]
+        self.na_placeholders = '|'.join(patterns)
+
+        self.summarize()
+
+    # --- 1. CHECKING METHODS (Inspect without modifying) ---
+
+    def summarize(self):
+        """Prints a summary of the DataFrame, including info and shape."""
+        print("\n--- DataFrame Summary ---")
+        print(f"Shape: {self.df.shape}")
+        self.check_duplicates()
+        self.check_missing_values()
+        print("\nInfo:")
+        self.df.info()
+        print('\nDescribe:')
+        print(self.df.describe())
+        print('\nRandom row:')
+        print(self.df.sample(n=1).T)
+        self.check_string_placeholders()
+        print("-------------------------\n")
+
+        return self
+
+    def check_missing_values(self):
+        """Prints a report of missing values per column (count and percentage)."""
+        missing_values = self.df.isna().sum()
+        missing_percent = ((missing_values / len(self.df)) * 100).round(2)
+        missing_df = pd.DataFrame({
+            'missing_count': missing_values,
+            'missing_percent': missing_percent
+        })
+        print("\n--- Missing Values Report ---")
+        print(missing_df[missing_df['missing_count'] > 0])
+        return self
+
+    def check_duplicates(self):
+        """Prints the number of duplicate rows found."""
+        num_duplicates = self.df.duplicated().sum()
+        print(f"\nFound {num_duplicates} duplicate rows.\n")
+        return self
+    
+    def check_string_placeholders(self, na_placeholders=None):
+        """
+        Checks object/string columns for common string placeholders for NA values
+        and prints a report of what it finds.
+        
+        Args:
+            na_placeholders (list, optional): A custom list of strings to check for.
+                                              Defaults to a comprehensive internal list.
+        """
+        print("\n--- Checking for String Placeholders ---")
+        if na_placeholders is None:
+            na_placeholders = self.na_placeholders
+
+        found_placeholders = {}
+        string_cols = self.df.select_dtypes(include=['object', 'string']).columns
+
+        for col in string_cols:
+            matching_mask = self.df[col].astype(str).str.match(na_placeholders, na=False)
+            if matching_mask.any():
+                # Get the value counts of only the matching placeholders
+                counts = self.df[col][matching_mask].value_counts()
+                if not counts.empty:
+                    found_placeholders[col] = counts
+
+        # Report the findings
+        if not found_placeholders:
+            print("No common string NA placeholders found in object/string columns.")
+        else:
+            print("Found the following string placeholders:")
+            for col, counts in found_placeholders.items():
+                print(f"\nColumn '{col}':")
+                print(counts)
+                
+        self.found_placeholders = found_placeholders
+        return self
+        
+    def head(self, n=5):
+        """Shows the first n rows of the current DataFrame."""
+        print(self.df.head(n))
+        return self
+
+    # --- 2. CLEANING METHODS (Modify the DataFrame) ---
+
+    def standardize_missing_values(self, include_cols=None, exclude_cols=None, placeholders=None):
+        if include_cols is not None and exclude_cols is not None:
+            raise ValueError("Cannot specify both 'include_cols' and 'exclude_cols'. Please choose one.")
+
+        if placeholders is None:
+            placeholders = self.na_placeholders
+        
+        initial_nas = self.df.isna().sum().sum()
+        
+        target_cols = self.df.columns
+        
+        # Determine the target columns for the operation
+        if include_cols is not None:
+            # Validate that included columns actually exist
+            target_cols = [col for col in include_cols if col in self.df.columns]
+            print(f"Applying replacement to specified columns: {target_cols}")
+            self.df[target_cols] = self.df[target_cols].replace(placeholders, pd.NA)
+
+        elif exclude_cols is not None:
+            target_cols = [col for col in self.df.columns if col not in exclude_cols]
+            print(f"Applying replacement to all columns EXCEPT: {exclude_cols}")
+            self.df[target_cols] = self.df[target_cols].replace(placeholders, pd.NA)
+            
+        else:
+            # Default behavior: replace on the entire DataFrame
+            print("Applying replacement to all columns.")
+            self.df = self.df.replace(placeholders, pd.NA)
+        
+        new_nas = self.df.isna().sum().sum()
+        print(f"Standardized missing values. Added {new_nas - initial_nas} new NA values.")
+        return self
+
+    def clean_column_names(self):
+        """
+        Standardizes all column names to snake_case (lowercase with underscores).
+        """
+        new_cols = []
+        for col in self.df.columns:
+            new_col = str(col).strip().lower()
+            new_col = re.sub(r'\s+', '_', new_col) # Replace spaces with underscores
+            new_col = re.sub(r'[^a-z0-9_]', '', new_col) # Remove special characters
+            new_cols.append(new_col)
+        self.df.columns = new_cols
+        print("Cleaned column names.")
+        return self
+
+    def standardize_missing_values(self, placeholders=None):
+        """
+        Replaces a list of common string placeholders with np.nan.
+
+        Args:
+            placeholders (list, optional): A list of strings to replace.
+                                           Defaults to a comprehensive list.
+        """
+        if placeholders is None:
+            placeholders = [
+                'NA', 'N/A', 'n/a', 'Null', 'null', '', '-', '?',
+                'missing', 'Missing', 'NaN', 'nan', 'undefined'
+            ]
+        
+        initial_nas = self.df.isna().sum().sum()
+        self.df.replace(placeholders, np.nan, inplace=True)
+        new_nas = self.df.isna().sum().sum()
+        print(f"Standardized missing values. Added {new_nas - initial_nas} new NaN values.")
+        return self
+
+    def drop_duplicates(self):
+        """Removes duplicate rows from the DataFrame."""
+        initial_rows = len(self.df)
+        self.df.drop_duplicates(inplace=True)
+        rows_dropped = initial_rows - len(self.df)
+        if rows_dropped > 0:
+            print(f"Dropped {rows_dropped} duplicate rows.")
+        else:
+            print("No duplicate rows to drop.")
+        return self
+
+    def strip_whitespace(self, columns=None):
+        """
+        Strips leading/trailing whitespace from string columns.
+
+        Args:
+            columns (list, optional): Specific columns to strip.
+                                      If None, applies to all object columns.
+        """
+        if columns is None:
+            columns = self.df.select_dtypes(include=['object', 'string']).columns
+        
+        for col in columns:
+            if col in self.df.columns:
+                self.df[col] = self.df[col].str.strip()
+        print(f"Stripped whitespace from columns: {list(columns)}.")
+        return self
+
+    def convert_data_types(self):
+        """
+        Uses pandas' convert_dtypes() to infer and convert columns to the
+        best possible types (e.g., string, Int64, boolean).
+        """
+        self.df = self.df.convert_dtypes()
+        print("Attempted to convert columns to more efficient types.")
+        return self
+        
+    def reset_dataframe_index(self):
+        """Resets the DataFrame's index, useful after dropping rows."""
+        self.df.reset_index(drop=True, inplace=True)
+        print("Reset DataFrame index.")
+        return self
+
+    # --- 3. UTILITY METHODS ---
+
+    def run_all(self):
+        """
+        Runs a standard sequence of cleaning operations.
+        This is a great one-shot method for a quick clean.
+        """
+        print("\n--- Running Full Cleaning Pipeline ---")
+        self.clean_column_names()
+        self.standardize_missing_values()
+        self.strip_whitespace()
+        self.drop_duplicates()
+        self.convert_data_types()
+        self.reset_dataframe_index()
+        print("\n--- Full Cleaning Pipeline Complete ---")
+        self.summarize()
+        return self
+
+    def get_df(self):
+        """Returns the cleaned DataFrame."""
+        return self.df
+
+
+
 # ==============================================================================
 #  requests
 # ==============================================================================

@@ -6,3 +6,4 @@ notebooks/
 __pycache__/
 myutils*/
 academic_dataset.jsonl
+test.ipynb
