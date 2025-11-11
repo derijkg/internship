@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from .myutils import sanitize_filename_new, timed_request
+from .mu import sanitize_filename_new, timed_request
 
 class BaseScraper:
     """A base class for scraping theses from different sources.

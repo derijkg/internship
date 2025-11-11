@@ -6,10 +6,177 @@ import random
 import requests
 from requests import Session
 import time
+import zipfile
+import shutil
+from pathlib import Path
+from typing import Optional, List, Generator
+from contextlib import contextmanager
 
+def basic_imports():
+    import re
+    import os
+    from collections import Counter
+    import logging
+    import random
+    import requests
+    from requests import Session
+    import time
+    import zipfile
+    import shutil
+    from pathlib import Path
+    from typing import Optional, List, Generator
+    from contextlib import contextmanager
+    import pandas as pd
+    
 # ==============================================================================
 #  IO
 # ==============================================================================
+
+def set_path(path_str: str) -> Path:
+    """
+    Ensures a directory exists from a string path, creating it if necessary.
+
+    This is intended for creating permanent directories (e.g., for final outputs).
+
+    Args:
+        path_str (str): The directory path to create.
+
+    Returns:
+        Path: The created (or already existing) path object.
+    """
+    path = Path(path_str)
+    path.mkdir(parents=True, exist_ok=True)
+    print(f"Path ensured: '{path}'")
+    return path
+
+@contextmanager
+def temp_path(path_str: str, temporary: bool = True) -> Generator[Path, None, None]:
+    """
+    A context manager to create a directory from a string path and optionally
+    clean it up afterward. The recommended way to handle temporary directories.
+
+    Args:
+        path_str (str): The directory path to manage.
+        temporary (bool): If True, the directory and all its contents will be
+                          deleted upon exiting the context. If False, the
+                          directory will be created but not deleted.
+    
+    Yields:
+        Path: The path object for the created directory.
+    """
+    path = Path(path_str)
+    # This is the "enter" part of the context
+    path.mkdir(parents=True, exist_ok=True)
+    print(f"Managed path created: '{path}'{' (temporary)' if temporary else ''}")
+    
+    try:
+        # Yield the path object to be used inside the 'with' block
+        yield path
+    finally:
+        # This is the "exit" part, which runs no matter what
+        if temporary and path.exists():
+            shutil.rmtree(path)
+            print(f"Temporary path cleaned up: '{path}'")
+
+def to_zip(
+    input_dir: Path,
+    output_dir: Path,
+    extensions: Optional[List[str]] = None,
+    flatten: bool = True
+):
+    """
+    Compresses files from a source directory into a zip archive, with an
+    optional filter for file extensions.
+
+    Args:
+        input_dir (Path): The directory containing the files to zip.
+        output_dir (Path): The full path for the output zip file to be created.
+        extensions (Optional[List[str]]): A list of file extensions to include
+            (e.g., ['.md', '.json']). If None, all files will be included.
+        flatten (bool): If True, the directory structure within the zip file is
+            flattened, so all files appear at the root. If False, the original
+            directory structure is preserved.
+    """
+    if not input_dir.is_dir():
+        print(f"Error: Source directory '{input_dir}' does not exist.")
+        return
+
+    # Normalize extensions to ensure they start with a dot and are lowercase
+    if extensions:
+        normalized_exts = {f".{ext.lstrip('.').lower()}" for ext in extensions}
+        print(f"Zipping files with extensions: {', '.join(normalized_exts)}")
+    else:
+        print("Zipping all files in the directory.")
+
+    found_files = 0
+    with zipfile.ZipFile(output_dir, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # rglob('*') finds all files in all subdirectories
+        for file_path in input_dir.rglob('*'):
+            if file_path.is_file():
+                # Apply the extension filter if it exists
+                if extensions and file_path.suffix.lower() not in normalized_exts:
+                    continue  # Skip files that don't match
+
+                # Determine the name of the file inside the zip archive
+                if flatten:
+                    arcname = file_path.name
+                else:
+                    arcname = file_path.relative_to(input_dir)
+
+                zipf.write(file_path, arcname=arcname)
+                found_files += 1
+
+    print(f"Successfully added {found_files} files to '{output_dir}'.")
+
+
+def from_zip(
+    input_dir: Path,
+    output_dir: Path,
+    extensions: Optional[List[str]] = None
+):
+    """
+    Extracts files from a zip archive to a destination directory, with an
+    optional filter for file extensions.
+
+    Args:
+        input_dir (Path): The path to the zip file to be extracted.
+        output_dir (Path): The directory where files will be extracted.
+        extensions (Optional[List[str]]): A list of file extensions to extract
+            (e.g., ['.pdf']). If None, all files will be extracted.
+    """
+    if not input_dir.is_file():
+        print(f"Error: Zip file '{input_dir}' not found.")
+        return
+
+    # Ensure the destination directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize extensions for filtering
+    if extensions:
+        normalized_exts = {f".{ext.lstrip('.').lower()}" for ext in extensions}
+        print(f"Extracting files with extensions: {', '.join(normalized_exts)}")
+    else:
+        print("Extracting all files from the archive.")
+
+    extracted_count = 0
+    with zipfile.ZipFile(input_dir, 'r') as zip_ref:
+        # Get a list of all files in the zip archive
+        file_list = zip_ref.namelist()
+
+        for file_name in file_list:
+            # Check if the file is a directory (ends with '/')
+            if file_name.endswith('/'):
+                continue
+
+            # Apply the extension filter if it exists
+            if extensions and Path(file_name).suffix.lower() not in normalized_exts:
+                continue # Skip files that don't match
+
+            zip_ref.extract(file_name, output_dir)
+            extracted_count += 1
+            
+    print(f"Successfully extracted {extracted_count} files to '{output_dir}'.")
+
 
 def sanitize_filename(filename: str, replacement: str = "_") -> str:
     # Characters forbidden in filenames on Windows, Linux, and macOS

@@ -14,11 +14,18 @@ TEMP_MD = Path("data/temp/marker_output")
 TEMP_EXTRACTION_DIR = Path("data/temp/temp_pdf_extraction")
 
 LIMIT_FILES_TO = 5
-
+'''
 MARKER_CONFIG = {
-    
+    "extract_images": False,
+    "output_formats": ['markdown','json'],
+    #"output_dir": 
 }
+'''
 # ---------------------
+
+if torch.cuda.is_available != True:
+    print('cuda not found')
+    sys.exit()
 
 def zip_output_files(source_dir, zip_path):
     """
@@ -88,6 +95,8 @@ def main():
         command = [
             "marker",
             '--disable_image_extraction',
+            '--output_dir',
+            str(TEMP_MD),
             str(TEMP_EXTRACTION_DIR)
         ]
         
