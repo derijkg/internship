@@ -23,10 +23,6 @@ MARKER_CONFIG = {
 '''
 # ---------------------
 
-if torch.cuda.is_available != True:
-    print('cuda not found')
-    sys.exit()
-
 def zip_output_files(source_dir, zip_path):
     """
     Finds all .md and .json files in the source_dir and adds them to a zip archive.
@@ -95,6 +91,11 @@ def main():
         command = [
             "marker",
             '--disable_image_extraction',
+            #'--workers', '2',
+            #'--batch_multiplier 3',
+            '--detection_batch_size', '3',
+            '--layout_batch_size', '3',
+            '--pdftext_workers', '10'
             '--output_dir',
             str(TEMP_MD),
             str(TEMP_EXTRACTION_DIR)
@@ -120,6 +121,8 @@ def main():
     except subprocess.CalledProcessError as e:
         print(f"\nError: Marker process failed with exit code {e.returncode}.")
         sys.exit(1)
+
+
     finally:
         # --- Step 5: Clean Up All Intermediate Files ---
         # This 'finally' block ensures that all temporary directories are
