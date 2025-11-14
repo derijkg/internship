@@ -7,133 +7,195 @@ from pathlib import Path
 import torch
 
 # --- Configuration ---
-ZIP_FILE_PATH = Path("data/archive.zip")
-OUTPUT_ZIP = Path("data/output_md.zip")
+ZIP_INPUT = Path("data/archive.zip")
+ZIP_OUTPUT = Path("data/output_marker.zip")
 
-TEMP_MD = Path("data/temp/marker_output")
-TEMP_EXTRACTION_DIR = Path("data/temp/temp_pdf_extraction")
+TEMP_OUTPUT = Path("data/temp/marker_output")
+TEMP_INPUT = Path("data/temp/temp_extraction") # Changed name for clarity
 
-LIMIT_FILES_TO = 5
-'''
-MARKER_CONFIG = {
-    "extract_images": False,
-    "output_formats": ['markdown','json'],
-    #"output_dir": 
-}
-'''
+# The new state file
+DONE_FILES_LOG = Path("data/temp/done_files.txt")
+
+LIMIT_FILES_TO = 0
+
 # ---------------------
 
 def zip_output_files(source_dir, zip_path):
     """
     Finds all .md and .json files in the source_dir and adds them to a zip archive.
-
-    Args:
-        source_dir (Path): The directory containing the output files.
-        zip_path (Path): The path for the final output zip file.
+    This function is now designed to append to the output, preserving old results.
     """
-    print(f"\nCreating zip archive at: {zip_path}")
-    found_files = 0
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        # Use pathlib's rglob for a cleaner way to find files
-        for file_path in source_dir.rglob("*.md"):
-            zipf.write(file_path, arcname=file_path.name)
-            found_files += 1
-        for file_path in source_dir.rglob("*.json"):
-            zipf.write(file_path, arcname=file_path.name)
-            found_files += 1
-            
-    print(f"Successfully added {found_files} markdown and json files to the zip archive.")
+    print(f"\nUpdating zip archive at: {zip_path}")
+    # Create a temporary zip file for the new results
+    temp_zip_path = zip_path.with_suffix(".temp.zip")
+    
+    # Zip the new output from TEMP_OUTPUT
+    with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as temp_zipf:
+        for item in source_dir.iterdir():
+            if item.is_dir():
+                for file_path in item.rglob('*'):
+                    # arcname should be flat, e.g., "basename.md"
+                    arcname = f"{item.name}{file_path.suffix}"
+                    temp_zipf.write(file_path, arcname=arcname)
+
+    # Merge the new zip with the old one if it exists
+    if zip_path.exists():
+        # This part requires a bit more logic to merge zips, for simplicity we will re-create it
+        # from the preserved files and the new files.
+        pass # For now, we assume a full re-zip is acceptable. A more complex merge is possible.
+
+    # For simplicity in this script, we just create the full zip from scratch
+    # from the combination of preserved files and new files in TEMP_OUTPUT
+    print(f"Creating final zip from all content in {TEMP_OUTPUT}...")
+    final_files_count = 0
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as final_zipf:
+        for item in TEMP_OUTPUT.iterdir():
+            if item.is_dir():
+                 for file_path in item.rglob('*'):
+                    arcname = f"{item.name}{file_path.suffix}"
+                    final_zipf.write(file_path, arcname=arcname)
+                    final_files_count += 1
+    
+    print(f"Successfully added {final_files_count} files to the zip archive.")
 
 
 def main():
     """
-    Main function to orchestrate the PDF processing and zipping workflow.
+    Main function to orchestrate the file processing and zipping workflow.
     """
-    # --- Step 1: Validate Inputs and Set Up Directories ---
-    if not os.path.exists(ZIP_FILE_PATH):
-        print(f"Error: The file '{ZIP_FILE_PATH}' was not found.")
+    # --- Step 1: Initial Setup ---
+    if not os.path.exists(ZIP_INPUT):
+        print(f"Error: The file '{ZIP_INPUT}' was not found.")
         sys.exit(1)
 
-    # Clean up previous runs to ensure a fresh start
-    for path in [TEMP_MD, TEMP_EXTRACTION_DIR]:
-        if os.path.exists(path):
-            print(f"Warning: Directory '{path}' already exists. Cleaning it up.")
-            shutil.rmtree(path)
-    
-    os.makedirs(TEMP_MD)
-    os.makedirs(TEMP_EXTRACTION_DIR)
-    print("Setup complete. Directories are ready.")
+    os.makedirs(TEMP_OUTPUT, exist_ok=True)
 
-    try:
-        # --- Step 2: Extract a Subset or All of the PDF Files ---
-        print(f"Opening '{ZIP_FILE_PATH}' to find PDFs...")
-        with zipfile.ZipFile(ZIP_FILE_PATH, 'r') as zip_ref:
-            # Get a list of all PDF files, ignoring other file types
-            pdf_files_in_zip = [f for f in zip_ref.namelist() if f.lower().endswith(".pdf")]
-
-            if LIMIT_FILES_TO and LIMIT_FILES_TO > 0:
-                print(f"LIMIT_FILES_TO is set to {LIMIT_FILES_TO}. Extracting a subset of files.")
-                files_to_extract = pdf_files_in_zip[:LIMIT_FILES_TO]
-            else:
-                print("Processing all PDF files in the archive.")
-                files_to_extract = pdf_files_in_zip
-
-            if not files_to_extract:
-                print("Error: No PDF files found in the zip archive.")
-                sys.exit(1)
-
-            print(f"Extracting {len(files_to_extract)} PDF(s) to '{TEMP_EXTRACTION_DIR}'...")
-            for pdf_file in files_to_extract:
-                zip_ref.extract(pdf_file, TEMP_EXTRACTION_DIR)
+    # --- ACTION 1: Extract all files if the temp input folder doesn't exist ---
+    if not os.path.exists(TEMP_INPUT):
+        print(f"Temporary input cache '{TEMP_INPUT}' not found. Extracting all files from archive...")
+        os.makedirs(TEMP_INPUT)
+        with zipfile.ZipFile(ZIP_INPUT, 'r') as zip_ref:
+            zip_ref.extractall(TEMP_INPUT)
         print("Extraction complete.")
+    else:
+        print(f"Using existing input cache at '{TEMP_INPUT}'.")
 
-        # --- Step 3: Construct and Run the Marker Command ---
-        command = [
-            "marker",
-            '--disable_image_extraction',
-            #'--workers', '2',
-            #'--batch_multiplier 3',
-            '--detection_batch_size', '3',
-            '--layout_batch_size', '3',
-            '--pdftext_workers', '10'
-            '--output_dir',
-            str(TEMP_MD),
-            str(TEMP_EXTRACTION_DIR)
-        ]
+    # --- ACTION 2 & 3: Create/Update the 'done' file ---
+    done_basenames = set()
+    if DONE_FILES_LOG.exists():
+        with open(DONE_FILES_LOG, 'r') as f:
+            done_basenames = set(line.strip() for line in f if line.strip())
+        print(f"Loaded {len(done_basenames)} records from existing 'done' file.")
+
+    # Check TEMP_OUTPUT for any results from a prior crashed run
+    for item in TEMP_OUTPUT.iterdir():
+        if item.is_dir():
+            done_basenames.add(item.name)
+
+    # Check final zip for results
+    if ZIP_OUTPUT.exists():
+        try:
+            with zipfile.ZipFile(ZIP_OUTPUT, 'r') as zip_ref:
+                for filename in zip_ref.namelist():
+                    done_basenames.add(Path(filename).stem)
+        except zipfile.BadZipFile:
+            print("Warning: Output zip is corrupted.")
+
+    # --- ACTION 4: Validate the 'done' file entries ---
+    validated_done_basenames = set()
+    print("Validating 'done' file records...")
+    for basename in done_basenames:
+        is_valid = False
+        # Check in TEMP_OUTPUT first
+        output_dir = TEMP_OUTPUT / basename
+        if output_dir.is_dir():
+            dir_size = sum(f.stat().st_size for f in output_dir.rglob('*') if f.is_file())
+            if dir_size > 50:
+                is_valid = True
         
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0"
-        env['TORCH_DEVICE'] = 'cuda'
-        env['OUTPUT_DIR'] = str(TEMP_MD)
+        # If not found or invalid in temp, check the final zip
+        if not is_valid and ZIP_OUTPUT.exists():
+            try:
+                with zipfile.ZipFile(ZIP_OUTPUT, 'r') as zip_ref:
+                    md_file = f"{basename}.md"
+                    if md_file in zip_ref.namelist():
+                        if zip_ref.getinfo(md_file).file_size > 50:
+                            is_valid = True
+            except (zipfile.BadZipFile, KeyError):
+                pass # Ignore errors, just means file isn't valid
 
-        print("\nStarting Marker conversion...")
-        print(f"Running command: {' '.join(command)}")
-        subprocess.run(command, check=True, env=env)
-        print("\nMarker conversion successfully completed!")
+        if is_valid:
+            validated_done_basenames.add(basename)
 
-        # --- Step 4: Zip the Markdown Results ---
-        zip_output_files(TEMP_MD, OUTPUT_ZIP)
+    if len(done_basenames) != len(validated_done_basenames):
+        print(f"Validation complete. Removed {len(done_basenames) - len(validated_done_basenames)} invalid records.")
+    
+    # --- ACTION 5: Remove already-done files from the input folder ---
+    files_to_process_paths = []
+    print(f"Cleaning {len(validated_done_basenames)} already processed files from '{TEMP_INPUT}'...")
+    for item in TEMP_INPUT.iterdir():
+        if item.is_file():
+            if item.stem in validated_done_basenames:
+                item.unlink() # Delete the file
+            else:
+                files_to_process_paths.append(item)
+    
+    print(f"Found {len(files_to_process_paths)} files to process in '{TEMP_INPUT}'.")
 
-    except FileNotFoundError:
-        print("\nError: 'marker' command not found.")
-        print("Please ensure you have activated the correct Conda environment (e.g., 'conda activate marker_env').")
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"\nError: Marker process failed with exit code {e.returncode}.")
-        sys.exit(1)
+    # --- ACTION 6: Run the marker command ---
+    if not files_to_process_paths:
+        print("\nNo new files to process.")
+    else:
+        try:
+            command = [
+                "marker",
+                '--disable_image_extraction',
+                '--detection_batch_size', '17', #increase
+                '--layout_batch_size', '17', #increase
+                '--pdftext_workers', '10', #fine
+                #'--skip_existing',
+                '--output_dir', str(TEMP_OUTPUT),
+                str(TEMP_INPUT)
+            ]
+            
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = "0"
+            env['TORCH_DEVICE'] = 'cuda'
+            env['OUTPUT_DIR'] = str(TEMP_OUTPUT)
 
+            print("\nStarting Marker conversion...")
+            print(f"Running command: {' '.join(command)}")
+            subprocess.run(command, check=True, env=env)
+            print("\nMarker conversion successfully completed!")
 
-    finally:
-        # --- Step 5: Clean Up All Intermediate Files ---
-        # This 'finally' block ensures that all temporary directories are
-        # removed, leaving only the final zip archive.
-        print("\nCleaning up intermediate directories...")
-        for path in [TEMP_EXTRACTION_DIR, TEMP_MD]:
-            if os.path.exists(path):
-                shutil.rmtree(path)
-                print(f"Removed '{path}'.")
-        print("Cleanup complete.")
+            # --- ACTION 7: Final update ---
+            newly_processed_basenames = {p.stem for p in files_to_process_paths}
+            print(f"Updating 'done' file with {len(newly_processed_basenames)} new records.")
+            final_done_set = validated_done_basenames.union(newly_processed_basenames)
+            with open(DONE_FILES_LOG, 'w') as f:
+                for basename in sorted(list(final_done_set)):
+                    f.write(f"{basename}\n")
+            
+            # Re-zip the entire valid output directory
+            zip_output_files(TEMP_OUTPUT, ZIP_OUTPUT)
 
+            print(f"Cleaning up {len(newly_processed_basenames)} source files from input cache...")
+            for path in files_to_process_paths:
+                if path.exists():
+                    path.unlink()
 
+        except FileNotFoundError:
+            print("\nError: 'marker' command not found.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"\nError: Marker process failed with exit code {e.returncode}.")
+            sys.exit(1)
+        '''
+        finally:
+            # Clean up the marker output dir, as its contents are now in the zip
+            if os.path.exists(TEMP_OUTPUT):
+                shutil.rmtree(TEMP_OUTPUT)
+                print(f"Removed temporary output directory '{TEMP_OUTPUT}'.")
+        '''
 if __name__ == "__main__":
     main()

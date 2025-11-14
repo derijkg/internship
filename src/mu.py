@@ -485,25 +485,6 @@ class DataFrameCleaner:
         print("Cleaned column names.")
         return self
 
-    def standardize_missing_values(self, placeholders=None):
-        """
-        Replaces a list of common string placeholders with np.nan.
-
-        Args:
-            placeholders (list, optional): A list of strings to replace.
-                                           Defaults to a comprehensive list.
-        """
-        if placeholders is None:
-            placeholders = [
-                'NA', 'N/A', 'n/a', 'Null', 'null', '', '-', '?',
-                'missing', 'Missing', 'NaN', 'nan', 'undefined'
-            ]
-        
-        initial_nas = self.df.isna().sum().sum()
-        self.df.replace(placeholders, np.nan, inplace=True)
-        new_nas = self.df.isna().sum().sum()
-        print(f"Standardized missing values. Added {new_nas - initial_nas} new NaN values.")
-        return self
 
     def drop_duplicates(self):
         """Removes duplicate rows from the DataFrame."""
