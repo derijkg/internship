@@ -35,6 +35,8 @@ df_filtered = df.copy()
 df_filtered['year'] = pd.to_numeric(df_filtered['year'], errors='coerce')
 df_filtered['abstract'] = df_filtered['abstract'].fillna('')
 
+
+# min length? 
 def is_dutch(text: str) -> bool:
     if not text.strip():
         return False
@@ -43,7 +45,8 @@ def is_dutch(text: str) -> bool:
     except LangDetectException:
         return False
 
-def is_dutch_abstact(row):
+'''
+def is_dutch_abstact(row): # no abstract_full col?
     abstract_full_data = row['abstract_full']
     try:
         if isinstance(abstract_full_data, list) and abstract_full_data:
@@ -66,6 +69,7 @@ def is_dutch_abstact(row):
         except LangDetectException:
             return False
     return False
+''' 
 
 year_mask = df_filtered['year'].between(2000,2022)
 language_mask = df_filtered['abstract'].apply(is_dutch)
