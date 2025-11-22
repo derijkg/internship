@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from .mu import sanitize_filename_new, timed_request
+from mu import sanitize_filename_new, timed_request
 
 class BaseScraper:
     """A base class for scraping theses from different sources.
@@ -260,7 +260,7 @@ class ScriptiebankScraper(BaseScraper):
         Sets the source name to 'scriptiebank' and configures the URLs and
         regex patterns specific to the Scriptiebank website structure.
         """
-        super().__init__(source_name="scriptiebank")
+        super().__init__(source_name="ugent")
         # inherits:
         #self.source_name = source_name
         #self.csv_path = base_folder / "metadata.csv"

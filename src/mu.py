@@ -325,7 +325,7 @@ import pandas as pd
 import numpy as np
 import re
 from collections import Counter
-
+''' 
 class DataFrameCleaner_old:
     """
     A class to encapsulate a pandas DataFrame and apply a series of
@@ -648,7 +648,7 @@ class DataFrameCleaner_old:
     def get_df(self):
         """Returns the cleaned DataFrame."""
         return self.df
-
+'''
 
 class DataFrameCleaner:
     """
@@ -951,6 +951,15 @@ class DataFrameCleaner:
             print(f"{current_prefix}{arrow_type} | {n_unique} unique ({cat_label})")
 
 
+    def get_samples(self, columns=None, number=5):
+        valid = [c for c in columns or [] if c in self.df.columns]
+        if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
+        for col in valid:
+            s = self.df[col].dropna()
+            print(f"Column: {col}", *s.sample(min(number, len(s))), "-" * 30, sep="\n")
+            
+        return self
+
     def check_missing_values(self):
         """Prints a report of missing values."""
         # Calculate isna once to save time
@@ -1083,7 +1092,7 @@ class DataFrameCleaner:
         cols_to_drop = [col for col in self.df.columns[mask] if col not in exclude]
         if cols_to_drop:
             self.df.drop(columns=cols_to_drop, inplace=True)
-            print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop.tolist()}")
+            print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
         return self
 
     def standardize_missing_values(self, include_cols=None, exclude_cols=None, placeholders=None):
