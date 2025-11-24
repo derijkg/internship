@@ -325,330 +325,80 @@ import pandas as pd
 import numpy as np
 import re
 from collections import Counter
-''' 
-class DataFrameCleaner_old:
-    """
-    A class to encapsulate a pandas DataFrame and apply a series of
-    common cleaning operations.
+import pyarrow as pa
+import ast
 
-    Attributes:
-        df (pd.DataFrame): The DataFrame being cleaned.
-    """
+class SchemaEnforcer:
+    def __init__(self, df, regex_patterns):
+        self.df = df
+        # Compile regex once
+        self.garbage_regex = re.compile(regex_patterns)
 
-    def __init__(self, dataframe):
-        """
-        Initializes the cleaner with a DataFrame.
+    def _is_garbage(self, val):
+        """Fast check if a value is 'garbage' based on regex."""
+        if val is None: return True
+        if isinstance(val, (float, int)) and np.isnan(val): return True
+        if isinstance(val, str):
+            s = val.strip()
+            if not s: return True 
+            if self.garbage_regex.match(s): return True
+        return False
 
-        Args:
-            dataframe (pd.DataFrame): The DataFrame to be cleaned.
-                                      A copy is made to avoid side effects.
-        """
-        self.df = dataframe.copy()
-        print("DataFrameCleaner initialized. A copy of the original DataFrame has been made.")
+    def _clean_complex(self, val, expected_type):
+        """Universal cleaner for List/Dict columns."""
+        if self._is_garbage(val): return None
         
-        print('Setting display.max_rows to None')
-        pd.set_option('display.max_rows', None)
+        # 1. Handle NumPy Arrays -> List
+        if isinstance(val, np.ndarray):
+            val = val.tolist()
 
-        patterns = [
-                r'(?i)^nan$', #case insensitive nan
-                r'(?i)^(?:n\/?a|null|none|<none>|not reported|unknown|undefined|missing)$',
-                r'^(?:-+$|/+$)',
-                r'^\?+$',
-                r'^(?:-99|-9999|999|9999)$',
-            ]
-        self.na_placeholders = '|'.join(patterns)
-
-        self.summarize()
-
-    # --- 1. CHECKING METHODS (Inspect without modifying) ---
-
-    def summarize(self):
-        """Prints a summary of the DataFrame, including info and shape."""
-        print("\n--- DataFrame Summary ---")
-        print(f"Shape: {self.df.shape}")
-        self.check_duplicates()  # This is now simpler and more robust
-        self.check_missing_values()
-        print("\nInfo:")
-        self.df.info(verbose=True, show_counts=True) # More detailed info, very long time, optim
-        print('\nDescribe (numerical):')
-        #print(self.df.describe())
-        print('\nDescribe (categorical):')
-        #print(self.df.describe(include=['object', 'category']))
-        print('Describe turned off for now to spare time')
-        print('\nRandom row:')
-        print(self.df.sample(n=1).T)
-        self.check_string_placeholders()
-        print("-------------------------\n")
-        return self
-
-    def check_missing_values(self):
-        """Prints a report of missing values per column (count and percentage)."""
-        missing_values = self.df.isna().sum()
-        missing_percent = ((missing_values / len(self.df)) * 100).round(2)
-        missing_df = pd.DataFrame({
-            'missing_count': missing_values,
-            'missing_percent': missing_percent
-        })
-        print("\n--- Missing Values Report ---")
-        print(missing_df[missing_df['missing_count'] > 0])
-        return self
-
-
-    def _find_unhashable_columns(self):
-        """A helper method to identify columns with unhashable types."""
-        unhashable_cols = []
-        for col in self.df.columns:
-            # We check the first non-NA value's type.
-            # This is much safer than .iloc[0] as it handles empty/all-NA columns.
-            non_na_series = self.df[col].dropna()
-            if not non_na_series.empty:
-                first_value = non_na_series.iloc[0]
-                # Dictionaries and lists are the most common unhashable types in DataFrames.
-                if isinstance(first_value, (dict, list)):
-                    unhashable_cols.append(col)
-        return unhashable_cols
-    
-
-    def check_duplicates(self):
-        """
-        Prints the number of duplicate rows.
-        Automatically excludes unhashable columns (like those with dicts/lists)
-        from the check and warns the user.
-        """
-        unhashable_cols = self._find_unhashable_columns()
+        # 2. Handle Stringified JSON
+        if isinstance(val, str):
+            try:
+                val = ast.literal_eval(val)
+            except (ValueError, SyntaxError):
+                return None # Parse failure = Garbage
         
-        if unhashable_cols:
-            print(f"\nWarning: Found unhashable columns: {unhashable_cols}.")
-            print("Excluding them from the duplicate check.")
-            # Check for duplicates only in the subset of hashable columns
-            hashable_cols = [col for col in self.df.columns if col not in unhashable_cols]
-            # It's possible all columns are unhashable
-            if not hashable_cols:
-                print("No hashable columns to check for duplicates.")
-                return self
-            num_duplicates = self.df.duplicated(subset=hashable_cols).sum()
-        else:
-            # If all columns are hashable, check the whole DataFrame
-            num_duplicates = self.df.duplicated().sum()
+        # 3. Type Check
+        if isinstance(val, expected_type):
+            return val
+            
+        return None
 
-        print(f"\nFound {num_duplicates} duplicate rows.\n")
-        return self
-    
-    def check_string_placeholders(self, na_placeholders=None):
-        """
-        Checks object/string columns for common string placeholders for NA values
-        and prints a report of what it finds.
+    def _clean_scalar_str(self, val):
+        """Forces value to String or None."""
+        if self._is_garbage(val): return None
+        if isinstance(val, (list, dict, set, np.ndarray)): return None
+        return str(val).strip()
+
+    def apply(self, schema):
+        """Applies cleaning logic based on the provided schema dict."""
+        print(f"--- Enforcing Schema on {len(schema)} columns ---")
         
-        Args:
-            na_placeholders (list, optional): A custom list of strings to check for.
-                                              Defaults to a comprehensive internal list.
-        """
-        print("\n--- Checking for String Placeholders ---")
-        if na_placeholders is None:
-            na_placeholders = self.na_placeholders
+        for col, dtype in schema.items():
+            if col not in self.df.columns: continue
 
-        found_placeholders = {}
-        string_cols = self.df.select_dtypes(include=['object', 'string']).columns
-
-        for col in string_cols:
-            matching_mask = self.df[col].astype(str).str.match(na_placeholders, na=False)
-            if matching_mask.any():
-                # Get the value counts of only the matching placeholders
-                counts = self.df[col][matching_mask].value_counts()
-                if not counts.empty:
-                    found_placeholders[col] = counts
-
-        # Report the findings
-        if not found_placeholders:
-            print("No common string NA placeholders found in object/string columns.")
-        else:
-            print("Found the following string placeholders:")
-            for col, counts in found_placeholders.items():
-                print(f"\nColumn '{col}':")
-                print(counts)
+            # Complex Types
+            if dtype == 'list':
+                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list))
+            elif dtype == 'dict':
+                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict))
+            
+            # String Types (Vectorized + Map)
+            elif dtype == 'string':
+                # We use map for speed on object columns, handles the specific cleaning
+                self.df[col] = self.df[col].map(self._clean_scalar_str)
+            
+            # Numeric Types
+            elif dtype in ['int', 'float', 'number']:
+                self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
                 
-        self.found_placeholders = found_placeholders
-        return self
-        
-    def head(self, n=5):
-        """Shows the first n rows of the current DataFrame."""
-        print(self.df.head(n))
-        return self
+            # Date Types
+            elif dtype in ['date', 'datetime']:
+                self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
 
-    # --- 2. CLEANING METHODS (Modify the DataFrame) ---
-
-    def drop_missing_cols(self,threshold=0.95): # add specific cols func
-        initial_cols = self.df.shape[1]
-        missing_frac = self.df.isna().mean()
-        cols_to_drop = missing_frac[missing_frac > threshold].index
-        self.df.drop(columns=cols_to_drop, inplace=True)
-        print(f"Dropped {initial_cols - self.df.shape[1]} columns with >{threshold*100}% missing values.")
-        print('Dropped cols: ', cols_to_drop.tolist())
-        return self
-    
-
-    
-    def map_yn_to_boolean(self, columns):
-        """
-        Converts columns with 'y'/'n' or 'Y'/'N' values to True/False.
-
-        Args:
-            columns (list): A list of column names to convert.
-        """
-        if not isinstance(columns, list):
-            raise TypeError("The 'columns' argument must be a list of column names.")
-
-        # Create the mapping dictionary
-        # .str.lower() handles both 'Y' and 'y'
-        yn_map = {'y': True, 'n': False}
-
-        print(f"\nConverting 'y'/'n' to boolean for columns: {columns}")
-        for col in columns:
-            if col in self.df.columns:
-                # First, store original non-NA count to see if we lose data
-                original_non_na = self.df[col].notna().sum()
-                
-                # Apply the mapping
-                self.df[col] = self.df[col].str.lower().map(yn_map)
-                
-                # See how many values were not in the map (became NA)
-                unmapped_count = original_non_na - self.df[col].notna().sum()
-                if unmapped_count > 0:
-                    print(f"  - Note for column '{col}': {unmapped_count} values were not 'y' or 'n' and are now NA.")
-            else:
-                print(f"  - Warning: Column '{col}' not found in DataFrame.")
-        
-        # Use convert_dtypes to get a proper nullable BooleanDtype
-        self.convert_data_types()
-        return self
-    
-    def standardize_missing_values(self, include_cols=None, exclude_cols=None, placeholders=None):
-        """
-        Replaces string placeholders with a standard missing value indicator (NA/NaN).
-        """
-        if include_cols is not None and exclude_cols is not None:
-            raise ValueError("Cannot specify both 'include_cols' and 'exclude_cols'.")
-
-        if placeholders is None:
-            placeholders = self.na_placeholders
-
-        initial_nas = self.df.isna().sum().sum()
-
-        if include_cols is not None:
-            target_cols = [col for col in include_cols if col in self.df.columns]
-            print(f"Applying replacement to specified columns: {target_cols}")
-        elif exclude_cols is not None:
-            target_cols = [col for col in self.df.columns if col not in exclude_cols]
-            print(f"Applying replacement to all columns EXCEPT: {exclude_cols}")
-        else:
-            target_cols = self.df.columns.tolist() # Use .tolist() for clarity
-            print("Applying replacement to all columns.")
-
-        # We only act on the string columns within our target columns for efficiency
-        string_cols_in_target = self.df[target_cols].select_dtypes(include=['object', 'string']).columns
-
-        if not string_cols_in_target.empty:
-            cleaned_slice = self.df[string_cols_in_target].replace(placeholders, pd.NA, regex=True)
-            self.df.loc[:, string_cols_in_target] = cleaned_slice
-        
-        new_nas = self.df.isna().sum().sum()
-        print(f"Standardized missing values. Added {new_nas - initial_nas} new NA/NaN values.")
-        return self
-
-    def clean_column_names(self):
-        """
-        Standardizes all column names to snake_case (lowercase with underscores).
-        """
-        new_cols = []
-        for col in self.df.columns:
-            new_col = str(col).strip().lower()
-            new_col = re.sub(r'\s+', '_', new_col) # Replace spaces with underscores
-            new_col = re.sub(r'[^a-z0-9_]', '', new_col) # Remove special characters
-            new_cols.append(new_col)
-        self.df.columns = new_cols
-        print("Cleaned column names.")
-        return self
-
-
-    def drop_duplicates(self):
-        """
-        Removes duplicate rows from the DataFrame.
-        Automatically excludes unhashable columns from the check.
-        """
-        initial_rows = len(self.df)
-        unhashable_cols = self._find_unhashable_columns()
-        
-        subset_to_check = None
-        if unhashable_cols:
-            print(f"Warning: Excluding unhashable columns from duplicate removal: {unhashable_cols}")
-            subset_to_check = [col for col in self.df.columns if col not in unhashable_cols]
-            if not subset_to_check:
-                print("No hashable columns to check for duplicates. No rows dropped.")
-                return self
-
-        self.df.drop_duplicates(subset=subset_to_check, inplace=True)
-        rows_dropped = initial_rows - len(self.df)
-        
-        if rows_dropped > 0:
-            print(f"Dropped {rows_dropped} duplicate rows.")
-        else:
-            print("No duplicate rows to drop.")
-        return self
-
-    def strip_whitespace(self, columns=None):
-        """
-        Strips leading/trailing whitespace from string columns.
-
-        Args:
-            columns (list, optional): Specific columns to strip.
-                                      If None, applies to all object columns.
-        """
-        if columns is None:
-            columns = self.df.select_dtypes(include=['object', 'string']).columns
-        
-        for col in columns:
-            if col in self.df.columns:
-                self.df[col] = self.df[col].str.strip()
-        print(f"Stripped whitespace from columns: {list(columns)}.")
-        return self
-
-    def convert_data_types(self):
-        """
-        Uses pandas' convert_dtypes() to infer and convert columns to the
-        best possible types (e.g., string, Int64, boolean).
-        """
-        self.df = self.df.convert_dtypes()
-        print("Attempted to convert columns to more efficient types.")
-        return self
-        
-    def reset_dataframe_index(self):
-        """Resets the DataFrame's index, useful after dropping rows."""
-        self.df.reset_index(drop=True, inplace=True)
-        print("Reset DataFrame index.")
-        return self
-
-    # --- 3. UTILITY METHODS ---
-
-    def run_all(self):
-        """
-        Runs a standard sequence of cleaning operations.
-        This is a great one-shot method for a quick clean.
-        """
-        print("\n--- Running Full Cleaning Pipeline ---")
-        self.clean_column_names()
-        self.standardize_missing_values()
-        self.strip_whitespace()
-        self.drop_duplicates()
-        self.convert_data_types()
-        self.reset_dataframe_index()
-        print("\n--- Full Cleaning Pipeline Complete ---")
-        self.summarize()
-        return self
-
-    def get_df(self):
-        """Returns the cleaned DataFrame."""
         return self.df
-'''
+    
 
 class DataFrameCleaner:
     """
@@ -674,6 +424,8 @@ class DataFrameCleaner:
             r'^(?:-99|-9999|999|9999)$', # Common numeric placeholders
         ]
         self.na_placeholders = '|'.join(patterns)
+
+        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
 
     # --- 1. CHECKING METHODS (Inspect without modifying) ---
     def summarize(self):
@@ -739,102 +491,6 @@ class DataFrameCleaner:
             else:
                 print('\nNo complex nested columns found.')
             return self
-    
-    ''' old nested analyze
-    def inspect_nested_columns(self, sample_size=2000):
-            """
-            Analyzes unhashable columns (Lists/Dicts) to give structural insights.
-            - Lists: Length stats, Total Unique items, Top occurring items.
-            - Dicts: Key frequency, Key Cardinality (is it an ID or a Category?).
-            """
-            cols = self._find_unhashable_columns()
-            if not cols:
-                return self
-
-            print(f"\n--- Nested Structure Analysis (Sample n={sample_size}) ---")
-
-            for col in cols:
-                # Get valid data only
-                valid_series = self.df[col].dropna()
-                if valid_series.empty:
-                    continue
-                
-                # Check type of first item
-                first_item = valid_series.iloc[0]
-
-                # --- STRATEGY 1: LISTS ---
-                if isinstance(first_item, list):
-                    # 1. Length Statistics
-                    lengths = valid_series.str.len()
-                    
-                    # 2. Content Analysis (Flatten the lists from the sample)
-                    # We limit this to the sample_size to avoid exploding 1M rows
-                    sample = valid_series.sample(n=min(len(valid_series), sample_size), random_state=42)
-                    
-                    # Flatten: list of lists -> single list
-                    all_items = [item for sublist in sample for item in sublist]
-                    
-                    # If list contains unhashable items (like dicts inside lists), we can't count uniques easily
-                    try:
-                        unique_count = len(set(all_items))
-                        top_items = Counter(all_items).most_common(3)
-                        content_summary = f"Total Unique: ~{unique_count} (in sample)"
-                        top_summary = f"Top items: {top_items}"
-                    except TypeError:
-                        # Fallback if list contains dicts
-                        content_summary = "Content: Complex Objects (Dicts/Lists)"
-                        top_summary = ""
-
-                    print(f"Column '{col}' [List]:")
-                    print(f"  - Lengths: Min={lengths.min()}, Max={lengths.max()}, Avg={lengths.mean():.2f}")
-                    print(f"  - {content_summary}")
-                    if top_summary:
-                        print(f"  - {top_summary}")
-
-                # --- STRATEGY 2: DICTIONARIES ---
-                elif isinstance(first_item, dict):
-                    actual_n = min(len(valid_series), sample_size)
-                    sample = valid_series.sample(n=actual_n, random_state=42)
-                    
-                    all_keys = []
-                    # Storage for values of the most common keys to check cardinality
-                    key_values_map = {} 
-                    
-                    for d in sample:
-                        keys = list(d.keys())
-                        all_keys.extend(keys)
-                        # Store values for analysis later
-                        for k, v in d.items():
-                            if k not in key_values_map:
-                                key_values_map[k] = []
-                            key_values_map[k].append(str(v)) # Convert to str to handle unhashables
-
-                    # Key Frequency
-                    key_counts = Counter(all_keys)
-                    top_keys = [k for k, _ in key_counts.most_common(5)]
-                    
-                    print(f"Column '{col}' [Dict]:")
-                    print(f"  - Top Keys found: {top_keys}")
-                    
-                    # Analyze Cardinality of Top Keys
-                    print(f"  - Key Insights (Sample):")
-                    for k in top_keys:
-                        vals = key_values_map[k]
-                        n_unique = len(set(vals))
-                        example = vals[0] if vals else ""
-                        if len(example) > 20: example = example[:20] + "..."
-                        
-                        # Heuristic: Low unique count = Categorical, High = ID/Text
-                        val_type = "ID/Text" if n_unique > (actual_n * 0.8) else "Categorical"
-                        if n_unique == 1: val_type = "Constant"
-                        
-                        print(f"    * '{k}': {n_unique} unique values ({val_type}). Ex: {example}")
-
-                print("") # spacer
-            
-            print("--------------------------------------------------\n")
-            return self
-    '''
 
     def analyze_structure_recursive(self, sample_size=5000):
             """
@@ -951,7 +607,7 @@ class DataFrameCleaner:
             print(f"{current_prefix}{arrow_type} | {n_unique} unique ({cat_label})")
 
 
-    def get_samples(self, columns=None, number=5):
+    def get_samples(self, columns=None, number=5):  # add func for str as well as list
         valid = [c for c in columns or [] if c in self.df.columns]
         if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
         for col in valid:
@@ -981,15 +637,38 @@ class DataFrameCleaner:
         return self
 
     def _find_unhashable_columns(self):
-        """Helper: Find columns containing lists or dicts."""
-        unhashable_cols = []
-        # Only check object columns, numeric/bool are always hashable
-        for col in self.df.select_dtypes(include=['object']):
-            # Check first non-na value
-            first_valid = self.df[col].dropna().iloc[0] if not self.df[col].dropna().empty else None
-            if isinstance(first_valid, (dict, list, set)):
-                unhashable_cols.append(col)
-        return unhashable_cols
+            """
+            Identifies columns that contain complex nested data (Lists, Dicts, Structs, Arrays).
+            Supports both legacy 'object' columns and modern 'ArrowDtype' columns.
+            """
+            import pyarrow as pa
+            
+            unhashable_cols = []
+
+            for col in self.df.columns:
+                dtype = self.df[col].dtype
+
+                # --- STRATEGY 1: Check PyArrow Dtypes (Metadata) ---
+                if isinstance(dtype, pd.ArrowDtype):
+                    pa_type = dtype.pyarrow_dtype
+                    # Check for nested Arrow types
+                    if (pa.types.is_list(pa_type) or 
+                        pa.types.is_large_list(pa_type) or 
+                        pa.types.is_fixed_size_list(pa_type) or 
+                        pa.types.is_struct(pa_type) or 
+                        pa.types.is_map(pa_type)):
+                        
+                        unhashable_cols.append(col)
+                        continue
+
+                # --- STRATEGY 2: Check Object Dtypes (Value Inspection) ---
+                if pd.api.types.is_object_dtype(dtype):
+                    valid = self.df[col].dropna()
+                    if not valid.empty:
+                        if isinstance(valid.iloc[0], (list, dict, set, np.ndarray)):
+                            unhashable_cols.append(col)
+
+            return unhashable_cols
 
     def check_duplicates(self):
         """Checks for duplicate rows, skipping unhashable columns."""
@@ -1028,26 +707,93 @@ class DataFrameCleaner:
             return self.df.loc[final_mask, col].unique().tolist()
         return None
 
+    def auto_infer_schema(self, sample_size=1000):
+        """
+        Automatically guesses the schema dictionary required by enforce_schema.
+        Returns: dict (e.g. {'file': 'list', 'title': 'string', 'year': 'int'})
+        """
+        import pyarrow as pa
+        import numpy as np
+        import ast
+
+        inferred = {}
+        print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
+
+        for col in self.df.columns:
+            # 1. Get a clean sample
+            valid_sample = self.df[col].dropna()
+            if valid_sample.empty:
+                continue # Cannot infer from empty, skip (will remain untouched)
+            
+            if len(valid_sample) > sample_size:
+                valid_sample = valid_sample.sample(n=sample_size, random_state=42)
+
+            # 2. Check basics first (Pandas Dtypes)
+            if pd.api.types.is_integer_dtype(self.df[col]):
+                inferred[col] = 'int'
+                continue
+            elif pd.api.types.is_float_dtype(self.df[col]):
+                inferred[col] = 'float'
+                continue
+            elif pd.api.types.is_datetime64_any_dtype(self.df[col]):
+                inferred[col] = 'datetime'
+                continue
+            
+            # 3. Deep Inspection for Objects (String vs List vs Dict)
+            # We use your existing logic to handle Arrays/Strings looking like lists
+            try:
+                first_val = valid_sample.iloc[0]
+                
+                # Fix NumPy arrays for detection
+                if isinstance(first_val, np.ndarray):
+                    valid_sample = valid_sample.apply(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+                # Fix Stringified Lists for detection
+                elif isinstance(first_val, str) and (first_val.strip().startswith('[') or first_val.strip().startswith('{')):
+                    try:
+                        valid_sample = valid_sample.apply(ast.literal_eval)
+                    except:
+                        pass # It's just a string
+                
+                # Use PyArrow to guess the type of the OBJECT column
+                arrow_array = pa.array(valid_sample.tolist())
+                arrow_type = arrow_array.type
+
+                if pa.types.is_list(arrow_type):
+                    inferred[col] = 'list'
+                    print(f"  > Detected '{col}' as LIST")
+                elif pa.types.is_struct(arrow_type) or pa.types.is_map(arrow_type):
+                    inferred[col] = 'dict'
+                    print(f"  > Detected '{col}' as DICT")
+                elif pa.types.is_string(arrow_type):
+                    inferred[col] = 'string'
+                else:
+                    # Fallback for weird objects
+                    inferred[col] = 'string'
+
+            except Exception:
+                # If PyArrow crashes (mixed types), usually safest to treat as string
+                inferred[col] = 'string'
+
+        return inferred
+
+
+
+
+
     # --- 2. CLEANING METHODS (Modify the DataFrame) ---
-    def unify_na_values(self):
+
+    def enforce_schema(self, schema_dict):
         """
-        Reverts modern pd.NA (and None) back to np.nan for consistency 
-        and compatibility with external libraries (like sklearn/plotting).
+        The Master Cleaning Function. 
+        Replaces: strip_whitespace, standardize_missing_values, and unify_na_values.
         """
-        # Replace pd.NA with np.nan
-        # Note: This might cast Int64 columns back to float64, which is usually expected in data science.
-        self.df = self.df.replace({pd.NA: np.nan, None: np.nan})
-        print("Unified missing values to np.nan.")
+        self.df = self.enforcer.apply(schema_dict)
         return self
 
-    def convert_to_datetime(self, columns):
-        """
-        Forces columns to datetime objects. Coerces errors to NaT.
-        """
-        for col in columns:
-            if col in self.df.columns:
-                self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
-                print(f"Converted '{col}' to datetime.")
+    def clean_column_names(self):
+        self.df.columns = (self.df.columns.astype(str).str.strip().str.lower()
+                           .str.replace(r'\s+', '_', regex=True)
+                           .str.replace(r'[^a-z0-9_]', '', regex=True))
         return self
     
     def drop_constant_columns(self):
@@ -1073,18 +819,6 @@ class DataFrameCleaner:
                 print(f"Capped '{col}' between {lower:.2f} and {upper:.2f}")
         return self
 
-    def clean_column_names(self):
-        """
-        Vectorized cleanup of column names to snake_case.
-        """
-        # Use vector string methods for speed
-        self.df.columns = (self.df.columns.astype(str)
-                           .str.strip()
-                           .str.lower()
-                           .str.replace(r'\s+', '_', regex=True)  # spaces to underscore
-                           .str.replace(r'[^a-z0-9_]', '', regex=True)) # remove special chars
-        print("Cleaned column names to snake_case.")
-        return self
 
     def drop_missing_cols(self, threshold=0.95, exclude=[]):
         """Drops columns that are missing more than `threshold` percent of data."""
@@ -1093,40 +827,6 @@ class DataFrameCleaner:
         if cols_to_drop:
             self.df.drop(columns=cols_to_drop, inplace=True)
             print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
-        return self
-
-    def standardize_missing_values(self, include_cols=None, exclude_cols=None, placeholders=None):
-        """Replaces placeholder strings with np.nan."""
-        if placeholders is None:
-            placeholders = self.na_placeholders
-
-        # Determine target columns
-        if include_cols:
-            target_cols = include_cols
-        elif exclude_cols:
-            target_cols = [c for c in self.df.columns if c not in exclude_cols]
-        else:
-            target_cols = self.df.columns
-
-        # Only apply to object/string columns within the target set
-        # Regex replace on numeric columns is usually safe but inefficient
-        cols_to_clean = self.df[target_cols].select_dtypes(include=['object', 'string']).columns
-
-        if not cols_to_clean.empty:
-            initial_nas = self.df[cols_to_clean].isna().sum().sum()
-            
-            # Apply regex replace
-            self.df[cols_to_clean] = self.df[cols_to_clean].replace(
-                to_replace=placeholders, 
-                value=np.nan, 
-                regex=True
-            )
-            
-            new_nas = self.df[cols_to_clean].isna().sum().sum()
-            diff = new_nas - initial_nas
-            if diff > 0:
-                print(f"Standardized {diff} values to NaN.")
-        
         return self
 
     def map_yn_to_boolean(self, columns):
@@ -1141,32 +841,49 @@ class DataFrameCleaner:
         return self
 
     def drop_duplicates(self):
-        """Removes duplicate rows, ignoring unhashable columns."""
+        # Only check hashable columns to avoid crashing on lists
         unhashable = self._find_unhashable_columns()
-        subset = [c for c in self.df.columns if c not in unhashable] if unhashable else None
-        
-        initial = len(self.df)
-        self.df.drop_duplicates(subset=subset, inplace=True)
-        dropped = initial - len(self.df)
-        
-        if dropped:
-            print(f"Dropped {dropped} duplicate rows.")
+        hashable_subset = [c for c in self.df.columns if c not in unhashable]
+        if hashable_subset:
+            initial = len(self.df)
+            self.df.drop_duplicates(subset=hashable_subset,inplace=True)
+            print(f"Dropped {initial - len(self.df)} duplicates.")
         return self
 
-    def strip_whitespace(self):
-        """Strips whitespace from all string columns."""
-        # Only select object columns
-        str_cols = self.df.select_dtypes(include=['object', 'string']).columns
-        # Vectorized strip
-        self.df[str_cols] = self.df[str_cols].apply(lambda x: x.str.strip())
-        print("Stripped whitespace from string columns.")
-        return self
 
-    def convert_data_types(self):
+    def convert_data_types_pandas(self):
         """Uses pandas convert_dtypes to infer best types."""
         self.df = self.df.convert_dtypes()
         print("Converted column types.")
         print(self.df.dtypes)
+        return self
+    
+    def convert_data_types_arrow(self):
+        """
+        The Final Step: Convert everything to PyArrow backends.
+        This locks in the schema and optimizes memory.
+        """
+        print("Step 1: Auto converting to PyArrow-backed types...")
+        try:
+            # automatic conversion
+            self.df = self.df.convert_dtypes(dtype_backend="pyarrow")
+            
+            # Manual override for List/Structs if they remained objects
+            # (Optional: PyArrow backend usually catches lists if they are clean)
+            print(self.df.dtypes)
+        except Exception as e:
+            print(f"PyArrow conversion warning: {e}")
+
+        print('Step 2: converting object types')
+        for col in self.df.select_dtypes(include=['object']):
+            try:
+                arrow_array = pa.array(self.df[col].dropna())
+
+                self.df[col] = self.df[col].astype(pd.ArrowDtype(arrow_array.type))
+                print(f' > Cast {col} to strict {arrow_array.type}')
+            except Exception:
+                pass
+        print('Conversion complete.')
         return self
     
     def reset_index(self):
@@ -1175,20 +892,35 @@ class DataFrameCleaner:
 
     # --- 3. PIPELINE ---
 
-    def run_all(self):
-        """Runs the standard cleaning pipeline."""
+    def run_all(self, schema):
+        """
+        Runs the most efficient path: 
+        1. Clean Names 
+        2. Enforce Schema (Cleans whitespace, garbage, and fixes types in 1 pass)
+        3. Drop Duplicates
+        4. Finalize to Arrow
+        """
         return (self
                 .clean_column_names()
-                .standardize_missing_values()
-                .strip_whitespace()
+                .enforce_schema(schema)
+                .drop_missing_cols()
                 .drop_duplicates()
-                .convert_data_types()
-                .unify_na_values()
-                .reset_index()
+                .convert_data_types_arrow()
                 .summarize())
 
-    def get_df(self):
-        return self.df
+    def run_auto_pipeline(self):
+        # 1. Guess the schema
+        detected_schema = self.auto_infer_schema()
+        
+        # 2. Run the enforcement using the guess
+        return self.run_all(detected_schema)
+    
+    def save_parquet(self, path):
+        if path:
+            self.df.to_parquet(path, engine='pyarrow')
+        else:
+            print('No path given')
+
 
 # ==============================================================================
 #  requests
