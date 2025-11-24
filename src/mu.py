@@ -305,6 +305,10 @@ def dict_dupes(list_of_dicts, keys):
 
 
 #  DATAFRAMECLEANER
+    # TODO
+        # checken voor type outliers
+        # include exclude list voor placeholders + specific placeholders
+        # per colom # unique waarden
 import pandas as pd
 import numpy as np
 import re
@@ -313,112 +317,102 @@ import pyarrow as pa
 import ast
 
 class SchemaEnforcer:
-    def __init__(self, df, regex_patterns):
+    def __init__(self, df, regex_patterns, protected_values=None):
+        """
+        protected_values: Dict[str, set] 
+        Example: {'id': {'999', '0000'}, 'score': {'0'}}
+        Values in this dict are EXEMPT from global regex cleaning for that specific column.
+        """
         self.df = df
-        # Compile regex once
         self.garbage_regex = re.compile(regex_patterns)
-
-        #boolean standarization
+        
+        # Convert list to sets for O(1) lookup speed
+        self.protected_values = {k: set(map(str, v)) for k, v in (protected_values or {}).items()}
+        
         self.true_vals = {'y', 'yes', 't', 'true', '1', 'on'}
         self.false_vals = {'n', 'no', 'f', 'false', '0', 'off'}
 
-    def _is_garbage(self, val):
-        """Fast check if a value is 'garbage' based on regex."""
+    def _is_garbage(self, val, col_name=None):
+        """
+        Checks value against standard nulls, then Protected Values, then Global Regex.
+        """
+        # 1. Standard Nulls (Always garbage)
         if val is None or val is pd.NA: return True
         if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val): return True
-        if isinstance(val, str):
-            s = val.strip()
-            if not s: return True 
-            if self.garbage_regex.match(s): return True
+
+        # 2. String conversion for checking
+        # We need a string representation to check against regex and protected lists
+        s_val = str(val).strip()
+
+        # 3. Check Protected Values (The "Exclusion" Check)
+        if col_name and col_name in self.protected_values:
+            if s_val in self.protected_values[col_name]:
+                return False # Explicitly protected: Do NOT treat as garbage
+
+        # 4. Check Global Regex
+        if not s_val: return True # Empty string
+        if self.garbage_regex.match(s_val): 
+            return True
+            
         return False
 
-    def _clean_complex(self, val, expected_type):
-        """Universal cleaner for List/Dict columns."""
-        if self._is_garbage(val): return None
+    def _clean_complex(self, val, expected_type, col_name):
+        if self._is_garbage(val, col_name): return None
         
-        # 1. Handle NumPy Arrays -> List
-        if isinstance(val, np.ndarray):
-            val = val.tolist()
-
-        # 2. Handle Stringified JSON
+        if isinstance(val, np.ndarray): val = val.tolist()
         if isinstance(val, str):
-            try:
-                val = ast.literal_eval(val)
-            except (ValueError, SyntaxError):
-                return None # Parse failure = Garbage
+            try: val = ast.literal_eval(val)
+            except: return None
         
-        # 3. Type Check
-        if isinstance(val, expected_type):
-            return val
-            
+        if isinstance(val, expected_type): return val
         return None
     
-    def _clean_bool(self, val):
-        """
-        Standardizes Boolean values.
-        Maps: 'yes', 'y', '1', 1 -> True
-        Maps: 'no', 'n', '0', 0 -> False
-        Everything else -> None
-        """
-        if self._is_garbage(val): return None
-        
-        # 1. Handle actual Booleans
-        if isinstance(val, bool): 
-            return val
-            
-        # 2. Handle Numbers (1/0)
+    def _clean_bool(self, val, col_name):
+        if self._is_garbage(val, col_name): return None
+        if isinstance(val, bool): return val
         if isinstance(val, (int, float)):
             if val == 1: return True
             if val == 0: return False
-            return None # 2, -1, etc are not booleans
-            
-        # 3. Handle Strings
+            return None
         if isinstance(val, str):
             s = val.strip().lower()
             if s in self.true_vals: return True
             if s in self.false_vals: return False
-            
         return None
     
-    def _clean_scalar_str(self, val):
-        """Forces value to String or None."""
-        if self._is_garbage(val): return None
+    def _clean_scalar_str(self, val, col_name):
+        if self._is_garbage(val, col_name): return None
         if isinstance(val, (list, dict, set, np.ndarray)): return None
         return str(val).strip()
 
     def apply(self, schema):
-        """Applies cleaning logic based on the provided schema dict."""
         print(f"--- Enforcing Schema on {len(schema)} columns ---")
         
         for col, dtype in schema.items():
             if col not in self.df.columns: continue
 
-            # Complex Types
+            # Pass col_name to every cleaner function
             if dtype == 'list':
-                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list))
+                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list, col))
             elif dtype == 'dict':
-                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict))
-
-            # Bool
+                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict, col))
             elif dtype == 'bool':
-                self.df[col] = self.df[col].map(self._clean_bool)
-            
-            # String Types (Vectorized + Map)
+                self.df[col] = self.df[col].map(lambda x: self._clean_bool(x, col))
             elif dtype == 'string':
-                # We use map for speed on object columns, handles the specific cleaning
-                self.df[col] = self.df[col].map(self._clean_scalar_str)
-            
-            # Numeric Types
+                self.df[col] = self.df[col].map(lambda x: self._clean_scalar_str(x, col))
             elif dtype in ['int', 'float', 'number']:
+                # Numeric needs manual garbage check first to support protected values
+                if col in self.protected_values:
+                     self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-                
-            # Date Types
             elif dtype in ['date', 'datetime']:
+                if col in self.protected_values:
+                     self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
                 self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
 
         return self.df
     
-
+#TODO 999 not detected in id at first summarize but is removed at auto-run
 class DataFrameCleaner:
     """
     A class to encapsulate a pandas DataFrame and apply a series of
@@ -444,7 +438,151 @@ class DataFrameCleaner:
         ]
         self.na_placeholders = '|'.join(patterns)
 
-        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
+    # HELPERS
+    def _get_placeholders(self, col):
+        """Helper: Returns a list of unique values matching the garbage regex."""
+        try:
+            # Dropna first to avoid nan errors in unique
+            unique_vals = self.df[col].dropna().unique()
+            
+            # Convert only the unique values to string for regex checking
+            u_series = pd.Series(unique_vals).astype(str)
+            
+            # Check pattern match
+            matches = u_series[u_series.str.match(self.na_placeholders, na=False)]
+            
+            if not matches.empty:
+                return matches.tolist()
+        except Exception:
+            return None
+        return None
+    
+    def _find_unhashable_columns(self):
+        """
+        Identifies columns that contain complex nested data (Lists, Dicts, Structs, Arrays).
+        Supports both legacy 'object' columns and modern 'ArrowDtype' columns.
+        """
+        import pyarrow as pa
+        
+        unhashable_cols = []
+
+        for col in self.df.columns:
+            dtype = self.df[col].dtype
+
+            # --- STRATEGY 1: Check PyArrow Dtypes (Metadata) ---
+            if isinstance(dtype, pd.ArrowDtype):
+                pa_type = dtype.pyarrow_dtype
+                # Check for nested Arrow types
+                if (pa.types.is_list(pa_type) or 
+                    pa.types.is_large_list(pa_type) or 
+                    pa.types.is_fixed_size_list(pa_type) or 
+                    pa.types.is_struct(pa_type) or 
+                    pa.types.is_map(pa_type)):
+                    
+                    unhashable_cols.append(col)
+                    continue
+
+            # --- STRATEGY 2: Check Object Dtypes (Value Inspection) ---
+            if pd.api.types.is_object_dtype(dtype):
+                valid = self.df[col].dropna()
+                if not valid.empty:
+                    if isinstance(valid.iloc[0], (list, dict, set, np.ndarray)):
+                        unhashable_cols.append(col)
+
+        return unhashable_cols
+    
+    def _analyze_arrow_data(self, array, indent=0):
+            """
+            Helper: Recursively walks through PyArrow DATA arrays.
+            - If List: Flattens it and recurses.
+            - If Struct: Extracts fields and recurses.
+            - If Atomic: Calculates unique counts, gets sample, and formats output.
+            """
+            import pyarrow as pa
+            import pyarrow.compute as pc
+            
+            prefix = " " * indent
+            arrow_type = array.type
+            
+            # --- ALIGNMENT SETTINGS ---
+            # Adjust these to change the visual width of columns
+            KEY_WIDTH = 30    # Width for "  * fieldname:"
+            TYPE_WIDTH = 15   # Width for "int64", "string", etc.
+            COUNT_WIDTH = 15  # Width for "123 unique"
+            SAMPLE_WIDTH = 40 # Width for sample text
+
+            # CASE 1: LIST
+            if pa.types.is_list(arrow_type):
+                print(f"{prefix}- List of:")
+                flattened = array.flatten()
+                self._analyze_arrow_data(flattened, indent + 2)
+                
+            # CASE 2: STRUCT / DICT
+            elif pa.types.is_struct(arrow_type):
+                print(f"{prefix}- Object (Dict) with keys:")
+                
+                for field in arrow_type:
+                    # Extract the field column
+                    child_array = array.field(field.name)
+                    
+                    # ALIGNMENT FIX: Pad the key name so the next value starts aligned
+                    # We construct the label "  * name:"
+                    label = f"{prefix}  * {field.name}:"
+                    
+                    # If the child is complex, we print the label and newline
+                    if pa.types.is_list(field.type) or pa.types.is_struct(field.type):
+                        print(label) 
+                        self._analyze_arrow_data(child_array, indent + 6)
+                    # If the child is simple, we print the label PADDIED and stay on same line
+                    else:
+                        # Use ljust to ensure the Type starts at the same horizontal position
+                        # We subtract the indent from KEY_WIDTH to keep alignment relative to nesting
+                        print(f"{label.ljust(KEY_WIDTH + indent)}", end="")
+                        self._analyze_arrow_data(child_array, indent=0)
+
+            # CASE 3: ATOMIC -> STATS & SAMPLE
+            else:
+                total_count = len(array)
+                if total_count == 0:
+                    print(f"{arrow_type} (Empty)")
+                    return
+
+                # 1. Get Stats
+                unique_vals = pc.unique(array)
+                n_unique = len(unique_vals)
+                
+                ratio = n_unique / total_count
+                if n_unique == 1: cat_label = "CONSTANT"
+                elif ratio > 0.9: cat_label = "ID/TEXT"
+                elif ratio < 0.1 or n_unique < 50: cat_label = "CATEGORY"
+                else: cat_label = "DENSE"
+
+                # 2. Get Sample (Safely)
+                # Slice first 50 items to find a non-null without scanning everything
+                sample_slice = array.slice(0, 50) 
+                non_null_slice = sample_slice.drop_null()
+                
+                if len(non_null_slice) > 0:
+                    val = non_null_slice[0].as_py() # Convert to Python object
+                    val_str = str(val).replace('\n', ' ') # Remove newlines for clean print
+                    if len(val_str) > SAMPLE_WIDTH - 3: 
+                        val_str = val_str[:SAMPLE_WIDTH-3] + "..."
+                else:
+                    val_str = "NULL"
+
+                # 3. Format Output (Columns)
+                # If indent is 0, we are inline with a Key, so don't print prefix
+                current_prefix = prefix if indent > 0 else ""
+                
+                # Formatted strings using f-string padding
+                # < : Left Align, > : Right Align
+                type_str = f"{str(arrow_type)}".ljust(TYPE_WIDTH)
+                count_str = f"{n_unique} unique".rjust(10) # e.g. "   5 unique"
+                sample_str = f"sample: {val_str}".ljust(SAMPLE_WIDTH + 8) # +8 for "sample: " length
+
+                print(f"{current_prefix}{type_str} | {count_str} | {sample_str} | ({cat_label})")
+
+
 
     # --- 1. CHECKING METHODS (Inspect without modifying) ---
     def summarize(self):
@@ -460,7 +598,7 @@ class DataFrameCleaner:
             summary = pd.DataFrame(index=self.df.columns)
             summary['missing#'] = self.df.isna().sum()
             summary['missing%'] = (self.df.isna().mean() * 100).round(2)
-            summary['dtypes'] = self.df.dtypes   
+            summary['dtypes'] = self.df.dtypes.astype(str)
 
             unhashable_cols = self._find_unhashable_columns()
             unique_counts = pd.Series(0, index=self.df.columns, dtype='int64')
@@ -485,7 +623,7 @@ class DataFrameCleaner:
                 else:
                     samples.append(np.nan)
 
-                if pd.api.types.is_object_dtype(self.df[col]) or pd.api.types.is_string_dtype(self.df[col]):
+                if col in hashable_cols:
                     matches = self._get_placeholders(col)
                     if matches:
                         found_placeholders.append(str(matches))
@@ -500,7 +638,19 @@ class DataFrameCleaner:
             order = ['missing#', 'missing%', 'unique#', 'sample_val', 'placeholders', 'dtypes']
             summary = summary[order]
     
-            print(summary.to_string())
+            # --- FIX: FORCE LEFT ALIGNMENT ---
+            # 1. Calculate the max length of the dtype strings
+            # (If empty dataframe, default to 10 to prevent errors)
+            max_len = summary['dtypes'].map(len).max() if not summary.empty else 10
+            
+            # 2. Define a formatter
+            # "<" forces left alignment, padding with spaces on the right up to max_len
+            formatters = {
+                'dtypes': lambda x: f"{x:<{max_len}}"
+            }
+
+            # 3. Apply formatter in to_string
+            print(summary.sort_values('dtypes', ascending=False).to_string(formatters=formatters))
             print("--------------------------------------------------\n")
 
             if unhashable_cols:
@@ -509,7 +659,8 @@ class DataFrameCleaner:
             else:
                 print('\nNo complex nested columns found.')
             return self
-
+    
+    
     def analyze_structure_recursive(self, sample_size=5000):
             """
             Converts unhashable columns to PyArrow arrays to infer the schema
@@ -551,80 +702,6 @@ class DataFrameCleaner:
             print("-----------------------------------------------------\n")
             return self
 
-    def _analyze_arrow_data(self, array, indent=0):
-        """
-        Helper: Recursively walks through PyArrow DATA arrays.
-        - If List: Flattens it and recurses.
-        - If Struct: Extracts fields and recurses.
-        - If Atomic: Calculates unique counts.
-        """
-        import pyarrow as pa
-        import pyarrow.compute as pc
-        
-        prefix = " " * indent
-        arrow_type = array.type
-        
-        # CASE 1: LIST (e.g., [ [a,b], [c] ])
-        if pa.types.is_list(arrow_type):
-            # "List<string>"
-            print(f"{prefix}- List of:")
-            
-            # .flatten() unwraps one level of nesting: [a, b, c]
-            # This allows us to analyze the CONTENTS of the lists in aggregate
-            flattened = array.flatten()
-            self._analyze_arrow_data(flattened, indent + 2)
-            
-        # CASE 2: STRUCT / DICT (e.g., {x: 1, y: 2})
-        elif pa.types.is_struct(arrow_type):
-            print(f"{prefix}- Object (Dict) with keys:")
-            
-            for field in arrow_type:
-                # .field(name) extracts the column for just this key
-                child_array = array.field(field.name)
-                
-                print(f"{prefix}  * {field.name}: ", end="")
-                
-                # If child is complex, new line and recurse
-                if pa.types.is_list(field.type) or pa.types.is_struct(field.type):
-                    print("") 
-                    self._analyze_arrow_data(child_array, indent + 6)
-                # If child is simple, print stats on same line
-                else:
-                    self._analyze_arrow_data(child_array, indent=0)
-
-        # CASE 3: ATOMIC (String, Int, Float, etc.) -> CALCULATE STATS
-        else:
-            # This is where the magic happens. We have the raw data array here.
-            # We can count unique values instantly in C++.
-            
-            total_count = len(array)
-            if total_count == 0:
-                print(f"{arrow_type} (Empty)")
-                return
-
-            # pc.unique is very fast
-            unique_vals = pc.unique(array)
-            n_unique = len(unique_vals)
-            
-            # Heuristic for ID vs Category
-            # If >90% of values are unique, it's likely an ID or free text
-            # If <10% are unique, it's likely a category
-            ratio = n_unique / total_count
-            if n_unique == 1:
-                cat_label = "CONSTANT"
-            elif ratio > 0.9:
-                cat_label = "ID/TEXT"
-            elif ratio < 0.1 or n_unique < 50:
-                cat_label = "CATEGORY"
-            else:
-                cat_label = "DENSE"
-
-            # Print details
-            # If indent is 0, we are inline with a Struct key, so don't print prefix
-            current_prefix = prefix if indent > 0 else ""
-            print(f"{current_prefix}{arrow_type} | {n_unique} unique ({cat_label})")
-
-
     def get_samples(self, columns=None, number=5):  # add func for str as well as list
         valid = [c for c in columns or [] if c in self.df.columns]
         if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
@@ -654,40 +731,6 @@ class DataFrameCleaner:
             print("\nNo standard missing values (NaN) found.")
         return self
 
-    def _find_unhashable_columns(self):
-            """
-            Identifies columns that contain complex nested data (Lists, Dicts, Structs, Arrays).
-            Supports both legacy 'object' columns and modern 'ArrowDtype' columns.
-            """
-            import pyarrow as pa
-            
-            unhashable_cols = []
-
-            for col in self.df.columns:
-                dtype = self.df[col].dtype
-
-                # --- STRATEGY 1: Check PyArrow Dtypes (Metadata) ---
-                if isinstance(dtype, pd.ArrowDtype):
-                    pa_type = dtype.pyarrow_dtype
-                    # Check for nested Arrow types
-                    if (pa.types.is_list(pa_type) or 
-                        pa.types.is_large_list(pa_type) or 
-                        pa.types.is_fixed_size_list(pa_type) or 
-                        pa.types.is_struct(pa_type) or 
-                        pa.types.is_map(pa_type)):
-                        
-                        unhashable_cols.append(col)
-                        continue
-
-                # --- STRATEGY 2: Check Object Dtypes (Value Inspection) ---
-                if pd.api.types.is_object_dtype(dtype):
-                    valid = self.df[col].dropna()
-                    if not valid.empty:
-                        if isinstance(valid.iloc[0], (list, dict, set, np.ndarray)):
-                            unhashable_cols.append(col)
-
-            return unhashable_cols
-
     def check_duplicates(self):
         """Checks for duplicate rows, skipping unhashable columns."""
         unhashable_cols = self._find_unhashable_columns()
@@ -707,26 +750,6 @@ class DataFrameCleaner:
         else:
             print("\nNo duplicates found.")
         return self
-    
-    
-    def _get_placeholders(self, col):
-            """Helper: Returns a list of unique values matching the garbage regex."""
-            try:
-                # Dropna first to avoid nan errors in unique
-                unique_vals = self.df[col].dropna().unique()
-                
-                # Convert only the unique values to string for regex checking
-                u_series = pd.Series(unique_vals).astype(str)
-                
-                # Check pattern match
-                matches = u_series[u_series.str.match(self.na_placeholders, na=False)]
-                
-                if not matches.empty:
-                    return matches.tolist()
-            except Exception:
-                # Fallback if something goes wrong with unique() (e.g. unhashable types missed earlier)
-                return None
-            return None
 
   
     def auto_infer_schema(self, sample_size=1000):
@@ -812,19 +835,19 @@ class DataFrameCleaner:
                     inferred[col] = 'string'
                     
             return inferred
-
-
+    
 
 
 
     # --- 2. CLEANING METHODS (Modify the DataFrame) ---
 
-    def enforce_schema(self, schema_dict):
+    def enforce_schema(self, schema_dict, protected_values=None):
         """
         The Master Cleaning Function. 
         Replaces: strip_whitespace, standardize_missing_values, and unify_na_values.
         """
-        self.df = self.enforcer.apply(schema_dict)
+        enforcer = SchemaEnforcer(self.df, self.na_placeholders, protected_values)
+        self.df = enforcer.apply(schema_dict)
         return self
 
     def clean_column_names(self):
@@ -918,7 +941,7 @@ class DataFrameCleaner:
 
     # --- 3. PIPELINE ---
 
-    def run_all(self, schema):
+    def run_all(self, schema, protected_values=None):
         """
         Runs the most efficient path: 
         1. Clean Names 
@@ -928,18 +951,20 @@ class DataFrameCleaner:
         """
         return (self
                 .clean_column_names()
-                .enforce_schema(schema)
+                .enforce_schema(schema, protected_values)
                 .drop_missing_cols()
                 .drop_duplicates()
                 .convert_data_types_arrow()
                 .summarize())
 
-    def run_auto_pipeline(self):
+    def run_auto_pipeline(self, schema=None, protected_values=None):
         # 1. Guess the schema
         detected_schema = self.auto_infer_schema()
-        
+        if schema:
+            detected_schema.update(schema)
+            print(f" applying {len(schema)} overrides to auto schema")
         # 2. Run the enforcement using the guess
-        return self.run_all(detected_schema)
+        return self.run_all(detected_schema,protected_values)
     
     def save_parquet(self, path):
         if path:

@@ -32,7 +32,14 @@ else:
 
 # CLEANING JSON -> PARQUET (arrow dtypes)
 cleaner = DataFrameCleaner(pd.read_json(Path('data/ugent_datadump/publications.json'), lines=True))
-cleaner.run_auto_pipeline()
+schema={
+    'esci_id': 'string'
+}
+protected_values = {
+    'volume': [999,'999'],
+    'issue': ['999',999]
+}
+cleaner.run_auto_pipeline(protected_values=protected_values)
 cleaner.save_parquet(path=UGENT_CLEAN_PATH)
 del cleaner
 gc.collect()
