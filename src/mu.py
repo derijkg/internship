@@ -11,22 +11,6 @@ import shutil
 from pathlib import Path
 from typing import Optional, List, Generator
 from contextlib import contextmanager
-
-def basic_imports():
-    import re
-    import os
-    from collections import Counter
-    import logging
-    import random
-    import requests
-    from requests import Session
-    import time
-    import zipfile
-    import shutil
-    from pathlib import Path
-    from typing import Optional, List, Generator
-    from contextlib import contextmanager
-    import pandas as pd
     
 # ==============================================================================
 #  IO
@@ -334,10 +318,14 @@ class SchemaEnforcer:
         # Compile regex once
         self.garbage_regex = re.compile(regex_patterns)
 
+        #boolean standarization
+        self.true_vals = {'y', 'yes', 't', 'true', '1', 'on'}
+        self.false_vals = {'n', 'no', 'f', 'false', '0', 'off'}
+
     def _is_garbage(self, val):
         """Fast check if a value is 'garbage' based on regex."""
-        if val is None: return True
-        if isinstance(val, (float, int)) and np.isnan(val): return True
+        if val is None or val is pd.NA: return True
+        if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val): return True
         if isinstance(val, str):
             s = val.strip()
             if not s: return True 
@@ -364,7 +352,34 @@ class SchemaEnforcer:
             return val
             
         return None
-
+    
+    def _clean_bool(self, val):
+        """
+        Standardizes Boolean values.
+        Maps: 'yes', 'y', '1', 1 -> True
+        Maps: 'no', 'n', '0', 0 -> False
+        Everything else -> None
+        """
+        if self._is_garbage(val): return None
+        
+        # 1. Handle actual Booleans
+        if isinstance(val, bool): 
+            return val
+            
+        # 2. Handle Numbers (1/0)
+        if isinstance(val, (int, float)):
+            if val == 1: return True
+            if val == 0: return False
+            return None # 2, -1, etc are not booleans
+            
+        # 3. Handle Strings
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in self.true_vals: return True
+            if s in self.false_vals: return False
+            
+        return None
+    
     def _clean_scalar_str(self, val):
         """Forces value to String or None."""
         if self._is_garbage(val): return None
@@ -383,6 +398,10 @@ class SchemaEnforcer:
                 self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list))
             elif dtype == 'dict':
                 self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict))
+
+            # Bool
+            elif dtype == 'bool':
+                self.df[col] = self.df[col].map(self._clean_bool)
             
             # String Types (Vectorized + Map)
             elif dtype == 'string':
@@ -438,25 +457,21 @@ class DataFrameCleaner:
             self.check_duplicates()
 
             print(f"\nGetting dataframe overview...")
-            summary = pd.DataFrame(self.df.dtypes, columns=['dtypes'])
+            summary = pd.DataFrame(index=self.df.columns)
             summary['missing#'] = self.df.isna().sum()
             summary['missing%'] = (self.df.isna().mean() * 100).round(2)
-            
-
+            summary['dtypes'] = self.df.dtypes   
 
             unhashable_cols = self._find_unhashable_columns()
-            unique_counts = pd.Series(index=self.df.columns, dtype='int64')
+            unique_counts = pd.Series(0, index=self.df.columns, dtype='int64')
             hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
             if hashable_cols:
                 unique_counts[hashable_cols] = self.df[hashable_cols].nunique(dropna=True)
                 
             for col in unhashable_cols:
-                try:
-                    unique_counts[col] = self.df[col].astype(str).nunique(dropna=True)
-                except Exception:
-                    unique_counts[col] = 0 # Fallback if something goes really wrong
+                unique_counts[col] = -1 # MAYBE CHECK PER ATOMIC VALUE, PLACEHOLDER, TODO
 
-            summary['unique#'] = unique_counts
+            summary['unique#'] = unique_counts.astype(int)
             # ----------------------------------
 
             samples = []
@@ -482,7 +497,10 @@ class DataFrameCleaner:
             summary['sample_val'] = samples
             summary['placeholders'] = found_placeholders
 
-            print(summary.sort_values('missing%', ascending=False).to_string())
+            order = ['missing#', 'missing%', 'unique#', 'sample_val', 'placeholders', 'dtypes']
+            summary = summary[order]
+    
+            print(summary.to_string())
             print("--------------------------------------------------\n")
 
             if unhashable_cols:
@@ -513,7 +531,7 @@ class DataFrameCleaner:
                 
                 # Cap sample size
                 if len(valid_data) > sample_size:
-                    valid_data = valid_data.sample(n=sample_size, random_state=42)
+                    valid_data = valid_data.sample(n=sample_size)
                 
                 print(f"Column '{col}':")
                 try:
@@ -690,91 +708,110 @@ class DataFrameCleaner:
             print("\nNo duplicates found.")
         return self
     
+    
     def _get_placeholders(self, col):
-        """Helper: Returns a list of unique values matching the garbage regex."""
-        # Convert to string for regex check
-        col_as_str = self.df[col].astype(str)
-        
-        # Check pattern match
-        matches_mask = col_as_str.str.match(self.na_placeholders, na=False)
-        
-        # CRITICAL FIX: Exclude values that are ALREADY real NaN/None
-        # We only want strings that look like garbage, not actual missing values
-        is_real_nan = self.df[col].isna()
-        final_mask = matches_mask & (~is_real_nan)
-
-        if final_mask.any():
-            return self.df.loc[final_mask, col].unique().tolist()
-        return None
-
-    def auto_infer_schema(self, sample_size=1000):
-        """
-        Automatically guesses the schema dictionary required by enforce_schema.
-        Returns: dict (e.g. {'file': 'list', 'title': 'string', 'year': 'int'})
-        """
-        import pyarrow as pa
-        import numpy as np
-        import ast
-
-        inferred = {}
-        print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
-
-        for col in self.df.columns:
-            # 1. Get a clean sample
-            valid_sample = self.df[col].dropna()
-            if valid_sample.empty:
-                continue # Cannot infer from empty, skip (will remain untouched)
-            
-            if len(valid_sample) > sample_size:
-                valid_sample = valid_sample.sample(n=sample_size, random_state=42)
-
-            # 2. Check basics first (Pandas Dtypes)
-            if pd.api.types.is_integer_dtype(self.df[col]):
-                inferred[col] = 'int'
-                continue
-            elif pd.api.types.is_float_dtype(self.df[col]):
-                inferred[col] = 'float'
-                continue
-            elif pd.api.types.is_datetime64_any_dtype(self.df[col]):
-                inferred[col] = 'datetime'
-                continue
-            
-            # 3. Deep Inspection for Objects (String vs List vs Dict)
-            # We use your existing logic to handle Arrays/Strings looking like lists
+            """Helper: Returns a list of unique values matching the garbage regex."""
             try:
-                first_val = valid_sample.iloc[0]
+                # Dropna first to avoid nan errors in unique
+                unique_vals = self.df[col].dropna().unique()
                 
-                # Fix NumPy arrays for detection
-                if isinstance(first_val, np.ndarray):
-                    valid_sample = valid_sample.apply(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
-                # Fix Stringified Lists for detection
-                elif isinstance(first_val, str) and (first_val.strip().startswith('[') or first_val.strip().startswith('{')):
-                    try:
-                        valid_sample = valid_sample.apply(ast.literal_eval)
-                    except:
-                        pass # It's just a string
+                # Convert only the unique values to string for regex checking
+                u_series = pd.Series(unique_vals).astype(str)
                 
-                # Use PyArrow to guess the type of the OBJECT column
-                arrow_array = pa.array(valid_sample.tolist())
-                arrow_type = arrow_array.type
-
-                if pa.types.is_list(arrow_type):
-                    inferred[col] = 'list'
-                    print(f"  > Detected '{col}' as LIST")
-                elif pa.types.is_struct(arrow_type) or pa.types.is_map(arrow_type):
-                    inferred[col] = 'dict'
-                    print(f"  > Detected '{col}' as DICT")
-                elif pa.types.is_string(arrow_type):
-                    inferred[col] = 'string'
-                else:
-                    # Fallback for weird objects
-                    inferred[col] = 'string'
-
+                # Check pattern match
+                matches = u_series[u_series.str.match(self.na_placeholders, na=False)]
+                
+                if not matches.empty:
+                    return matches.tolist()
             except Exception:
-                # If PyArrow crashes (mixed types), usually safest to treat as string
-                inferred[col] = 'string'
+                # Fallback if something goes wrong with unique() (e.g. unhashable types missed earlier)
+                return None
+            return None
 
-        return inferred
+  
+    def auto_infer_schema(self, sample_size=1000):
+
+            inferred = {}
+            print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
+
+            for col in self.df.columns:
+                valid = self.df[col].dropna()
+                if valid.empty: continue
+                
+                if len(valid) > sample_size: 
+                    valid = valid.sample(n=sample_size, random_state=42)
+
+                # --- PHASE 1: Explicit Booleans ---
+                if pd.api.types.is_bool_dtype(self.df[col]): 
+                    inferred[col] = 'bool'
+                    continue
+
+                # --- PHASE 2: Numeric Inspection (Int/Float OR Bool?) ---
+                if pd.api.types.is_numeric_dtype(self.df[col]):
+                    # Check for "Binary Integer" Boolean (0, 1)
+                    # We use the sample 'valid' to be fast
+                    unique_nums = valid.unique()
+                    
+                    # If the column ONLY contains 0s and 1s (and we already dropped NaNs)
+                    if set(unique_nums).issubset({0, 1, 0.0, 1.0}):
+                        inferred[col] = 'bool'
+                        print(f"  > Detected '{col}' as BOOL (Binary Numeric)")
+                    
+                    # Otherwise, standard numeric fallback
+                    elif pd.api.types.is_integer_dtype(self.df[col]): 
+                        inferred[col] = 'int'
+                    else: 
+                        inferred[col] = 'float'
+                    
+                    continue
+
+                # --- PHASE 3: Date Inspection ---
+                if pd.api.types.is_datetime64_any_dtype(self.df[col]): 
+                    inferred[col] = 'datetime'
+                    continue
+
+                # --- PHASE 4: Object Inspection ---
+                try:
+                    first_val = valid.iloc[0]
+                    is_complex_object = isinstance(first_val, (list, dict, set, np.ndarray))
+
+                    # --- BOOLEAN DETECTION (String Scalar) ---
+                    if not is_complex_object:
+                        unique_vals = valid.astype(str).str.lower().unique()
+                        
+                        if len(unique_vals) <= 10: 
+                            u_series = pd.Series(unique_vals)
+                            # Filter garbage
+                            mask_clean = ~u_series.str.match(self.na_placeholders)
+                            clean_vals = u_series[mask_clean].tolist()
+                            
+                            if clean_vals:
+                                check_set = set(clean_vals)
+                                # Check for Yes/No, T/F, Y/N
+                                if check_set.issubset(self.enforcer.true_vals | self.enforcer.false_vals):
+                                    inferred[col] = 'bool'
+                                    print(f"  > Detected '{col}' as BOOL (Semantic String)")
+                                    continue
+
+                    # --- PHASE 5: Deep Arrow Inference (Complex Types) ---
+                    def normalize(x):
+                        if isinstance(x, np.ndarray): return x.tolist()
+                        if isinstance(x, str) and x.strip().startswith(('[','{')):
+                            try: return ast.literal_eval(x)
+                            except: pass
+                        return x
+                    
+                    sample_list = valid.apply(normalize).tolist()
+                    arrow_type = pa.array(sample_list).type
+                    
+                    if pa.types.is_list(arrow_type): inferred[col] = 'list'; print(f"  > Detected '{col}' as LIST")
+                    elif pa.types.is_struct(arrow_type) or pa.types.is_map(arrow_type): inferred[col] = 'dict'; print(f"  > Detected '{col}' as DICT")
+                    else: inferred[col] = 'string'
+
+                except Exception:
+                    inferred[col] = 'string'
+                    
+            return inferred
 
 
 
@@ -829,17 +866,6 @@ class DataFrameCleaner:
             print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
         return self
 
-    def map_yn_to_boolean(self, columns):
-        """Maps 'yes/no' style columns to boolean True/False."""
-        yn_map = {'y': True, 'n': False, 'yes': True, 'no': False, 't': True, 'f': False}
-        
-        for col in columns:
-            if col in self.df.columns:
-                self.df[col] = self.df[col].astype(str).str.lower().map(yn_map)
-        
-        print(f"Mapped {columns} to boolean.")
-        return self
-
     def drop_duplicates(self):
         # Only check hashable columns to avoid crashing on lists
         unhashable = self._find_unhashable_columns()
@@ -880,7 +906,7 @@ class DataFrameCleaner:
                 arrow_array = pa.array(self.df[col].dropna())
 
                 self.df[col] = self.df[col].astype(pd.ArrowDtype(arrow_array.type))
-                print(f' > Cast {col} to strict {arrow_array.type}')
+                print(f' > {col}: {arrow_array.type}')
             except Exception:
                 pass
         print('Conversion complete.')
