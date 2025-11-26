@@ -317,5 +317,9 @@ if not PATH_SB_CLEAN.exists():
 
     print(f'idx: {last_idx_pre, last_idx_post}')
     print(f'id: {last_id_pre, last_id_post}')
-    if last_id_pre != last_id_post:
+    if int(last_id_pre) != int(last_id_post):
         print('\nwarning last id got removed or things moved i think'*10)
+
+    del cleaner
+    del df_s
+    gc.collect()

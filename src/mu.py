@@ -655,7 +655,7 @@ class DataFrameCleaner:
                 # Formatted strings using f-string padding
                 # < : Left Align, > : Right Align
                 type_str = f"{str(arrow_type)}".ljust(TYPE_WIDTH)
-                count_str = f"{n_unique} unique".rjust(10) # e.g. "   5 unique"
+                count_str = f"{n_unique} unique".rjust(10) # e.g. "   5 unique" #TODO where unique counts are below 10 or so, print all possible values
                 sample_str = f"sample: {val_str}".ljust(SAMPLE_WIDTH + 8) # +8 for "sample: " length
 
                 print(f"{current_prefix}{type_str} | {count_str} | {sample_str} | ({cat_label})")
@@ -764,7 +764,7 @@ class DataFrameCleaner:
                 
                 # Cap sample size
                 if len(valid_data) > sample_size:
-                    valid_data = valid_data.sample(n=sample_size)
+                    valid_data = valid_data.sample(n=sample_size, random_state=42)
                 
                 print(f"Column '{col}':")
                 try:
@@ -789,7 +789,7 @@ class DataFrameCleaner:
         if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
         for col in valid:
             s = self.df[col].dropna()
-            print(f"Column: {col}, {type(s.iloc[0])}", *s.sample(min(number, len(s))), "-" * 30, sep="\n")
+            print(f"Column: {col}, {type(s.iloc[0])}", *s.sample(min(number, len(s))), "-" * 30, sep="\n") 
             
         return self
 

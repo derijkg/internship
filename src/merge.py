@@ -13,11 +13,14 @@ PATH_SB_CLEAN = Path('data/metadata_clean.parquet')
 
 PATH_MERGED = Path('data/metadata.parquet')
 
+# logic
+    # select first then add data
+
 # MERGE
     #TODO
         # some non downloadable english abstract texts were making it in, maybe download type is wrong? check fullText condition
 ''' selecting from ugent and merging datasets '''
-
+# SB
 df1 = pd.read_parquet(
     PATH_SB_CLEAN, 
     engine='pyarrow', 
@@ -27,6 +30,8 @@ df1 = pd.read_parquet(
         ('year', '<=', 2022)
     ]
 )
+
+# UG
 df2 = pd.read_parquet(
     PATH_UGENT_CLEAN, 
     engine='pyarrow', 
@@ -44,6 +49,7 @@ def get_open_access_link(file_list):
     if isinstance(file_list, (list, np.ndarray)):
         for f in file_list:
             if isinstance(f, dict) and f.get('access') == 'open': #TODO and f.get(typeofcontent) == 'fullText' something
+                
                 return f.get('url')
     return None
 
@@ -94,7 +100,6 @@ def process_authors(auth_list):
             if full:
                 result.append(full)
     return result
-
 
 # unused 
 def process_affiliation(aff_list):
