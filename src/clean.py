@@ -14,7 +14,7 @@ PATH_UGENT_CLEAN = Path('data/ugent_datadump/ugent_cleaned.parquet')
 PATH_SB_CSV = Path('data/metadata copy.csv')
 PATH_SB_CLEAN = Path('data/metadata_clean.parquet')
 
-PATH_MERGED = Path('data/metadata.parquet')
+#PATH_MERGED = Path('data/metadata.parquet')
 
 
 # FUNCTIONS
@@ -133,7 +133,7 @@ def solve_duplicates(df):
     
     # Find authors that appear > 1 time in the WHOLE dataframe
     # (We cast to str to ensure hashability if list)
-    author_counts = df['authors'].astype(str).value_counts()
+    author_counts = df['authors'].apply(str).value_counts()
     repeated_authors = author_counts[author_counts > 1].index
     
     unaccounted_results = []
@@ -141,7 +141,7 @@ def solve_duplicates(df):
     for auth in repeated_authors:
         # Get all indices for this author
         # Note: This filtering might be slow on huge DFs, usually better to iterate groups
-        mask = df['authors'].astype(str) == auth
+        mask = df['authors'].apply(str) == auth
         author_indices = set(df.index[mask])
         
         # Subtract indices we already handled in Step 2
@@ -159,11 +159,16 @@ def solve_duplicates(df):
     df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
     
     return keep_idx, remove_idx
+
+
+
+# EXECUTION ---------------------------------------------------------------------------------
+
 # UGENT -----------------------------------------------------------------------------------
 
 # DOWNLOAD UGENT JSON IF DOESNT EXIST
 datadump_url = 'https://biblio.ugent.be/exports/publications.json'
-
+print('Attempting ugent datadump download')
 if not PATH_UGENT_JSON.exists():
     print(f'Downloading ugent datadump from {PATH_UGENT_JSON}')
 
@@ -208,6 +213,9 @@ if not PATH_UGENT_CLEAN.exists():
 
 if not PATH_SB_CLEAN.exists():
     df_s = pd.read_csv(PATH_SB_CSV)
+    # CHECK FOR LATER OPERATION
+    last_idx_pre = len(df_s)
+    last_id_pre = df_s['id'].iloc[-1]
 
     # add future rows (might delete later)
     df_s['abstract'] = None
@@ -284,7 +292,7 @@ if not PATH_SB_CLEAN.exists():
     
     keep, remove = solve_duplicates(cleaner.df)
     cleaner.df.drop(index=list(remove),inplace=True)
-
+    cleaner.df.reset_index()
     
     
     #TODO remove duplicates from archive and marker_ouput
@@ -302,3 +310,12 @@ if not PATH_SB_CLEAN.exists():
 
     # final
     cleaner.save_parquet(path=PATH_SB_CLEAN)
+
+    # CHECK
+    last_idx_post = len(cleaner.df)
+    last_id_post = cleaner.df['id'].iloc[-1]
+
+    print(f'idx: {last_idx_pre, last_idx_post}')
+    print(f'id: {last_id_pre, last_id_post}')
+    if last_id_pre != last_id_post:
+        print('\nwarning last id got removed or things moved i think'*10)

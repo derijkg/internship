@@ -1095,7 +1095,8 @@ class DataFrameCleaner:
         return self
 
     # --- 3. PIPELINE ---
-
+    #TODO 
+        # check first for mixed types and adapt enforce schema
     def run_all(self, schema, protected_values=None):
         """
         Runs the most efficient path: 
