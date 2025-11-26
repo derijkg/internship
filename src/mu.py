@@ -309,6 +309,7 @@ def dict_dupes(list_of_dicts, keys):
         # checken voor type outliers
         # include exclude list voor placeholders + specific placeholders
         # per colom # unique waarden
+        # 
 import pandas as pd
 import numpy as np
 import re
@@ -318,53 +319,43 @@ import ast
 
 class SchemaEnforcer:
     def __init__(self, df, regex_patterns, protected_values=None):
-        """
-        protected_values: Dict[str, set] 
-        Example: {'id': {'999', '0000'}, 'score': {'0'}}
-        Values in this dict are EXEMPT from global regex cleaning for that specific column.
-        """
         self.df = df
         self.garbage_regex = re.compile(regex_patterns)
         
-        # Convert list to sets for O(1) lookup speed
-        self.protected_values = {k: set(map(str, v)) for k, v in (protected_values or {}).items()}
+        # Track detailed statistics
+        # Structure: {col: {'total': 0, 'placeholders': 0, 'mismatch': 0, 'examples': []}}
+        self.stats = {} 
         
+        self.protected_values = {k: set(map(str, v)) for k, v in (protected_values or {}).items()}
         self.true_vals = {'y', 'yes', 't', 'true', '1', 'on'}
         self.false_vals = {'n', 'no', 'f', 'false', '0', 'off'}
 
     def _is_garbage(self, val, col_name=None):
-        """
-        Checks value against standard nulls, then Protected Values, then Global Regex.
-        """
-        # 1. Standard Nulls (Always garbage)
+        """Row-level check used inside apply/map functions."""
         if val is None or val is pd.NA: return True
         if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val): return True
 
-        # 2. String conversion for checking
-        # We need a string representation to check against regex and protected lists
         s_val = str(val).strip()
 
-        # 3. Check Protected Values (The "Exclusion" Check)
         if col_name and col_name in self.protected_values:
             if s_val in self.protected_values[col_name]:
-                return False # Explicitly protected: Do NOT treat as garbage
+                return False 
 
-        # 4. Check Global Regex
-        if not s_val: return True # Empty string
-        if self.garbage_regex.match(s_val): 
-            return True
-            
+        if not s_val: return True
+        if self.garbage_regex.match(s_val): return True
         return False
 
+    # --- Cleaning Functions ---
     def _clean_complex(self, val, expected_type, col_name):
         if self._is_garbage(val, col_name): return None
-        
         if isinstance(val, np.ndarray): val = val.tolist()
         if isinstance(val, str):
             try: val = ast.literal_eval(val)
             except: return None
-        
-        if isinstance(val, expected_type): return val
+        if isinstance(val, expected_type): #TODO recursive checking for NA, if all NA put whole as NA
+            if len(val) == 0:
+                return None
+            return val
         return None
     
     def _clean_bool(self, val, col_name):
@@ -385,13 +376,55 @@ class SchemaEnforcer:
         if isinstance(val, (list, dict, set, np.ndarray)): return None
         return str(val).strip()
 
+    # --- Analysis Helper (UPDATED) ---
+    def _scan_placeholders(self, col):
+        """
+        Vectorized scan to count AND identify regex matches.
+        Returns: (count, list_of_unique_matches)
+        """
+        try:
+            # 1. Get non-null values as strings
+            s = self.df[col].dropna().astype(str).str.strip()
+            if s.empty: return 0, []
+
+            # 2. Exclude Protected Values
+            if col in self.protected_values:
+                mask_protected = s.isin(self.protected_values[col])
+                s = s[~mask_protected]
+
+            if s.empty: return 0, []
+
+            # 3. Find Matches
+            # Get boolean mask of garbage
+            mask_garbage = s.str.match(self.garbage_regex)
+            
+            # Filter the series to just the garbage
+            garbage_values = s[mask_garbage]
+            
+            count = garbage_values.shape[0]
+            
+            # Get unique examples (limit to top 5 to avoid massive lists)
+            if count > 0:
+                examples = garbage_values.unique().tolist()
+            else:
+                examples = []
+                
+            return count, examples
+        except:
+            return 0, []
+
     def apply(self, schema):
         print(f"--- Enforcing Schema on {len(schema)} columns ---")
         
         for col, dtype in schema.items():
             if col not in self.df.columns: continue
+            
+            initial_valid = self.df[col].notna().sum()
+            
+            # NEW: Get count AND specific values found
+            n_placeholders, found_examples = self._scan_placeholders(col)
 
-            # Pass col_name to every cleaner function
+            # --- Transformation ---
             if dtype == 'list':
                 self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list, col))
             elif dtype == 'dict':
@@ -401,7 +434,6 @@ class SchemaEnforcer:
             elif dtype == 'string':
                 self.df[col] = self.df[col].map(lambda x: self._clean_scalar_str(x, col))
             elif dtype in ['int', 'float', 'number']:
-                # Numeric needs manual garbage check first to support protected values
                 if col in self.protected_values:
                      self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
@@ -409,6 +441,41 @@ class SchemaEnforcer:
                 if col in self.protected_values:
                      self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
                 self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+
+            final_valid = self.df[col].notna().sum()
+            
+            # --- Stats Calculation ---
+            total_cleaned = initial_valid - final_valid
+            n_mismatch = max(0, total_cleaned - n_placeholders)
+            
+            # Consistency check
+            if total_cleaned < n_placeholders:
+                n_placeholders = total_cleaned
+
+            if total_cleaned > 0:
+                self.stats[col] = {
+                    'total': total_cleaned,
+                    'placeholders': n_placeholders,
+                    'mismatch': n_mismatch,
+                    'examples': found_examples # Store the specific values found
+                }
+
+        # --- Print Detailed Report (UPDATED) ---
+        if self.stats:
+            print("\n[Cleaning Report] Values converted to NaN:\n")
+            # Adjusted widths to fit the new column
+            print(f"{'Column':<20} | {'Total':<6} | {'Regex Match':<11} | {'Type Mismatch':<13} | {'Detected Garbage'}")
+            print("-" * 100)
+            
+            for col, data in self.stats.items():
+                # Format the examples list as a string, truncate if too long
+                ex_str = str(data['examples'])
+                if len(ex_str) > 40: 
+                    ex_str = ex_str[:37] + "..."
+                
+                print(f"{col:<20} | {data['total']:<6} | {data['placeholders']:<11} | {data['mismatch']:<13} | {ex_str}")
+        else:
+            print("\n[Cleaning Report] No values were converted to NaN.\n")
 
         return self.df
     
@@ -419,10 +486,21 @@ class DataFrameCleaner:
     common cleaning operations using method chaining.
     """
 
-    def __init__(self, dataframe):
+    def __init__(self, data):
         # Create a copy to avoid setting warnings or modifying the original variable unexpectedly
-        self.df = dataframe.copy()
-        print("DataFrameCleaner initialized. (Working on a copy)")
+        if isinstance(data, pd.DataFrame):
+            self.df = data.copy()
+            print('Dataframe cleaner initialized, working on copy')
+        if isinstance(data, (Path, str)):
+            try: path = Path(data)
+            except: raise ValueError(f'couldnt convert string to path, invalid path')
+            if not path.exists(): raise FileNotFoundError(f'file not found {path}')
+            if path.suffix.lower() != '.parquet': raise ValueError(f'Input parquet file. got {path.suffix}')
+
+            self.df = pd.read_parquet(path, engine='pyarrow',dtype_backend='pyarrow')
+            print(f'Dataframe cleaner initialized.')
+
+
 
         pd.set_option('display.max_rows', None)
         print('Showing all rows, set back with pd.set_option(\'display.max_rows\', 10 idk)')
@@ -591,9 +669,9 @@ class DataFrameCleaner:
             samples, and detected placeholder garbage values.
             """
             print(f"\n--- DataFrame Summary (Shape: {self.df.shape} (rows, cols)) ---")
-            print(f"\nChecking for duplicate rows...")
+            print(f"\nDUPLICATES")
             self.check_duplicates()
-
+            print('-'*20)
             print(f"\nGetting dataframe overview...")
             summary = pd.DataFrame(index=self.df.columns)
             summary['missing#'] = self.df.isna().sum()
@@ -651,7 +729,11 @@ class DataFrameCleaner:
 
             # 3. Apply formatter in to_string
             print(summary.sort_values('dtypes', ascending=False).to_string(formatters=formatters))
-            print("--------------------------------------------------\n")
+            print('\n')
+            print("-"*20)
+
+            self.check_mixed_type()
+            print('-'*20)
 
             if unhashable_cols:
                 print(f"\nChecking unhashable column structures...")
@@ -707,9 +789,42 @@ class DataFrameCleaner:
         if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
         for col in valid:
             s = self.df[col].dropna()
-            print(f"Column: {col}", *s.sample(min(number, len(s))), "-" * 30, sep="\n")
+            print(f"Column: {col}, {type(s.iloc[0])}", *s.sample(min(number, len(s))), "-" * 30, sep="\n")
             
         return self
+
+    def check_mixed_type(self, verbose=True):
+        """
+        Checks for columns containing multiple data types (e.g. str AND int).
+        Useful for debugging why a column won't convert to a strict schema.
+        """
+        mixed_report = {}
+        
+        # We only care about 'object' columns. 
+        # Numeric/Datetime columns in Pandas are guaranteed to be homogeneous (or NaN).
+        candidates = self.df.select_dtypes(include=['object']).columns
+        
+        for col in candidates:
+            # Get unique types of non-null values
+            # We use apply(type) which is slow but necessary for exact diagnostics
+            types_counts = self.df[col].dropna().apply(type).value_counts()
+            
+            if len(types_counts) > 1:
+                # Store clean names (e.g. 'int' instead of <class 'int'>)
+                breakdown = {str(t.__name__): count for t, count in types_counts.items()}
+                mixed_report[col] = breakdown
+
+        if verbose:
+            if mixed_report:
+                print("\n[Mixed Type Report] The following columns have inconsistent data types:")
+                print(f"{'Column':<25} | {'Type Breakdown'}")
+                print("-" * 60)
+                for col, stats in mixed_report.items():
+                    print(f"{col:<25} | {stats}")
+            else:
+                print("\n[Mixed Type Report]\nNo mixed data types found (All object columns are homogeneous).")
+                
+        return mixed_report
 
     def check_missing_values(self):
         """Prints a report of missing values."""
@@ -840,6 +955,38 @@ class DataFrameCleaner:
 
 
     # --- 2. CLEANING METHODS (Modify the DataFrame) ---
+    def drop_short_strings(self, column, min_chars=10):
+        """Sets values in a string column to NaN if they are too short."""
+        if column in self.df.columns:
+            # Calculate lengths (handling existing NaNs gracefully)
+            lengths = self.df[column].astype(str).str.len()
+            
+            # Find indices where length is valid (not nan) but below threshold
+            # We check 'notna' to distinguish between "short string" and "already empty"
+            mask = (lengths < min_chars) & (self.df[column].notna())
+            
+            count = mask.sum()
+            if count > 0:
+                self.df.loc[mask, column] = np.nan
+                print(f"Cleaned '{column}': Removed {count} values shorter than {min_chars} chars.")
+        return self
+    
+    def reset_data(self, df_original):
+        """
+        Replaces the current (cleaned) dataframe with a fresh copy of the original.
+        Useful for restarting the pipeline without re-initializing the whole class.
+        """
+        print("Resetting DataFrame to original state...")
+        
+        # Create a fresh copy so we don't mutate the external variable
+        self.df = df_original.copy()
+        
+        # IMPORTANT: We must clear any previous analysis/enforcer state
+        # Re-initialize the enforcer with the new data
+        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
+        
+        print(f"Reset complete. Shape: {self.df.shape}")
+        return self
 
     def enforce_schema(self, schema_dict, protected_values=None):
         """
@@ -911,7 +1058,15 @@ class DataFrameCleaner:
         """
         The Final Step: Convert everything to PyArrow backends.
         This locks in the schema and optimizes memory.
+        
         """
+        print("Step 0: Checking for mixed types before conversion...")
+        mixed = self.check_mixed_type(verbose=False)
+        
+        if mixed:
+            print(f"⚠️ WARNING: Found {len(mixed)} mixed-type columns. PyArrow inference might fail or default to string for these:")
+            print(list(mixed.keys()))
+
         print("Step 1: Auto converting to PyArrow-backed types...")
         try:
             # automatic conversion
@@ -968,7 +1123,7 @@ class DataFrameCleaner:
     
     def save_parquet(self, path):
         if path:
-            self.df.to_parquet(path, engine='pyarrow')
+            self.df.to_parquet(path, engine='pyarrow', index=False)
         else:
             print('No path given')
 
