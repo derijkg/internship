@@ -7,10 +7,11 @@ from pathlib import Path
 
 # --- Configuration ---
 ZIP_INPUT = Path("data/archive.zip")
-ZIP_OUTPUT = Path("data/output_marker.zip")
 
 TEMP_OUTPUT = Path("data/temp/marker_output")
 TEMP_INPUT = Path("data/temp/temp_extraction")
+
+ZIP_OUTPUT = Path("data/output_marker.zip")
 
 IGNORE_LIST = ['1058',
  '1191',
@@ -46,6 +47,12 @@ IGNORE_LIST = ['1058',
  '692',
  '820',
  '841'] # constant failures
+
+# MARKER CONFIG
+workers = '1'
+detection_batch_size = '14'
+layout_batch_size = '14'
+pdftext_workers = '12'
 # ---------------------
 
 def zip_output_files(source_dir, zip_path):
@@ -147,10 +154,12 @@ def main():
         try:
             command = [
                 "marker",
+                '--debug_print',
+                #'--workers','1',
                 '--disable_image_extraction',
-                '--detection_batch_size', '5', 
-                '--layout_batch_size', '5',
-                '--pdftext_workers', '12',
+                '--detection_batch_size', detection_batch_size, 
+                '--layout_batch_size', layout_batch_size,
+                '--pdftext_workers', pdftext_workers,
                 '--output_dir', str(TEMP_OUTPUT),
                 str(TEMP_INPUT)
             ]
