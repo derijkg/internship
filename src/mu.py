@@ -345,13 +345,17 @@ class SchemaEnforcer:
         if self.garbage_regex.match(s_val): return True
         return False
     
-    #TODO WORKING integrate in clean_complex???
+    # --- Cleaning Functions ---
     def _prune_empty(self, obj):
         """Recursively removes empty structures."""
+        # keeps position by adding none
         if isinstance(obj, list):
             cleaned = [self._prune_empty(x) for x in obj]
-            cleaned = [x for x in cleaned if x is not None]
-            return cleaned if cleaned else None
+            if all(x is None for x in cleaned):
+                return None
+            return cleaned
+
+        # agressive: removes key, should work with pyarrow
         elif isinstance(obj, dict):
             cleaned = {k: self._prune_empty(v) for k, v in obj.items()}
             cleaned = {k: v for k, v in cleaned.items() if v is not None}
@@ -359,18 +363,22 @@ class SchemaEnforcer:
         # Base case
         return None if self._is_garbage(obj) else obj
     
-    # --- Cleaning Functions ---
     def _clean_complex(self, val, expected_type, col_name):
         if self._is_garbage(val, col_name): return None
         if isinstance(val, np.ndarray): val = val.tolist()
         if isinstance(val, str):
             try: val = ast.literal_eval(val)
             except: return None
-        if isinstance(val, expected_type): #TODO recursive checking for NA, if all NA put whole as NA
-            if len(val) == 0:
+        if isinstance(val, expected_type):
+            return self._prune_empty(val)
+        else:
+            if expected_type is list and val is not None:
+                print(f'UNEXPECTED DTYPE: {col_name}: {val}\nAttempting recovery through listing value.')
+                new_val = [val]
+                return self._prune_empty(new_val)
+            else:
+                print(f'UNEXPECTED DTYPE: {col_name}: {val}\nIrrecoverable: {expected_type} value set to None')
                 return None
-            return val
-        return None
     
     def _clean_bool(self, val, col_name):
         if self._is_garbage(val, col_name): return None
@@ -386,9 +394,51 @@ class SchemaEnforcer:
         return None
     
     def _clean_scalar_str(self, val, col_name):
+        # 1. Immediate Garbage Check
         if self._is_garbage(val, col_name): return None
-        if isinstance(val, (list, dict, set, np.ndarray)): return None
+        
+        # 2. Handle PyArrow Scalars (Unbox to Python objects)
+        if hasattr(val, 'as_py'):
+            val = val.as_py()
+
+        # 3. String Recovery (Parse "['text']" or "{'text'}")
+        if isinstance(val, str):
+            val = val.strip()
+            if val.startswith(('[', '{')):
+                try:
+                    parsed = ast.literal_eval(val)
+                    # Recursively clean the parsed object
+                    return self._clean_scalar_str(parsed, col_name)
+                except:
+                    pass # Keep as string if parsing fails
+            
+            if self._is_garbage(val, col_name): return None
+            return val
+
+        # 4. Container Recovery (List, Tuple, Array, AND SET)
+        # Added 'set' here to fix the volume issue: {9141} -> 9141
+        if isinstance(val, (list, tuple, np.ndarray, set)):
+            # Convert to list for consistent indexing
+            if isinstance(val, (np.ndarray, set)): 
+                val = list(val)
+            
+            # Filter out internal garbage
+            valid_items = [v for v in val if not self._is_garbage(v, col_name)]
+            
+            if not valid_items:
+                return None
+            
+            # RECOVERY STRATEGY: Take the first valid item
+            # Recursively clean it (handles [['Text']])
+            return self._clean_scalar_str(valid_items[0], col_name)
+
+        # 5. Dict Recovery (Still unsafe to guess key, drop)
+        if isinstance(val, dict):
+            return None
+
+        # 6. Numeric/Bool to String
         return str(val).strip()
+
 
     # --- Analysis Helper (UPDATED) ---
     def _scan_placeholders(self, col):
@@ -674,6 +724,10 @@ class DataFrameCleaner:
 
                 print(f"{current_prefix}{type_str} | {count_str} | {sample_str} | ({cat_label})")
 
+    def _get_python_type_name(self, val):
+        """Helper to get a clean string representation of a type."""
+        return type(val).__name__
+
 
 
     # --- 1. CHECKING METHODS (Inspect without modifying) ---
@@ -743,7 +797,7 @@ class DataFrameCleaner:
             print('\n')
             print("-"*20)
 
-            self.check_mixed_type()
+            self.audit_mixed_types()
             print('-'*20)
 
             if unhashable_cols:
@@ -804,39 +858,55 @@ class DataFrameCleaner:
             
         return self
 
-    def check_mixed_type(self, verbose=True):
+    def audit_mixed_types(self, verbose=True):
         """
-        Checks for columns containing multiple data types (e.g. str AND int).
-        Useful for debugging why a column won't convert to a strict schema.
+        Analyzes object columns. Returns a dict containing detailed stats about mixed types.
+        Structure: {col: {'majority_type': 'str', 'breakdown': {...}, 'outliers': [val1, val2]}}
         """
-        mixed_report = {}
+        report = {}
         
-        # We only care about 'object' columns. 
-        # Numeric/Datetime columns in Pandas are guaranteed to be homogeneous (or NaN).
+        # Only check object columns (where mixing happens)
         candidates = self.df.select_dtypes(include=['object']).columns
         
         for col in candidates:
-            # Get unique types of non-null values
-            # We use apply(type) which is slow but necessary for exact diagnostics
-            types_counts = self.df[col].dropna().apply(type).value_counts()
+            # Drop NAs to check actual values
+            valid_series = self.df[col].dropna()
+            if valid_series.empty: continue
+
+            # Get type counts
+            type_counts = valid_series.apply(self._get_python_type_name).value_counts()
             
-            if len(types_counts) > 1:
-                # Store clean names (e.g. 'int' instead of <class 'int'>)
-                breakdown = {str(t.__name__): count for t, count in types_counts.items()}
-                mixed_report[col] = breakdown
-
-        if verbose:
-            if mixed_report:
-                print("\n[Mixed Type Report] The following columns have inconsistent data types:")
-                print(f"{'Column':<25} | {'Type Breakdown'}")
-                print("-" * 60)
-                for col, stats in mixed_report.items():
-                    print(f"{col:<25} | {stats}")
-            else:
-                print("\n[Mixed Type Report]\nNo mixed data types found (All object columns are homogeneous).")
+            if len(type_counts) > 1:
+                # Identify Majority and Minority
+                majority_type = type_counts.idxmax()
+                majority_count = type_counts.max()
+                total_count = type_counts.sum()
                 
-        return mixed_report
+                # Find samples of the minority types (the "Outliers")
+                # We iterate to find indices where type != majority
+                # Note: This can be slow on massive DFs, so we might want to sample if len > 1M
+                types_series = valid_series.apply(self._get_python_type_name)
+                outlier_mask = types_series != majority_type
+                outlier_samples = valid_series[outlier_mask].head(5).tolist()
+                
+                report[col] = {
+                    'majority_type': majority_type,
+                    'majority_pct': (majority_count / total_count) * 100,
+                    'breakdown': type_counts.to_dict(),
+                    'outliers': outlier_samples
+                }
 
+        if verbose and report:
+            print(f"\n⚠️  [Mixed Type Report] Found {len(report)} inconsistent columns:")
+            print(f"{'Column':<20} | {'Majority':<8} | {'Breakdown':<30} | {'Outlier Samples'}")
+            print("-" * 90)
+            for col, data in report.items():
+                breakdown_str = str(data['breakdown'])
+                if len(breakdown_str) > 30: breakdown_str = breakdown_str[:27] + "..."
+                print(f"{col:<20} | {data['majority_type']:<8} | {breakdown_str:<30} | {data['outliers']}")
+        
+        return report
+    
     def check_missing_values(self):
         """Prints a report of missing values."""
         # Calculate isna once to save time
@@ -877,11 +947,15 @@ class DataFrameCleaner:
             print("\nNo duplicates found.")
         return self
 
-  
+    
     def auto_infer_schema(self, sample_size=1000):
+            import pyarrow as pa
+            import numpy as np
+            import ast
 
             inferred = {}
-            sample_size = min(len(self.df),sample_size)
+            # Optimization: Don't sample if df is small
+            sample_size = min(len(self.df), sample_size)
             print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
 
             for col in self.df.columns:
@@ -891,60 +965,73 @@ class DataFrameCleaner:
                 if len(valid) > sample_size: 
                     valid = valid.sample(n=sample_size, random_state=42)
 
-                # --- PHASE 1: Explicit Booleans ---
+                # --- PHASE 1: Native Checks (Fast) ---
                 if pd.api.types.is_bool_dtype(self.df[col]): 
-                    inferred[col] = 'bool'
-                    continue
+                    inferred[col] = 'bool'; continue
+                if pd.api.types.is_integer_dtype(self.df[col]): 
+                    inferred[col] = 'int'; continue
+                if pd.api.types.is_float_dtype(self.df[col]): 
+                    inferred[col] = 'float'; continue
+                if pd.api.types.is_datetime64_any_dtype(self.df[col]): 
+                    inferred[col] = 'datetime'; continue
 
-                # --- PHASE 2: Numeric Inspection (Int/Float OR Bool?) ---
+                # --- PHASE 2: Mixed Type Guard (Crucial for Object Columns) ---
+                # If a column contains multiple python types (e.g. str AND int), default to string
+                # to avoid data loss.
+                if pd.api.types.is_object_dtype(self.df[col]):
+                    # We apply type() to get the class of each value
+                    types_found = valid.apply(type).unique()
+                    if len(types_found) > 1:
+                        inferred[col] = 'string'
+                        # Optional: Print warning if you want to know
+                        print(f"  > MIXED TYPE Detected '{col}' as STRING (Mixed Types found)")
+                        continue
+
+                # --- PHASE 3: Numeric-as-Boolean Check ---
                 if pd.api.types.is_numeric_dtype(self.df[col]):
-                    # Check for "Binary Integer" Boolean (0, 1)
-                    # We use the sample 'valid' to be fast
                     unique_nums = valid.unique()
-                    
-                    # If the column ONLY contains 0s and 1s (and we already dropped NaNs)
+                    # Check if it only contains 0 and 1
                     if set(unique_nums).issubset({0, 1, 0.0, 1.0}):
                         inferred[col] = 'bool'
                         print(f"  > Detected '{col}' as BOOL (Binary Numeric)")
-                    
-                    # Otherwise, standard numeric fallback
-                    elif pd.api.types.is_integer_dtype(self.df[col]): 
-                        inferred[col] = 'int'
-                    else: 
-                        inferred[col] = 'float'
-                    
-                    continue
-
-                # --- PHASE 3: Date Inspection ---
-                if pd.api.types.is_datetime64_any_dtype(self.df[col]): 
-                    inferred[col] = 'datetime'
+                        continue
+                    # Fallback to standard numeric
+                    elif pd.api.types.is_integer_dtype(self.df[col]): inferred[col] = 'int'
+                    else: inferred[col] = 'float'
                     continue
 
                 # --- PHASE 4: Object Inspection ---
                 try:
                     first_val = valid.iloc[0]
+                    
+                    # FIX: Handle PyArrow Scalars if data loaded with pyarrow backend
+                    if hasattr(first_val, 'as_py'):
+                        first_val = first_val.as_py()
+
                     is_complex_object = isinstance(first_val, (list, dict, set, np.ndarray))
 
                     # --- BOOLEAN DETECTION (String Scalar) ---
                     if not is_complex_object:
+                        # Convert to string to safely check for 'yes'/'no'
                         unique_vals = valid.astype(str).str.lower().unique()
                         
                         if len(unique_vals) <= 10: 
                             u_series = pd.Series(unique_vals)
-                            # Filter garbage
+                            # Filter garbage using regex
                             mask_clean = ~u_series.str.match(self.na_placeholders)
                             clean_vals = u_series[mask_clean].tolist()
                             
                             if clean_vals:
-                                check_set = set(clean_vals)
-                                # Check for Yes/No, T/F, Y/N
-                                if check_set.issubset(self.enforcer.true_vals | self.enforcer.false_vals):
+                                if set(clean_vals).issubset(self.enforcer.true_vals | self.enforcer.false_vals):
                                     inferred[col] = 'bool'
                                     print(f"  > Detected '{col}' as BOOL (Semantic String)")
                                     continue
 
                     # --- PHASE 5: Deep Arrow Inference (Complex Types) ---
                     def normalize(x):
+                        # FIX: Handle Arrow Scalars row-by-row
+                        if hasattr(x, 'as_py'): x = x.as_py()
+                        
                         if isinstance(x, np.ndarray): return x.tolist()
                         if isinstance(x, str) and x.strip().startswith(('[','{')):
                             try: return ast.literal_eval(x)
@@ -962,7 +1049,7 @@ class DataFrameCleaner:
                     inferred[col] = 'string'
                     
             return inferred
-    
+        
 
 
 
@@ -1058,7 +1145,63 @@ class DataFrameCleaner:
             print(f"Dropped {initial - len(self.df)} duplicates.")
         return self
 
+    def resolve_mixed_types(self, interactive=True):
+        """
+        Uses audit results to prompt the user for resolution strategies.
+        Returns a schema dictionary with the user's choices.
+        """
+        report = self.audit_mixed_types(verbose=True)
+        if not report:
+            return {}
 
+        schema_overrides = {}
+        
+        # Map Python type names to your SchemaEnforcer names
+        type_map = {
+            'str': 'string', 'int': 'int', 'float': 'float', 
+            'bool': 'bool', 'list': 'list', 'dict': 'dict',
+            'ndarray': 'list' # Convert numpy arrays to lists usually
+        }
+
+        if not interactive:
+            print("\n[Non-Interactive Mode] Skipping manual resolution (defaulting to safe inference).")
+            return {}
+
+        print("\n--- Mixed Type Resolution ---")
+        for col, data in report.items():
+            maj_type = data['majority_type']
+            maj_schema = type_map.get(maj_type, 'string')
+            
+            print(f"\nColumn: '{col}'")
+            print(f" > Majority: {maj_type} ({data['majority_pct']:.1f}%)")
+            print(f" > Minority Types: {[k for k in data['breakdown'] if k != maj_type]}")
+            print(f" > Outlier Examples: {data['outliers']}")
+            
+            print(f"Options:")
+            print(f"  [1] Coerce to Majority ('{maj_schema}') -> Outliers become NaN")
+            print(f"  [2] Convert ALL to String -> Preserves data, loses type")
+            print(f"  [3] Force specific type (Enter manually)")
+            print(f"  [4] Skip (Let auto-inference decide)")
+            
+            choice = input(f"Action for '{col}': ").strip()
+            
+            if choice == '1':
+                schema_overrides[col] = maj_schema
+                print(f" -> Set schema for '{col}' to '{maj_schema}' (Strict)")
+            elif choice == '2':
+                schema_overrides[col] = 'string'
+                print(f" -> Set schema for '{col}' to 'string' (Safe)")
+            elif choice == '3':
+                manual = input("Enter schema type (int, float, string, bool, list, dict): ").strip()
+                if manual in type_map.values():
+                    schema_overrides[col] = manual
+                else:
+                    print("Invalid type, skipping.")
+            else:
+                print(" -> Skipped.")
+                
+        return schema_overrides
+    
     def convert_data_types_pandas(self):
         """Uses pandas convert_dtypes to infer best types."""
         self.df = self.df.convert_dtypes()
@@ -1072,13 +1215,6 @@ class DataFrameCleaner:
         This locks in the schema and optimizes memory.
         
         """
-        print("Step 0: Checking for mixed types before conversion...")
-        mixed = self.check_mixed_type(verbose=False)
-        
-        if mixed:
-            print(f"⚠️ WARNING: Found {len(mixed)} mixed-type columns. PyArrow inference might fail or default to string for these:")
-            print(list(mixed.keys()))
-
         print("Step 1: Auto converting to PyArrow-backed types...")
         try:
             # automatic conversion
@@ -1109,16 +1245,29 @@ class DataFrameCleaner:
     # --- 3. PIPELINE ---
     #TODO 
         # check first for mixed types and adapt enforce schema
-    def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False):
-        # 1. Diagnostic
+    def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False, interactive=True):
+        # 1. Diagnostic & Remediation
         print("\n--- Pipeline Start: Pre-Flight Check ---")
-        self.check_mixed_type()
-        
-        # 2. Infer
+        print('Looking for mixed types')
+        # This will print the report AND ask you what to do
+        # It returns a dict like {'authors': 'list', 'year': 'int'}
+        mixed_type_fixes = self.resolve_mixed_types(interactive=interactive)
+        # 2. Infer Base Schema
         detected_schema = self.auto_infer_schema()
-        if schema: detected_schema.update(schema)
         
-        # 3. Clean
+        # 3. Merge Schemas
+        # Priority: Manual Overrides (args) > Interactive Fixes > Auto Detect
+        if mixed_type_fixes:
+            print(f"Applying {len(mixed_type_fixes)} mixed-type resolutions...")
+            detected_schema.update(mixed_type_fixes)
+        else:
+            print('No mixed types found.')
+            
+        if schema:
+            print(f"Applying {len(schema)} manual overrides...")
+            detected_schema.update(schema)
+        
+        # 4. Clean
         self.clean_column_names().enforce_schema(detected_schema, protected_values)
         if drop_empty_cols: self.drop_missing_cols()
         

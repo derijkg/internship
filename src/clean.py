@@ -9,7 +9,7 @@ from rapidfuzz import process, fuzz
 
 # PATHS
 PATH_UGENT_JSON = Path('data/ugent_datadump/publications.json')
-PATH_UGENT_CLEAN = Path('data/ugent_datadump/ugent_cleaned.parquet')
+PATH_UGENT_CLEAN = Path('data/ugent_clean.parquet')
 
 PATH_SB_CSV = Path('data/metadata copy.csv')
 PATH_SB_CLEAN = Path('data/metadata_clean.parquet')

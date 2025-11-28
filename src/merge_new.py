@@ -4,14 +4,13 @@ import numpy as np
 from pathlib import Path
 from mu import DataFrameCleaner
 import ast
-# You need to install langdetect if you haven't: pip install langdetect
 from langdetect import detect, LangDetectException
 
 # HARDCODE ID
 LAST_ID = '4180'
 
 # PATHS
-PATH_UGENT_CLEAN = Path('data/ugent_datadump/ugent_cleaned.parquet')
+PATH_UGENT_CLEAN = Path('data/ugent_clean.parquet')
 PATH_SB_CLEAN = Path('data/metadata_clean.parquet')
 PATH_MERGED = Path('data/metadata.parquet')
 
@@ -188,8 +187,31 @@ if not df_filtered.empty:
         # Empty columns to match DF1 if needed
         'chapters': None,
         'pages': None,
-        'type': None
+        'type': df_filtered['type']
     })
 
-    #TODO RUN THIS THRU CLEANER INSTEAD OF MERGED
     cleaner = DataFrameCleaner(df_ugent_final)
+    ugent_schema = {
+    'id': 'string',
+    }
+    prot_values = {
+        'id': ['9999',9999]
+    }
+    cleaner.run_auto_pipeline(schema=ugent_schema,protected_values=prot_values)
+
+    df1_ready = df1.rename(columns={
+    'college': 'affiliation', 
+    'language_full': 'temp_language_full',
+    })
+
+    df_combined = pd.concat([df1_ready, cleaner.df], axis=0, ignore_index=True)
+
+    cleaner = DataFrameCleaner(df_combined)
+    ugent_schema = {
+        'id': 'string',
+    }
+    prot_values = {
+        'id': ['9999',9999,'999',999]
+    }
+    cleaner.run_auto_pipeline(schema=ugent_schema,protected_values=prot_values)
+    cleaner.save_parquet(PATH_MERGED)
