@@ -344,7 +344,21 @@ class SchemaEnforcer:
         if not s_val: return True
         if self.garbage_regex.match(s_val): return True
         return False
-
+    
+    #TODO WORKING integrate in clean_complex???
+    def _prune_empty(self, obj):
+        """Recursively removes empty structures."""
+        if isinstance(obj, list):
+            cleaned = [self._prune_empty(x) for x in obj]
+            cleaned = [x for x in cleaned if x is not None]
+            return cleaned if cleaned else None
+        elif isinstance(obj, dict):
+            cleaned = {k: self._prune_empty(v) for k, v in obj.items()}
+            cleaned = {k: v for k, v in cleaned.items() if v is not None}
+            return cleaned if cleaned else None
+        # Base case
+        return None if self._is_garbage(obj) else obj
+    
     # --- Cleaning Functions ---
     def _clean_complex(self, val, expected_type, col_name):
         if self._is_garbage(val, col_name): return None
@@ -716,13 +730,10 @@ class DataFrameCleaner:
             order = ['missing#', 'missing%', 'unique#', 'sample_val', 'placeholders', 'dtypes']
             summary = summary[order]
     
-            # --- FIX: FORCE LEFT ALIGNMENT ---
-            # 1. Calculate the max length of the dtype strings
-            # (If empty dataframe, default to 10 to prevent errors)
+            # --- FORCE LEFT ALIGNMENT ---
             max_len = summary['dtypes'].map(len).max() if not summary.empty else 10
             
             # 2. Define a formatter
-            # "<" forces left alignment, padding with spaces on the right up to max_len
             formatters = {
                 'dtypes': lambda x: f"{x:<{max_len}}"
             }
@@ -870,6 +881,7 @@ class DataFrameCleaner:
     def auto_infer_schema(self, sample_size=1000):
 
             inferred = {}
+            sample_size = min(len(self.df),sample_size)
             print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
 
             for col in self.df.columns:
@@ -1097,30 +1109,20 @@ class DataFrameCleaner:
     # --- 3. PIPELINE ---
     #TODO 
         # check first for mixed types and adapt enforce schema
-    def run_all(self, schema, protected_values=None):
-        """
-        Runs the most efficient path: 
-        1. Clean Names 
-        2. Enforce Schema (Cleans whitespace, garbage, and fixes types in 1 pass)
-        3. Drop Duplicates
-        4. Finalize to Arrow
-        """
-        return (self
-                .clean_column_names()
-                .enforce_schema(schema, protected_values)
-                .drop_missing_cols()
-                .drop_duplicates()
-                .convert_data_types_arrow()
-                .summarize())
-
-    def run_auto_pipeline(self, schema=None, protected_values=None):
-        # 1. Guess the schema
+    def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False):
+        # 1. Diagnostic
+        print("\n--- Pipeline Start: Pre-Flight Check ---")
+        self.check_mixed_type()
+        
+        # 2. Infer
         detected_schema = self.auto_infer_schema()
-        if schema:
-            detected_schema.update(schema)
-            print(f" applying {len(schema)} overrides to auto schema")
-        # 2. Run the enforcement using the guess
-        return self.run_all(detected_schema,protected_values)
+        if schema: detected_schema.update(schema)
+        
+        # 3. Clean
+        self.clean_column_names().enforce_schema(detected_schema, protected_values)
+        if drop_empty_cols: self.drop_missing_cols()
+        
+        return self.drop_duplicates().convert_data_types_arrow().summarize()
     
     def save_parquet(self, path):
         if path:

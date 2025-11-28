@@ -266,7 +266,7 @@ if not PATH_SB_CLEAN.exists():
         'downloaded': 'bool',
 
         # --- Lists (Strings inside Lists) ---
-        'authors': 'list',        # Note: Main DB uses 'author' (list of dicts). Keep as list for now.
+        'authors': 'list',   
         'keywords': 'list',
         'themes': 'list',
         'promoter': 'list',

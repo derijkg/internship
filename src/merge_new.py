@@ -172,7 +172,7 @@ if not df_filtered.empty:
     # Note: we cast year to Int64 to allow NaNs if necessary, though filters prevent it
     df_ugent_final = pd.DataFrame({
         'id': df_filtered['id_temp'].astype(str),
-        'source': 'ugent_biblio',
+        'source': 'ugent',
         'title': df_filtered['title'],
         'year': df_filtered['year'].astype('Int64'),
         'page_link': df_filtered['handle'],
@@ -191,38 +191,5 @@ if not df_filtered.empty:
         'type': None
     })
 
-    # 7. Prepare DF1 (Scriptiebank)
-    # Align columns
-    df1_ready = df1.rename(columns={
-        'college': 'affiliation', 
-        'language_full': 'temp_language_full',
-        # Ensure 'id' is treated consistently. 
-        # If DF1 has Int IDs and DF2 has String IDs, PyArrow might complain on merge.
-        # Best to convert DF1 IDs to string.
-    })
-    df1_ready['id'] = df1_ready['id'].astype(str)
-    
-    # If DF1 doesn't have language_abstract, add it
-    if 'language_abstract' not in df1_ready.columns:
-        df1_ready['language_abstract'] = None
-
-    # 8. Generate Sequential IDs (Optional: Overwrite original IDs)
-    # If you want a truly sequential index across the merged set:
-    print("  > Merging and re-indexing...")
-    
-    # Concatenate
-    # We align columns automatically
-    common_cols = list(set(df1_ready.columns) & set(df_ugent_final.columns))
-    df_combined = pd.concat([df1_ready, df_ugent_final], axis=0, ignore_index=True)
-    
-    # Create new Integer ID based on Index
-    # (User requested continuation)
-    
-    print(f"  > Merged. Total rows: {len(df_combined)}")
-    
-    # 9. Save
-    #df_combined.to_parquet(PATH_MERGED, engine='pyarrow')
-    print(f"Saved to {PATH_MERGED}")
-    cleaner = DataFrameCleaner(df_combined)
-else:
-    print("No UGent rows matched criteria.")
+    #TODO RUN THIS THRU CLEANER INSTEAD OF MERGED
+    cleaner = DataFrameCleaner(df_ugent_final)
