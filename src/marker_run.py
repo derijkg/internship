@@ -13,6 +13,7 @@ TEMP_INPUT = Path("data/temp/temp_extraction")
 
 ZIP_OUTPUT = Path("data/output_marker.zip")
 
+# my specifically problematic files
 IGNORE_LIST = ['1058',
  '1191',
  '1215',
@@ -49,7 +50,7 @@ IGNORE_LIST = ['1058',
  '841'] # constant failures
 
 # MARKER CONFIG
-workers = '1'
+workers = '1' # currently unused, see command = [...]
 detection_batch_size = '14'
 layout_batch_size = '14'
 pdftext_workers = '12'
@@ -154,7 +155,7 @@ def main():
         try:
             command = [
                 "marker",
-                '--debug_print',
+                #'--debug_print',
                 #'--workers','1',
                 '--disable_image_extraction',
                 '--detection_batch_size', detection_batch_size, 
@@ -185,8 +186,6 @@ def main():
             print("Cleaned up temporary input files.")
 
     # --- Step 6: Zip Results ---
-    # This runs if we processed files OR if there were 0 files to process 
-    # (ensuring the output zip is synced with the output folder)
     zip_output_files(TEMP_OUTPUT, ZIP_OUTPUT)
 
 if __name__ == "__main__":
