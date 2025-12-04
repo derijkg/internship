@@ -6,8 +6,6 @@ notebooks/
 __pycache__/
 myutils*/
 academic_dataset.jsonl
-test.ipynb
 marker_help.txt
-output.out
-output_dl.out
+*.out
 test.ipynb

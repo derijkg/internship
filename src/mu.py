@@ -11,6 +11,8 @@ import shutil
 from pathlib import Path
 from typing import Optional, List, Generator
 from contextlib import contextmanager
+from tqdm import tqdm
+import mimetypes
     
 # ==============================================================================
 #  IO
@@ -303,6 +305,386 @@ def dict_dupes(list_of_dicts, keys):
     return duplicates
 
 
+class CorpusManager:
+    def __init__(self, 
+                 path_merged: Path, 
+                 path_archive: Path, 
+                 path_temp_input: Path, 
+                 path_temp_output: Path, 
+                 path_marker_zip: Path):
+        
+        self.p_meta = Path(path_merged)
+        self.p_archive = Path(path_archive)
+        self.p_temp_in = Path(path_temp_input)
+        self.p_temp_out = Path(path_temp_output)
+        self.p_marker_zip = Path(path_marker_zip)
+
+        # Ensure directories exist
+        self.p_temp_in.mkdir(parents=True, exist_ok=True)
+        self.p_temp_out.mkdir(parents=True, exist_ok=True)
+
+        # Load Data
+        self.df = pd.read_parquet(self.p_meta, dtype_backend='pyarrow')
+        
+        # Ensure IDs
+        if self.df.id.duplicated().any():
+            duplicate_rows = self.df[self.df['id'].duplicated(keep=False)]
+            print(f'\nWARNING: DUPLICATE ID DETECTED:')
+            print(duplicate_rows.sort_values(by='id'))
+            raise ValueError(f'Init aborted: duplicate ids')
+        
+        self.valid_ids = set(self.df['id'].unique())
+
+    def save_metadata(self):
+        """Saves the dataframe back to parquet."""
+        self.df.to_parquet(self.p_meta, engine='pyarrow')
+        print(f"Metadata saved to {self.p_meta}")
+
+    # =========================================================================
+    # 1. AUDIT FUNCTIONALITY
+    # =========================================================================
+    def audit_consistency(self):
+        """
+        Points out inconsistencies across all 4 containers.
+        Returns a DataFrame containing the status of every ID.
+        """
+        print("Auditing containers...")
+        
+        # 1. Map Archive Content
+        archive_map = set()
+        if self.p_archive.exists():
+            with zipfile.ZipFile(self.p_archive, 'r') as z:
+                # Store IDs found in zip (stripping extensions)
+                archive_map = {Path(f).stem for f in z.namelist()}
+
+        # 2. Map Temp Output (Marker Folders)
+        # Looking for folders named 'id'
+        temp_out_map = {p.name for p in self.p_temp_out.iterdir() if p.is_dir()}
+
+        # 3. Map Marker Zip (Final Output)
+        marker_zip_map = set()
+        if self.p_marker_zip.exists():
+            with zipfile.ZipFile(self.p_marker_zip, 'r') as z:
+                # We expect flat files like 457.md, 457.json. 
+                # We check if ID exists in any form
+                marker_zip_map = {Path(f).stem for f in z.namelist()}
+
+        # Build Status
+        results = []
+        for _, row in self.df.iterrows():
+            uid = row['id']
+            results.append({
+                'id': uid,
+                'in_metadata': True, # Obviously
+                'downloaded_flag': row['downloaded'], # What the DB thinks
+                'in_archive_zip': uid in archive_map, # What exists physically
+                'in_temp_output': uid in temp_out_map,
+                'in_marker_zip': uid in marker_zip_map
+            })
+        
+        audit_df = pd.DataFrame(results)
+        
+        # Print Summary of Inconsistencies
+        # Example: Flagged downloaded but not in Zip
+        missing_physical = audit_df[(audit_df['downloaded_flag'] == True) & (audit_df['in_archive_zip'] == False)]
+        if not missing_physical.empty:
+            print(f"\n[!] CRITICAL: {len(missing_physical)} rows claim to be downloaded but are missing from {self.p_archive.name}")
+            print(missing_physical['id'].head().tolist())
+
+        # Example: In output but not in final zip
+        pending_pack = audit_df[(audit_df['in_temp_output'] == True) & (audit_df['in_marker_zip'] == False)]
+        if not pending_pack.empty:
+            print(f"\n[i] INFO: {len(pending_pack)} items are processed but not yet packed into {self.p_marker_zip.name}")
+
+        # SEE COMBINATIONS OF ALL 
+        cols = ['in_metadata', 'downloaded_flag', 'in_archive_zip', 'in_temp_output', 'in_marker_zip']
+
+        # 1. General Request: See counts for EVERY combination
+        # This creates a table showing which patterns exist and how frequent they are
+        combination_counts = audit_df[cols].value_counts().reset_index(name='count')
+
+        print("--- All Status Combinations ---")
+        print(combination_counts.to_string(index=False))
+
+        return audit_df
+    
+    def sync_metadata_with_archive(self):
+        """
+        Updates self.df to set 'downloaded' = True for any file 
+        that physically exists in the archive.zip.
+        """
+        print("Syncing metadata with physical archive...")
+        
+        if not self.p_archive.exists():
+            print("Archive zip does not exist.")
+            return
+
+        # 1. Get all IDs currently in the zip
+        with zipfile.ZipFile(self.p_archive, 'r') as z:
+            # strip extensions to get the raw ID
+            ids_in_zip = {Path(f).stem for f in z.namelist()}
+        
+        # 2. Identify rows that are WRONG (Zip says yes, DF says no)
+        # We look for IDs in the zip where the dataframe thinks it's NOT downloaded
+        mask = (self.df['id'].isin(ids_in_zip)) & (self.df['downloaded'] != True)
+        
+        count_to_fix = mask.sum()
+        
+        if count_to_fix == 0:
+            print("  -> Metadata is already in sync with archive.")
+        else:
+            # 3. Update the DataFrame
+            self.df.loc[mask, 'downloaded'] = True
+            self.save_metadata()
+            print(f"  -> FIXED: Updated {count_to_fix} rows to 'downloaded=True' based on zip content.")
+
+    # =========================================================================
+    # 2. PRUNE FUNCTIONALITY (Remove extraneous files)
+    # =========================================================================
+    def prune_extraneous_files(self):
+        """
+        Removes files from Zips and Folders if their ID is not in the DataFrame.
+        """
+        print("Pruning extraneous files...")
+        
+        # A. Prune Archive Zip (Requires Rebuild)
+        if self.p_archive.exists():
+            self._prune_zip_file(self.p_archive, "Archive")
+
+        # B. Prune Marker Zip (Requires Rebuild)
+        if self.p_marker_zip.exists():
+            self._prune_zip_file(self.p_marker_zip, "Marker Output")
+
+        # C. Prune Temp Input Folder
+        self._prune_folder(self.p_temp_in)
+        
+        # D. Prune Temp Output Folder
+        self._prune_folder(self.p_temp_out)
+
+    def _prune_zip_file(self, zip_path: Path, label: str):
+        """Helper to rebuild a zip file excluding invalid IDs."""
+        temp_zip_path = zip_path.with_suffix('.tmp.zip')
+        removed_count = 0
+        
+        with zipfile.ZipFile(zip_path, 'r') as zin, zipfile.ZipFile(temp_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in tqdm(zin.infolist(), desc=f"Pruning {label} Zip"):
+                file_id = Path(item.filename).stem
+                if file_id in self.valid_ids:
+                    zout.writestr(item, zin.read(item.filename))
+                else:
+                    removed_count += 1
+        
+        if removed_count > 0:
+            zip_path.unlink() # Delete old
+            temp_zip_path.rename(zip_path) # Move new to old
+            print(f"  -> Removed {removed_count} files from {zip_path.name}")
+        else:
+            temp_zip_path.unlink() # Clean up temp if nothing changed
+            print(f"  -> {zip_path.name} is clean.")
+
+    def _prune_folder(self, folder_path: Path):
+        """Helper to delete files/folders not in ID list."""
+        removed = 0
+        for item in folder_path.iterdir():
+            file_id = item.stem 
+            if file_id not in self.valid_ids:
+                if item.is_file(): item.unlink()
+                else: shutil.rmtree(item)
+                removed += 1
+        if removed > 0:
+            print(f"  -> Removed {removed} items from {folder_path.name}")
+
+    # =========================================================================
+    # 3. DOWNLOAD LOGIC
+    # =========================================================================
+    def download_missing(self):
+        """
+        Downloads missing files and appends them to the archive zip.
+        """
+        # 1. Identify rows to download
+        mask = self.df['downloaded'] != True
+        to_download_indices = self.df[mask].index
+
+        if to_download_indices.empty:
+            print("  -> No files to download.")
+            return
+
+        print(f"  -> Found {len(to_download_indices)} items to download.")
+
+        # 2. Pre-scan existing files in Zip (Read Mode)
+        # We do this before opening in 'append' mode to ensure we have a clean list
+        existing_ids_in_zip = set()
+        if self.p_archive.exists():
+            try:
+                with zipfile.ZipFile(self.p_archive, 'r') as z:
+                    existing_ids_in_zip = {Path(f).stem for f in z.namelist()}
+            except zipfile.BadZipFile:
+                print(f"  [!] Warning: {self.p_archive} seems corrupted. It might be overwritten or cause errors.")
+
+        success_count = 0
+        batch_count = 0
+
+        # 3. Open Zip ONCE in Append Mode
+        with zipfile.ZipFile(self.p_archive, 'a', zipfile.ZIP_DEFLATED) as z_out:
+            
+            for idx in tqdm(to_download_indices, desc="Downloading Files"):
+                row = self.df.loc[idx]
+                uid = row['id']
+                url = row['download_link']
+
+                # no dl link -> downloaded = false
+                if pd.isna(row['download_link']):
+                    self.df.loc[idx, 'downloaded'] = False
+                    continue
+
+                # Safety Check: Skip if ID already exists physically in zip
+                if uid in existing_ids_in_zip:
+                    self.df.loc[idx, 'downloaded'] = True
+                    continue
+
+                # Pass the OPEN zip handle (z_out) to the helper
+                if self._download_file(url, uid, z_out):
+                    self.df.loc[idx, 'downloaded'] = True
+                    existing_ids_in_zip.add(uid) # Add to local set to prevent dups in same batch
+                    success_count += 1
+                else:
+                    self.df.loc[idx, 'downloaded'] = False
+
+                # Periodic Metadata Save (Every 50 items)
+                batch_count += 1
+                if batch_count >= 50:
+                    self.save_metadata()
+                    batch_count = 0
+
+        # Final Save
+        self.save_metadata()
+        print(f"  -> Download process complete. {success_count} new files added.")
+
+    def _download_file(self, download_url: str, filename_in_zip: str, open_zip_handle: zipfile.ZipFile):
+        """
+        Downloads a file and writes it to the provided open zip handle.
+        """
+        mime_to_extension = {
+            "application/pdf": "pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+            "application/octet-stream": "bin"
+        }
+        
+        # 1. Download
+        response = timed_request(download_url, timeout=30)
+        if not response:
+            return False
+
+        # 2. Determine Extension
+        content_type = response.headers.get("Content-Type", "").lower().split(';')[0].strip()
+        extension = None
+
+        # Priority A: Content-Type Header
+        for mime, ext in mime_to_extension.items():
+            if mime == content_type:
+                extension = ext
+                break
+        
+        # Priority B: URL Guess (Fallback)
+        if not extension or extension == "bin":
+            guessed = mimetypes.guess_extension(content_type)
+            if guessed:
+                extension = guessed.lstrip('.')
+            elif '.' in download_url:
+                # Try to grab extension from url path
+                possible_ext = download_url.split('?')[0].split('.')[-1].lower()
+                if possible_ext in ['pdf', 'docx']:
+                    extension = possible_ext
+
+        if not extension:
+            print(f"  -> [Skip] Unknown file type '{content_type}' for {download_url}")
+            return False
+
+        # 3. Write to Open Zip Handle
+        full_filename = f"{filename_in_zip}.{extension}"
+        try:
+            open_zip_handle.writestr(full_filename, response.content)
+            return True
+        except Exception as e:
+            print(f"  -> [Error] Writing to zip failed for {full_filename}: {e}")
+            return False
+
+    # =========================================================================
+    # 4. EXTRACTION (STAGING) LOGIC
+    # =========================================================================
+    def stage_for_processing(self):
+        """
+        Extracts files from Archive Zip to Temp Input folder IF:
+        1. They are not in Temp Output (already processed)
+        2. They are not in Marker Zip (already packed)
+        """
+        print("Staging files for processing...")
+        
+        # Get list of already completed IDs
+        completed_ids = set()
+        
+        # Check Temp Output (Folders)
+        completed_ids.update([p.name for p in self.p_temp_out.iterdir()])
+        
+        # Check Marker Zip
+        if self.p_marker_zip.exists():
+            with zipfile.ZipFile(self.p_marker_zip, 'r') as z:
+                completed_ids.update([Path(f).stem for f in z.namelist()])
+
+        # Iterate Archive and Extract needed
+        extracted_count = 0
+        if not self.p_archive.exists():
+            print("Archive zip not found.")
+            return
+
+        with zipfile.ZipFile(self.p_archive, 'r') as z:
+            # Filter file list: Valid ID AND Not Completed
+            files_to_extract = []
+            for f in z.namelist():
+                fid = Path(f).stem
+                if fid in self.valid_ids and fid not in completed_ids:
+                    files_to_extract.append(f)
+            
+            # Extract
+            for f in tqdm(files_to_extract, desc="Extracting to Temp"):
+                z.extract(f, self.p_temp_in)
+                extracted_count += 1
+
+        print(f"Staged {extracted_count} files to {self.p_temp_in}")
+
+    # =========================================================================
+    # 5. SUGGESTED: PACK LOGIC
+    # =========================================================================
+    def pack_processed_output(self):
+        """
+        Moves processed folders from Temp Output into the flat Marker Zip.
+        """
+        print("Packing processed files...")
+        
+        processed_folders = [p for p in self.p_temp_out.iterdir() if p.is_dir()]
+        
+        if not processed_folders:
+            print("No folders in temp output to pack.")
+            return
+
+        with zipfile.ZipFile(self.p_marker_zip, 'a', compression=zipfile.ZIP_DEFLATED) as z:
+            existing_in_zip = set(z.namelist())
+            
+            for folder in tqdm(processed_folders, desc="Packing to Zip"):
+                # Marker output structure: folder 458/ -> 458.md, 458.json, meta.json
+                # We want flat structure in zip: 458.md, 458.json
+                
+                for file_path in folder.iterdir():
+                    if file_path.name in existing_in_zip:
+                        continue
+                    
+                    # Only add if it matches the ID (ignore random metadata logs if needed)
+                    if folder.name in file_path.name: 
+                        z.write(file_path, arcname=file_path.name)
+        
+        print("Packing complete.")
+
+
 
 #  DATAFRAMECLEANER
     # TODO
@@ -543,7 +925,7 @@ class SchemaEnforcer:
 
         return self.df
     
-#TODO 999 not detected in id at first summarize but is removed at auto-run
+
 class DataFrameCleaner:
     """
     A class to encapsulate a pandas DataFrame and apply a series of
@@ -1049,6 +1431,21 @@ class DataFrameCleaner:
                     inferred[col] = 'string'
                     
             return inferred
+
+    def show_duplicates(self, cols):
+        if isinstance(cols, str):
+            cols = [cols]
+        for col in cols:
+            if col not in self.df.columns:
+                continue
+            counts = self.df[col].value_counts()
+            duplicates = counts[counts>=2]
+
+            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
+            if not duplicates.empty:
+                print(duplicates.to_string(header=False))
+            else:
+                print("No values with 2+ appearances.")
         
 
 
@@ -1293,42 +1690,24 @@ def timed_request(
     headers: dict | None = None,
     **kwargs
 ):
-    """Makes a robust, timed HTTP request with error handling.
-
-    :param url: The URL to send the request to.
-    :type url: str
-    :param method: The HTTP method to use (e.g., 'GET', 'POST'). Defaults to 'GET'.
-    :type method: str, optional
-    :param delay: Time in seconds to wait before sending the request. If None,
-                a random delay (1.5s-4.5s) is used. Defaults to None.
-    :type delay: float, optional
-    :param timeout: Seconds to wait for the server to respond before giving up.
-    :type timeout: int, optional
-    :param headers: A dictionary of HTTP headers. If None, default headers are used.
-    :type headers: dict, optional
-    :param **kwargs: Additional keyword arguments to pass to `requests.request`,
-                    such as `json`, `data`, or `params`.
-    :return: The `requests.Response` object on a successful request (status 2xx),
-            otherwise None.
-    :rtype: requests.Response or None
-    """
-
-    # delay
+    """Makes a robust, timed HTTP request with error handling."""
+    
+    # 1. Delay
     if delay is None:
         delay = random.uniform(1.5, 4.5)
     time.sleep(delay)
 
-    # headers
+    # 2. Headers
     request_headers = headers
     if headers is None and session is None:
         request_headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Accept-Language': 'en-US,en;q=0.9',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
         }
 
-    # request
+    # 3. Request
     requester = session if session else requests
     try:
         response = requester.request(
@@ -1340,9 +1719,12 @@ def timed_request(
         )
         response.raise_for_status()
         return response
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP Error: {e.response.status_code} for URL {url}. Full error: {e}")
-        return None
     except requests.exceptions.RequestException as e:
-        print(f"Request failed for URL {url}. Error: {e}")
+        # Catching all Request exceptions (HTTPError, ConnectionError, etc)
+        print(f"  [Error] Request failed for {url}: {e}")
         return None
+
+
+
+
+

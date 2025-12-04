@@ -195,7 +195,7 @@ if not df_filtered.empty:
     'id': 'string',
     }
     prot_values = {
-        'id': ['9999',9999]
+        'id': ['9999',9999,999,'999']
     }
     cleaner.run_auto_pipeline(schema=ugent_schema,protected_values=prot_values)
 
