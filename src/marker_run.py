@@ -191,8 +191,9 @@ def main():
     # --- Step 2: Prompt User ---
     if count == 0:
         print("\nNo new files found to process.")
-        pack_processed_output(TEMP_OUTPUT,ZIP_OUTPUT)
         remove_empty_folders(TEMP_OUTPUT)
+        pack_processed_output(TEMP_OUTPUT,ZIP_OUTPUT)
+        
         return
     
     print(f"\nFound {count} new files in the zip that have not been processed.")
@@ -236,9 +237,10 @@ def main():
 
 
     # zip, remove failed conversions, delete extraction folder
+    remove_empty_folders(TEMP_OUTPUT)
     pack_processed_output(TEMP_OUTPUT,ZIP_OUTPUT)
     
-    remove_empty_folders(TEMP_OUTPUT)
+
 
     if TEMP_INPUT.exists():
         shutil.rmtree(TEMP_INPUT)
