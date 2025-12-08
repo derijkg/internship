@@ -140,11 +140,13 @@ def main():
     my_temp_output = Path(f"{BASE_TEMP_OUTPUT}_{args.worker_index}")
     my_zip_output = Path(f"{str(BASE_ZIP_OUTPUT)}_part_{args.worker_index}.zip")
 
+    '''
     # adapt load for titan
     if args.worker_index in [1,2]:
         detection_batch_size = '1'
         layout_batch_size = '1'
         pdftext_workers = '1'
+    '''
 
     # --- Step 1: Stage ---
     count = stage_for_processing(ZIP_INPUT, my_temp_input, my_temp_output, my_zip_output, IGNORE_LIST, args.worker_index, args.total_workers)
@@ -177,12 +179,14 @@ def main():
         env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
         env['TORCH_DEVICE'] = 'cuda'
 
+        '''
         if args.worker_index in [1,2]:
             
             # manual edit in settings.py files of surya and marker in marker_titan env
             env['TORCH_DTYPE'] = 'float32'
             env['SURYA_DTYPE'] = 'float32' 
-
+        '''
+        
         print(f"Worker {args.worker_index}: Starting Marker on GPU {env['CUDA_VISIBLE_DEVICES']}...")
         subprocess.run(command, check=True, env=env)
 
