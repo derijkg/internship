@@ -6,24 +6,19 @@ from pathlib import Path
 from langdetect import detect, LangDetectException
 import tempfile
 
-'''
---
 
-'''
 
 
 
 
 class MDParser:
-    def __init__(
-            self,
-            path,
-
-        ):
+    def __init__(self, path=None, keep_footnotes=False, keep_tables=False, debug=True):
 
         # patterns
         self.abstract_keywords = {
             'abstract',
+            'inleiding',
+            'introduction',
             'summary',
             'samenvatting',
             'résumé',
@@ -32,60 +27,76 @@ class MDParser:
             'overview',
             'synopsis'
         }
-        self.header_pattern = re.compile(r'^#{1,6}\s')
-        self.html_pattern = re.compile()
-        self.level_pattern = re.compile()
+        
+        # settings
+        self.keep_footnotes = keep_footnotes
+        self.keep_tables = keep_tables
+        self.debug = debug
 
-        self.paths_to_process = self._process_path(path)
+        # general
+        self.header_pattern = re.compile(r'^#{1,6}')
+        self.page_tag_pattern = re.compile(r'<span id="page-(\d+)"[^>]*>')
+        #self.html_pattern = re.compile()
+        #self.level_pattern = re.compile()
+        if path: self.path = path
 
+        
+    def run(self, path=None):
+        if not path and self.path: path = self.path
         # operation
         result = []
+        if not path: raise ValueError('provide path at .run or init')
+        self.paths_to_process = self._process_path(path)
         for p in self.paths_to_process:
-            content = self._read_md(p)
-            result_single = self.process_single(content)
-            result.append()
+            result_single = self.generate_tree_single(p)
+            result.append(result_single)
         return result
 
     
     def _process_path(self, input_path):
-        path = Path(input_path)
+        p = Path(input_path)
         paths_to_process = set()
-
-        # We match the path object, using guards to check types/extensions
-        match path:
-            
-            # Case 1: Valid Markdown file
+        if self.debug:
+            temp_dir = Path(tempfile.mkdtemp(prefix="markdown_extract_"))
+            try:
+                with zipfile.ZipFile(p, 'r') as z: #only extract relevant files?
+                    md_files = [f for f in z.namelist() if f.endswith('.md')]
+                    md_files = md_files[:10]
+                    if md_files: z.extractall(path = temp_dir, members = md_files)
+                paths_to_process.update(temp_dir.rglob("*.md"))
+            except zipfile.BadZipFile:
+                raise ValueError(f"File is not a valid zip: {p}")
+            return paths_to_process
+        
+        match p:
+            # md file
             case p if p.is_file() and p.suffix == '.md':
                 paths_to_process.add(p)
 
-            # Case 2: Zip File
+            # zip
             case p if p.is_file() and p.suffix == '.zip':
                 temp_dir = Path(tempfile.mkdtemp(prefix="markdown_extract_"))
-                
                 try:
-                    with zipfile.ZipFile(p, 'r') as z:
+                    with zipfile.ZipFile(p, 'r') as z: #only extract relevant files?
                         z.extractall(temp_dir)
                     paths_to_process.update(temp_dir.rglob("*.md"))
                 except zipfile.BadZipFile:
                     raise ValueError(f"File is not a valid zip: {p}")
 
-            # Case 3: Directory
+            # dir
             case p if p.is_dir():
                 paths_to_process.update(p.rglob("*.md"))
 
-            # Case 4: Invalid input (Catch-all)
+            # invalid
             case _:
-                if not path.exists():
-                    raise FileNotFoundError(f"Path does not exist: {path}")
-                raise ValueError(f"Unsupported input type (must be .md, .zip, or dir): {path}")
+                if not p.exists():
+                    raise FileNotFoundError(f"Path does not exist: {p}")
+                raise ValueError(f"Unsupported input type (must be .md, .zip, or dir): {p}")
 
         if not paths_to_process:
-            raise ValueError(f"No markdown files found in: {path}")
-
+            raise ValueError(f"No markdown files found in: {p}")
         return paths_to_process
-    def _read_md(self, path): #load md file
-        content = path.read_text(encoding='utf-8', errors='replace')
-        return content
+    
     def _process_header(
             self,
             clean_block,
@@ -94,17 +105,16 @@ class MDParser:
         match = re.match(self.header_pattern, clean_block)
         if match:
             hashes = match.group()
-            level = len(hashes)
+            level = len(hashes) #supplement with additional logic conc explicit numbering 1 -> 1.1 -> 1.2
             header_text = clean_block.lstrip('#').strip()
 
             return (header_text, level)
         else:
-            raise ValueError('clean block started with # but no re match')
+            raise ValueError('clean block started with # but no re match') # must have been the wind
 
-    def clean(
-            self,
-            block
-        ):
+    #TODO check if complete, as of now doesnt remove #
+        # delete text between html tags
+    def _clean(self, text): 
         # 1. Remove HTML tags (Marker puts <span id="page-x"> tags everywhere)
         text = re.sub(r'<[^>]+>', '', text)
         
@@ -123,65 +133,116 @@ class MDParser:
         
         return text
 
-    def process_single(
-            self,
-            md_content
-        ):
+    def generate_tree_single(self, path):
+        # TODO check weird codes \U1223 etcc
+        md_content = path.read_text(encoding='utf-8', errors='replace')
+        filename = path.stem
 
-        raw_blocks = md_content.split('\n\n')
-
-        in_abstract_section = False
+        # TODO find number of pages
+            # from filename -> filename(_meta).json
+            # find "page_id": 4 -> max num or last instance
         
-        # 2. Iterate Blocks
-        text = {
-            'title':title,
-            'paragraphs': [paragraphs],
+        raw_blocks = md_content.split('\n\n')
+        header_blocks = [self._clean(block) for block in raw_blocks if block.strip().startswith('#')]
+        abstracts = []
 
-        }
-        for i, block in enumerate(raw_blocks):
-            clean_block = self.clean(block) # edit
+
+
+        #TODO if rawblock startswith <sup> its a footnote prob. -> skip? optional
+        root = []
+        stack = []
+        for i, raw_block in enumerate(raw_blocks):
+            clean_block = self._clean(raw_block)
             if not clean_block:
                 continue
-            
-            is_header = block.strip().startswith('#')
-            if is_header:
-                # need to check how many we have and store count
+
+            # HEADER
+            if clean_block.strip().startswith('#'):
                 header_text, level = self._process_header(clean_block)
-                header_text = block.lstrip('#').strip().lower()
                 
-                if any(keyword in header_text for keyword in self.abstract_keywords):
-                    in_abstract_section = True
+                new_node = {
+                    "header": header_text,
+                    "text": [],
+                    "level": level,
+                    "children": []
+                }
+                while stack and stack[-1]['level'] >= level:
+                    stack.pop()
+
+                if stack:
+                    stack[-1]['node']['children'].append(new_node)
+                else:
+                    root.append(new_node)
+
+
+                stack.append({'node': new_node, 'level': level})
+                # TODO ADD MANUAL CHECK FOR 1.1.2...
+            
+            # TABLES
+            elif clean_block.startswith('|'):
+                if self.keep_tables and stack:
+                    stack[-1]['node']['text'].append(clean_block)
+
+            #FOOTNOTE
+            elif clean_block.startswith('<sup') or clean_block.startswith('['):
+                if self.keep_footnotes and stack:
+                    stack[-1]['node']['text'].append(clean_block)
+            
+            # RUNNING TEXT
+            else:
+                if stack:
+                    stack[-1]['node']['text'].append(clean_block)
+                # TODO check cases for encountering free text without title
+                else: continue
+
+        result = {
+            'filename': filename,
+            'tree': root
+        }
+        return result
+
+    ''' abstract logic
+                # ABSTRACT HEADER
+                # TODO CHECK LANGUAGES OF ALL PARAGRAPHS IN ABS, maybe after making tree structure
+                if any(keyword in header_text.lower() for keyword in self.abstract_keywords):
+                    in_abstract = True
+                    abstract = {
+                        'lang': abs_lang,
+                        'text': abs_text_paragraphs
+                    }
+                    abstracts.append(abstract)
                 else:
                     # continue searching for other lang abstracts
                     # if i > len(raw_blocks)/2: continue # if its beyond the half way point its not an abstract / summary..., maybe its a conclusion
-                    if in_abstract_section:
-                        in_abstract_section = False
                 
                 # We generally don't treat headers as "Paragraphs" of content, 
                 # but you can add them if you want structural text.
-                continue
-                
-            # Detect Tables (Marker uses pipes | for tables)
-            if block.strip().startswith('|'):
-                continue # Skip tables for text extraction
-                
-            # Store Content
-            if in_abstract_section:
-                abstract_lines.append(clean_block)
-            else:
-                paragraphs.append(clean_block)
+                    continue
+                    
 
+    result logic
+    
         # 3. Assemble Results
         full_text_sample = " ".join(paragraphs[:5]) # Use first 5 paragraphs for doc lang
         abstract_text = " ".join(abstract_lines)
+        text = {
+            'inferred_level': inferred_level,
+            'explicit_level': explicit_level,
+            'title':title,
+            'paragraphs': [paragraphs]
+        }
+
         result = {
             'id': id,
             'page_count': page_count,
             'chapter_count': chapter_count,
             'text': text
         }
-        return result
-    
+
+    '''
+
+
+
     def detect_language_safe(text):
         """
         Robust wrapper for language detection. 
@@ -221,6 +282,7 @@ class MDParser:
 
     def chapter_count():
         return chapter_count
+
 
 
 
