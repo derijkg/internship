@@ -130,9 +130,28 @@ def remove_empty_folders(directory_path: Path):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--final', action='store_true')
+    args = parser.parse_args()
+    if args.final == True:
+        print('running final branch')
+        zip_paths = []
+        for i in range(3):
+            remove_empty_folders(Path(f'data/temp/marker_output_{i}'))
+            output_zip = Path(f'data/output_marker_part_{i}')
+            zip_paths.append(str(output_zip))
+            pack_processed_output(temp_output= Path(f'data/temp/marker_output_{i}'), zip_output= output_zip)
+        
+        final_zip_name = 'data/marker_output_zip_full.zip'
+        command = ['zip', final_zip_name] + zip_paths
+        subprocess.run(command, check=True)
+        print('Final zip finished')
+        return
+
     parser.add_argument("--worker_index", type=int, required=True, help="0, 1, or 2")
     parser.add_argument("--total_workers", type=int, required=True, help="Total number of GPUs being used (e.g. 3)")
     args = parser.parse_args()
+
+
 
     # --- DYNAMIC PATHS ---
     # Each worker gets its own sandboxed folders

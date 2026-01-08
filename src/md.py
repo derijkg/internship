@@ -36,6 +36,8 @@ class MDParser:
         # general
         self.header_pattern = re.compile(r'^#{1,6}')
         self.page_tag_pattern = re.compile(r'<span id="page-(\d+)"[^>]*>')
+        self.numbering_pattern = re.compile(r'^(\w+(\.\w+)*)\.?\s')
+        self.caption_pattern = re.compile(r'^(table|tabel|figure|figuur|fig\.)\s+\d+', re.IGNORECASE)
         #self.html_pattern = re.compile()
         #self.level_pattern = re.compile()
         if path: self.path = path
@@ -51,6 +53,8 @@ class MDParser:
             result_single = self.generate_tree_single(p)
             result.append(result_single)
         return result
+
+
 
     
     def _process_path(self, input_path):
@@ -96,18 +100,18 @@ class MDParser:
         if not paths_to_process:
             raise ValueError(f"No markdown files found in: {p}")
         return paths_to_process
-    
-    def _process_header(
-            self,
-            clean_block,
-        ):
-
+    #TODO
+        # refine based on prev and next if using numbering.
+    def _process_header(self, clean_block):
         match = re.match(self.header_pattern, clean_block)
         if match:
-            hashes = match.group()
-            level = len(hashes) #supplement with additional logic conc explicit numbering 1 -> 1.1 -> 1.2
+            hash_level = len(match.group())
             header_text = clean_block.lstrip('#').strip()
-
+            numb_match = re.match(self.numbering_pattern, clean_block)
+            if numb_match:
+                numbering = numb_match.group(1)
+                level = numbering.count('.') + 1
+            else: level = hash_level
             return (header_text, level)
         else:
             raise ValueError('clean block started with # but no re match') # must have been the wind
@@ -133,22 +137,38 @@ class MDParser:
         
         return text
 
+    def into_dataframe(self, tree):
+        # TODO
+            # skip biblio ?
+            # skip figures?
+            # number of chapters
+            # number of pages from filename -> filename(_meta).json
+
+            # abstract col
+            # paragraphs
+                # min text len
+                # 
+            # def return paragraphs
+                # iterative if children
+
+            # abstract lang
+            # full text lang
+        
+
+        return
+
     def generate_tree_single(self, path):
-        # TODO check weird codes \U1223 etcc
+        # TODO check weird codes \U1223 etcc    
+            #ftfy
+
+        # general
         md_content = path.read_text(encoding='utf-8', errors='replace')
         filename = path.stem
-
-        # TODO find number of pages
-            # from filename -> filename(_meta).json
-            # find "page_id": 4 -> max num or last instance
-        
         raw_blocks = md_content.split('\n\n')
+        
+        # ???? check with json?
         header_blocks = [self._clean(block) for block in raw_blocks if block.strip().startswith('#')]
-        abstracts = []
 
-
-
-        #TODO if rawblock startswith <sup> its a footnote prob. -> skip? optional
         root = []
         stack = []
         for i, raw_block in enumerate(raw_blocks):
@@ -159,6 +179,7 @@ class MDParser:
             # HEADER
             if clean_block.strip().startswith('#'):
                 header_text, level = self._process_header(clean_block)
+
                 
                 new_node = {
                     "header": header_text,
@@ -176,8 +197,8 @@ class MDParser:
 
 
                 stack.append({'node': new_node, 'level': level})
-                # TODO ADD MANUAL CHECK FOR 1.1.2...
             
+
             # TABLES
             elif clean_block.startswith('|'):
                 if self.keep_tables and stack:
@@ -289,7 +310,9 @@ class MDParser:
 
 
 
-
+# TODO post cleaning
+    # abstract
+    # bibliography
 
 
 def main():
