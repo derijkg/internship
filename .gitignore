@@ -9,3 +9,5 @@ academic_dataset.jsonl
 marker_help.txt
 *.out
 test.ipynb
+extraction_results.json
+*.log

@@ -157,6 +157,8 @@ class MDParser:
 
         return
 
+    #meat and potatoes
+
     def generate_tree_single(self, path):
         # TODO check weird codes \U1223 etcc    
             #ftfy
@@ -167,7 +169,7 @@ class MDParser:
         raw_blocks = md_content.split('\n\n')
         
         # ???? check with json?
-        header_blocks = [self._clean(block) for block in raw_blocks if block.strip().startswith('#')]
+        #header_blocks = [self._clean(block) for block in raw_blocks if block.strip().startswith('#')]
 
         root = []
         stack = []
@@ -305,9 +307,52 @@ class MDParser:
         return chapter_count
 
 
+#TODO integrate in cleaning func
+# newest add for cleaning
+def clean_marker_markdown(text):
+    """
+    Normalizes Marker-PDF output to resemble standard AI-generated Markdown.
+    """
+    
+    # 1. Remove Marker Metadata block (usually at the start within --- or similar, 
+    #    but Marker often just dumps text. If you have JSON metadata headers, strip them.)
+    #    (Assumes text input is the raw string from the .md file)
+    
+    # 2. Remove Images/Figure placeholders
+    # Pattern: ![alt text](path/to/image.png)
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    
+    # 3. Remove Academic Citations
+    # Pattern: [1], [12], [1, 2], [1-3]
+    # This regex looks for square brackets containing only numbers, commas, or dashes
+    text = re.sub(r'\[[\d,\s\-]+\]', '', text)
+    
+    # 4. Remove Footnote references
+    # Pattern: [^1]
+    text = re.sub(r'\[\^.*?\]', '', text)
 
+    # 5. Remove Page Numbers / Headers (Heuristic)
+    # Marker is good at removing these, but sometimes stray numbers appear on their own lines
+    # Removes lines that are just numbers (potential page nums)
+    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
 
+    # 6. Remove the Bibliography / References section
+    # This is crude but effective. If we find a header "References" or "Bibliography",
+    # we cut everything after it.
+    # Note: AI generates references too, but usually in a different style. 
+    # For training data, the bibliography is usually just noise (names/dates).
+    cutoff_patterns = [r'^#+\s*References', r'^#+\s*Bibliography', r'^#+\s*Citations']
+    for pattern in cutoff_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            text = text[:match.start()]
+            break
 
+    # 7. Collapse excessive newlines
+    # PDF conversion often results in weird spacing. AI output is usually tighter.
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
 
 
 # TODO post cleaning
