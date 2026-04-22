@@ -237,6 +237,10 @@ def ensure_dir_for_file(file_path: str):
 # ==============================================================================
 #  data structures
 # ==============================================================================
+class DFCheck():
+    pass
+
+
 
 def flatten_list(list_of_lists):
     for item in list_of_lists:

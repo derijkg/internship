@@ -24,7 +24,7 @@ class BaseScraper:
     def __init__(self, source_name: str, base_folder: str = "data"):
         self.source_name = source_name
         base_folder = Path(base_folder)
-        self.csv_path = base_folder / "metadata.csv"
+        self.csv_path = base_folder / "metadata.tsv"
         self.zip_path = base_folder / "archive.zip"
         self.df = self._load_state()
         self.metadata_save_batch_size = 100
@@ -136,7 +136,7 @@ class BaseScraper:
 
             if new_urls_count > 0:
                 print(f"  -> Added {new_urls_count} new items to the dataframe.")
-                self.df.to_csv(self.csv_path, index=False)
+                self.df.to_csv(self.csv_path, sep="\t", index=False)
                 print(f"  -> State saved to {self.csv_path}")
                 print(f'Turning on gather_metadata since new urls have been found.')
                 gather_metadata=True
@@ -260,7 +260,7 @@ class ScriptiebankScraper(BaseScraper):
         Sets the source name to 'scriptiebank' and configures the URLs and
         regex patterns specific to the Scriptiebank website structure.
         """
-        super().__init__(source_name="ugent")
+        super().__init__(source_name="scriptiebank",base_folder='data2')
         # inherits:
         #self.source_name = source_name
         #self.csv_path = base_folder / "metadata.csv"
@@ -371,6 +371,8 @@ class ScriptiebankScraper(BaseScraper):
             print(f"  -> ERROR parsing metadata for {url}: {e}")
             return None
 
+
+#UNUSED
 class BiblioScraper(BaseScraper):
     """
     A scraper for theses from the Ghent University Academic Bibliography API.
