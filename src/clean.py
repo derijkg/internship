@@ -189,14 +189,10 @@ else:
 
 # CLEANING JSON -> PARQUET (arrow dtypes)
 if not PATH_UGENT_CLEAN.exists():
-    cleaner = DataFrameCleaner(pd.read_json(PATH_UGENT_JSON, lines=True))
-
-    schema ={
-
-    }
+    cleaner = DataFrameCleaner(pd.read_json(PATH_UGENT_JSON, lines=True)) #found in src/mu
 
     protected_values = {
-        'volume': [999,'999'],
+        'volume': [999,'999',9999,'9999'],
         'issue': ['999',999]
     }
     cleaner.run_auto_pipeline(protected_values=protected_values)
@@ -241,10 +237,10 @@ if not PATH_SB_CLEAN.exists():
 
     schema_definition = {
         # --- Identity & Source (Strings) ---
-        'id': 'string',           # Convert int -> string for safety
+        'id': 'string',
         'source': 'string',
-        'college': 'string',      # Will likely map to 'publisher' or 'affiliation' later
-        'type': 'string',         # Empty now, but strictly string
+        'college': 'string',
+        'type': 'string',
         
         # --- Content (Strings) ---
         'title': 'string',

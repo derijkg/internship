@@ -82,14 +82,86 @@ def main():
     if clean_metadata == True:
         ug_path = Path('/home/gderijck/internship/data/raw_data/UG/publications.json')
         sb_path = Path('/home/gderijck/internship/data/raw_data/SB/SB_metadata_raw.tsv')
-        
-        sb_cleaner = DataFrameCleaner(sb_path)
-        #save new
-        #del 
 
-        ug_cleaner = DataFrameCleaner(ug_path)
-        #save new
-        #del
+        ug_clean = Path()
+        sb_clean = Path()
+        
+        #1 SEPARATE CLEAN
+        #SB PREP
+        sb_df = pd.read_csv(sb_path,sep='\t')
+        sb_df['year'] = sb_df['year'].astype('Int64')
+        sb_df['authors'] = [[f"{f} {l}"] for f, l in zip(sb_df['first_name'], sb_df['last_name'])]
+        sb_df = sb_df.drop(columns=['first_name', 'last_name'])
+        sb_df['text_homepage'] = sb_df['text_homepage'].apply(parse_and_flatten)
+
+
+    # fix homepage
+        # (list -> string)
+        # delete unusable -> na
+    
+
+        def clean_df(df_path, save_path, protected_values=None,schema=None):
+            if not save_path: raise 'please input save path'
+            if df_path.suffix == '.tsv':
+                df = pd.read_csv(df_path,sep='\t')
+            elif df_path.suffix == '.json': df = pd.read_json(df_path, lines=True)
+            else: raise 'format not supported'
+            if not df: raise 'empty dataframe or something else went wrong'
+            cleaner = DataFrameCleaner(df)
+            cleaner.run_auto_pipeline(schema=schema, protected_values=protected_values) #MAKE SURE IT HANDLES NONE
+            cleaner.save_parquet(path=save_path)
+
+
+        #UG
+        prot_val_ug = {
+            'volume': [999,'999',9999,'9999'], #CHANGE TO REGEX
+            'issue': ['999',999]
+        }
+        
+        clean_df(ug_path, ug_clean, protected_values=prot_val_ug)
+
+        #SB
+        schema_sb = {
+            # --- Identity & Source (Strings) --- #how does it handle non-existant cols
+            'id': 'string',
+            'source': 'string',
+            'college': 'string',
+            'type': 'string',
+            
+            # --- Content (Strings) ---
+            'title': 'string',
+            'abstract': 'string',     
+            'language_full': 'string', 
+            'language_abstract': 'string',
+            'text_homepage': 'string',
+            
+            # --- URLs (Strings) ---
+            'page_link': 'string',
+            'download_link': 'string',
+
+            # --- Numeric (Ints) ---
+            'year': 'int',
+            'pages': 'int',           
+            'chapters': 'int',        
+
+            # --- Boolean ---
+            'downloaded': 'bool',
+
+            # --- Lists (Strings inside Lists) ---
+            'authors': 'list',   
+            'keywords': 'list',
+            'themes': 'list',
+            'promoter': 'list',
+        }
+
+        prot_val_sb = {
+            
+        }
+
+        clean_df(ug_path, ug_clean, protected_values=prot_val_sb,schema=schema_sb)
+        #2 FLAT MERGE
+        #3 SELECTION MERGE
+
 
         def generate_hash(title, year):
             """The deterministic fingerprint used by both cleaners."""
@@ -255,7 +327,13 @@ def main():
     
 
 
-
+#for gold
+    # add future rows (might delete later)
+    #df_s['abstract'] = None
+    #df_s['language_full'] = None
+    #df_s['chapters'] = None
+    #abstract found
+    #...
 
 if __name__ == "__main__":
     main()

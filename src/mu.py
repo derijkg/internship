@@ -13,6 +13,7 @@ from typing import Optional, List, Generator
 from contextlib import contextmanager
 from tqdm import tqdm
 import mimetypes
+from rapidfuzz import process, fuzz
     
 # ==============================================================================
 #  IO
@@ -704,9 +705,21 @@ import pyarrow as pa
 import ast
 
 class SchemaEnforcer:
-    def __init__(self, df, regex_patterns, protected_values=None):
+    def __init__(self, df, regex_patterns=None, protected_values=None):
         self.df = df
-        self.garbage_regex = re.compile(regex_patterns)
+        # Regex patterns to identify "garbage" values that act as Nulls
+        if regex_patterns:
+            self.garbage_regex = re.compile(regex_patterns)
+        else:
+            patterns = [
+                r'(?i)^nan$',  # Case insensitive 'nan'
+                r'(?i)^(?:n\/?a|null|none|<none>|not reported|unknown|undefined|missing)$',
+                r'^(?:-+$|/+$)',  # Dashes or slashes only
+                r'^\?+$',         # Question marks
+                r'^(?:-99|-9999|999|9999)$', # Common numeric placeholders
+            ]
+            combined_pattern = r'^(?:' + '|'.join(patterns) + r')$'
+            self.garbage_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
         
         # Track detailed statistics
         # Structure: {col: {'total': 0, 'placeholders': 0, 'mismatch': 0, 'examples': []}}
@@ -722,12 +735,10 @@ class SchemaEnforcer:
         if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val): return True
 
         s_val = str(val).strip()
-
+        if not s_val: return True
         if col_name and col_name in self.protected_values:
             if s_val in self.protected_values[col_name]:
                 return False 
-
-        if not s_val: return True
         if self.garbage_regex.match(s_val): return True
         return False
     
@@ -1241,38 +1252,28 @@ class DataFrameCleaner:
         for col in valid:
             s = self.df[col].dropna()
             print(f"Column: {col}, {type(s.iloc[0])}", *s.sample(min(number, len(s))), "-" * 30, sep="\n") 
-            
         return self
 
     def audit_mixed_types(self, verbose=True):
-        """
-        Analyzes object columns. Returns a dict containing detailed stats about mixed types.
-        Structure: {col: {'majority_type': 'str', 'breakdown': {...}, 'outliers': [val1, val2]}}
-        """
         report = {}
-        
-        # Only check object columns (where mixing happens)
         candidates = self.df.select_dtypes(include=['object']).columns
         
         for col in candidates:
-            # Drop NAs to check actual values
             valid_series = self.df[col].dropna()
-            if valid_series.empty: continue
+            if valid_series.empty:
+                continue
 
-            # Get type counts
-            type_counts = valid_series.apply(self._get_python_type_name).value_counts()
+            type_series = valid_series.apply(self._get_python_type_name)
+            
+            # 3. Get counts from the series we already created
+            type_counts = type_series.value_counts()
             
             if len(type_counts) > 1:
-                # Identify Majority and Minority
                 majority_type = type_counts.idxmax()
                 majority_count = type_counts.max()
                 total_count = type_counts.sum()
                 
-                # Find samples of the minority types (the "Outliers")
-                # We iterate to find indices where type != majority
-                # Note: This can be slow on massive DFs, so we might want to sample if len > 1M
-                types_series = valid_series.apply(self._get_python_type_name)
-                outlier_mask = types_series != majority_type
+                outlier_mask = type_series != majority_type
                 outlier_samples = valid_series[outlier_mask].head(5).tolist()
                 
                 report[col] = {
@@ -1283,14 +1284,7 @@ class DataFrameCleaner:
                 }
 
         if verbose and report:
-            print(f"\n⚠️  [Mixed Type Report] Found {len(report)} inconsistent columns:")
-            print(f"{'Column':<20} | {'Majority':<8} | {'Breakdown':<30} | {'Outlier Samples'}")
-            print("-" * 90)
-            for col, data in report.items():
-                breakdown_str = str(data['breakdown'])
-                if len(breakdown_str) > 30: breakdown_str = breakdown_str[:27] + "..."
-                print(f"{col:<20} | {data['majority_type']:<8} | {breakdown_str:<30} | {data['outliers']}")
-        
+            self._print_report(report) # Moved printing to a helper for cleanliness
         return report
     
     def check_missing_values(self):
@@ -1312,27 +1306,6 @@ class DataFrameCleaner:
         else:
             print("\nNo standard missing values (NaN) found.")
         return self
-
-    def check_duplicates(self):
-        """Checks for duplicate rows, skipping unhashable columns."""
-        unhashable_cols = self._find_unhashable_columns()
-        
-        if unhashable_cols:
-            print(f"\nWarning: Excluding unhashable columns from duplicate check: {unhashable_cols}")
-            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
-            if not hashable_cols:
-                print("No hashable columns to check.")
-                return self
-            dupes = self.df.duplicated(subset=hashable_cols).sum()
-        else:
-            dupes = self.df.duplicated().sum()
-
-        if dupes > 0:
-            print(f"\nFound {dupes} duplicate rows.")
-        else:
-            print("\nNo duplicates found.")
-        return self
-
     
     def auto_infer_schema(self, sample_size=1000):
             import pyarrow as pa
@@ -1436,23 +1409,6 @@ class DataFrameCleaner:
                     
             return inferred
 
-    def show_duplicates(self, cols):
-        if isinstance(cols, str):
-            cols = [cols]
-        for col in cols:
-            if col not in self.df.columns:
-                continue
-            counts = self.df[col].value_counts()
-            duplicates = counts[counts>=2]
-
-            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
-            if not duplicates.empty:
-                print(duplicates.to_string(header=False))
-            else:
-                print("No values with 2+ appearances.")
-        
-
-
 
     # --- 2. CLEANING METHODS (Modify the DataFrame) ---
     #def parse_and_flatten(self,pass):
@@ -1531,7 +1487,254 @@ class DataFrameCleaner:
         print(f"Flattened column '{column}' using mode='{mode}'")
         return self
 
-    def solve_duplicates(self):
+    def drop_short_strings(self, column, min_chars=10):
+        """Sets values in a string column to NaN if they are too short."""
+        if column in self.df.columns:
+            # Calculate lengths (handling existing NaNs gracefully)
+            lengths = self.df[column].astype(str).str.len()
+            
+            # Find indices where length is valid (not nan) but below threshold
+            # We check 'notna' to distinguish between "short string" and "already empty"
+            mask = (lengths < min_chars) & (self.df[column].notna())
+            
+            count = mask.sum()
+            if count > 0:
+                self.df.loc[mask, column] = np.nan
+                print(f"Cleaned '{column}': Removed {count} values shorter than {min_chars} chars.")
+        return self
+    
+    def reset_data(self, df_original):
+        """
+        Replaces the current (cleaned) dataframe with a fresh copy of the original.
+        Useful for restarting the pipeline without re-initializing the whole class.
+        """
+        print("Resetting DataFrame to original state...")
+        
+        # Create a fresh copy so we don't mutate the external variable
+        self.df = df_original.copy()
+        
+        # IMPORTANT: We must clear any previous analysis/enforcer state
+        # Re-initialize the enforcer with the new data
+        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
+        
+        print(f"Reset complete. Shape: {self.df.shape}")
+        return self
+
+    def enforce_schema(self, schema_dict, protected_values=None):
+        """
+        The Master Cleaning Function. 
+        Replaces: strip_whitespace, standardize_missing_values, and unify_na_values.
+        """
+        enforcer = SchemaEnforcer(self.df, self.na_placeholders, protected_values)
+        self.df = enforcer.apply(schema_dict)
+        return self
+
+    def clean_column_names(self):
+        self.df.columns = (self.df.columns.astype(str).str.strip().str.lower()
+                           .str.replace(r'\s+', '_', regex=True)
+                           .str.replace(r'[^a-z0-9_]', '', regex=True))
+        return self
+    
+    def drop_constant_columns(self):
+        """Drops columns where all values are the same."""
+        # nunique(dropna=False) counts NaNs as a unique value if they exist
+        # If nunique == 1, the column has only 1 value across all rows
+        cols_to_drop = [col for col in self.df.columns if self.df[col].nunique(dropna=False) <= 1]
+        
+        if cols_to_drop:
+            self.df.drop(columns=cols_to_drop, inplace=True)
+            print(f"Dropped constant columns: {cols_to_drop}")
+        return self
+    
+    def cap_outliers(self, columns, lower_quantile=0.05, upper_quantile=0.95):
+        """Caps numerical values at specific quantiles to reduce outlier impact."""
+        for col in columns:
+            if col in self.df.columns and pd.api.types.is_numeric_dtype(self.df[col]):
+                lower = self.df[col].quantile(lower_quantile)
+                upper = self.df[col].quantile(upper_quantile)
+                
+                # Clip values
+                self.df[col] = self.df[col].clip(lower=lower, upper=upper)
+                print(f"Capped '{col}' between {lower:.2f} and {upper:.2f}")
+        return self
+
+
+    def drop_missing_cols(self, threshold=0.95, exclude=[]):
+        """Drops columns that are missing more than `threshold` percent of data."""
+        mask = self.df.isna().mean() > threshold
+        cols_to_drop = [col for col in self.df.columns[mask] if col not in exclude]
+        if cols_to_drop:
+            self.df.drop(columns=cols_to_drop, inplace=True)
+            print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
+        return self
+    
+    # ---------------------------------------------------------
+    # DEDUPLICATION SUITE
+    # ---------------------------------------------------------
+
+    def check_duplicates(self):
+        """
+        A diagnostic tool. Simply reports how many exact duplicate rows 
+        exist, ignoring unhashable (list/dict) columns.
+        """
+        unhashable_cols = self._find_unhashable_columns()
+        
+        if unhashable_cols:
+            print(f"\n[Audit] Warning: Excluding unhashable columns from duplicate check: {unhashable_cols}")
+            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
+            if not hashable_cols:
+                print("[Audit] No hashable columns available to check.")
+                return self
+            dupes = self.df.duplicated(subset=hashable_cols).sum()
+        else:
+            dupes = self.df.duplicated().sum()
+
+        if dupes > 0:
+            print(f"[Audit] Found {dupes} exact duplicate rows.")
+        else:
+            print("[Audit] No exact duplicates found.")
+        return self
+
+    def show_column_duplicates(self, cols):
+        """
+        A diagnostic tool. Shows which specific values in specific columns 
+        appear more than once.
+        """
+        if isinstance(cols, str):
+            cols = [cols]
+            
+        for col in cols:
+            if col not in self.df.columns:
+                continue
+            counts = self.df[col].value_counts()
+            duplicates = counts[counts >= 2]
+
+            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
+            if not duplicates.empty:
+                print(duplicates.to_string(header=False))
+            else:
+                print("No values with 2+ appearances.")
+        return self
+
+    def drop_exact_duplicates(self):
+        """
+        The 'Low-Hanging Fruit'. Removes rows that are 100% identical 
+        in all hashable columns.
+        """
+        unhashable = self._find_unhashable_columns()
+        hashable_subset = [c for c in self.df.columns if c not in unhashable]
+        
+        if not hashable_subset:
+            print("Cannot drop exact duplicates: No hashable columns found.")
+            return self
+
+        initial_len = len(self.df)
+        self.df.drop_duplicates(subset=hashable_subset, inplace=True)
+        dropped = initial_len - len(self.df)
+        
+        if dropped > 0:
+            print(f"Dropped {dropped} exact duplicate rows.")
+        else:
+            print("No exact duplicates found to drop.")
+        return self
+
+    def resolve_fuzzy_duplicates(self, title_col='title', author_col='authors', 
+                                title_threshold=60, author_threshold=80):
+        """
+        The 'Heavy Lifter'. Uses fuzzy matching to find 'near-duplicates' 
+        and resolves them based on data completeness.
+        """
+        if title_col not in self.df.columns or author_col not in self.df.columns:
+            print(f"Error: Columns '{title_col}' or '{author_col}' not found.")
+            return self
+
+        print(f"Starting fuzzy deduplication (Title Thresh: {title_threshold}, Author Thresh: {author_threshold})...")
+        
+        # 1. Setup Tracking
+        keep_idx = set()
+        remove_idx = set()
+        # Calculate completeness (non-null count) for the resolution phase
+        self.df['_completeness_score'] = self.df.notna().sum(axis=1)
+
+        # 2. Identify Candidate Pairs
+        print(" -> Step 1: Identifying candidate title pairs...")
+        title_map = self.df.groupby(title_col).groups
+        unique_titles = list(title_map.keys())
+        candidate_pairs = []
+
+        # A. Fuzzy Title Matches
+        for t1 in unique_titles:
+            matches = process.extract(t1, unique_titles, scorer=fuzz.token_sort_ratio, limit=5)
+            for t2, score, _ in matches:
+                if t1 == t2: continue
+                if score >= title_threshold:
+                    idxs_1 = title_map[t1]
+                    idxs_2 = title_map[t2]
+                    for i1 in idxs_1:
+                        for i2 in idxs_2:
+                            pair = tuple(sorted((i1, i2)))
+                            candidate_pairs.append(pair)
+
+        # B. Exact Title Matches
+        for title, indices in title_map.items():
+            if len(indices) > 1:
+                indices = list(indices)
+                for i in range(len(indices)):
+                    for j in range(i + 1, len(indices)):
+                        candidate_pairs.append((indices[i], indices[j]))
+
+        candidate_pairs = list(set(candidate_pairs))
+        print(f" -> Found {len(candidate_pairs)} candidate pairs.")
+
+        # 3. Verify Authors and Resolve
+        print(" -> Step 2: Verifying Authors and Resolving by Completeness...")
+        
+        for idx1, idx2 in candidate_pairs:
+            # Skip if we already decided on one of these rows
+            if idx1 in remove_idx or idx2 in remove_idx:
+                continue
+
+            # Extract authors as strings for comparison
+            auth1 = str(self.df.loc[idx1, author_col])
+            auth2 = str(self.df.loc[idx2, author_col])
+
+            if fuzz.token_sort_ratio(auth1, auth2) >= author_threshold:
+                # Confirmed Duplicate. Choose the 'best' one.
+                score1 = self.df.loc[idx1, '_completeness_score']
+                score2 = self.df.loc[idx2, '_completeness_score']
+                
+                if score1 >= score2:
+                    keep_idx.add(idx1)
+                    remove_idx.add(idx2)
+                else:
+                    keep_idx.add(idx2)
+                    remove_idx.add(idx1)
+
+        # 4. Cleanup
+        self.df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
+        
+        # Apply the removal
+        if remove_idx:
+            self.df.drop(index=list(remove_idx), inplace=True)
+            print(f"Resolved {len(remove_idx)} fuzzy duplicates.")
+        else:
+            print("No fuzzy duplicates resolved.")
+
+        return self
+    
+    '''
+    def drop_duplicates(self):
+        # Only check hashable columns to avoid crashing on lists
+        unhashable = self._find_unhashable_columns()
+        hashable_subset = [c for c in self.df.columns if c not in unhashable]
+        if hashable_subset:
+            initial = len(self.df)
+            self.df.drop_duplicates(subset=hashable_subset,inplace=True)
+            print(f"Dropped {initial - len(self.df)} duplicates.")
+        return self
+    '''
+    '''
+        def solve_duplicates(self):
         # Sets to track our decisions
         df = self.df
         keep_idx = set()
@@ -1661,97 +1864,43 @@ class DataFrameCleaner:
         df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
         
         return keep_idx, remove_idx
-
-    def drop_short_strings(self, column, min_chars=10):
-        """Sets values in a string column to NaN if they are too short."""
-        if column in self.df.columns:
-            # Calculate lengths (handling existing NaNs gracefully)
-            lengths = self.df[column].astype(str).str.len()
-            
-            # Find indices where length is valid (not nan) but below threshold
-            # We check 'notna' to distinguish between "short string" and "already empty"
-            mask = (lengths < min_chars) & (self.df[column].notna())
-            
-            count = mask.sum()
-            if count > 0:
-                self.df.loc[mask, column] = np.nan
-                print(f"Cleaned '{column}': Removed {count} values shorter than {min_chars} chars.")
-        return self
-    
-    def reset_data(self, df_original):
-        """
-        Replaces the current (cleaned) dataframe with a fresh copy of the original.
-        Useful for restarting the pipeline without re-initializing the whole class.
-        """
-        print("Resetting DataFrame to original state...")
+    '''
+    '''
+        def check_duplicates(self):
+        """Checks for duplicate rows, skipping unhashable columns."""
+        unhashable_cols = self._find_unhashable_columns()
         
-        # Create a fresh copy so we don't mutate the external variable
-        self.df = df_original.copy()
-        
-        # IMPORTANT: We must clear any previous analysis/enforcer state
-        # Re-initialize the enforcer with the new data
-        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
-        
-        print(f"Reset complete. Shape: {self.df.shape}")
+        if unhashable_cols:
+            print(f"\nWarning: Excluding unhashable columns from duplicate check: {unhashable_cols}")
+            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
+            if not hashable_cols:
+                print("No hashable columns to check.")
+                return self
+            dupes = self.df.duplicated(subset=hashable_cols).sum()
+        else:
+            dupes = self.df.duplicated().sum()
+
+        if dupes > 0:
+            print(f"\nFound {dupes} duplicate rows.")
+        else:
+            print("\nNo duplicates found.")
         return self
 
-    def enforce_schema(self, schema_dict, protected_values=None):
-        """
-        The Master Cleaning Function. 
-        Replaces: strip_whitespace, standardize_missing_values, and unify_na_values.
-        """
-        enforcer = SchemaEnforcer(self.df, self.na_placeholders, protected_values)
-        self.df = enforcer.apply(schema_dict)
-        return self
+    def show_duplicates(self, cols):
+        if isinstance(cols, str):
+            cols = [cols]
+        for col in cols:
+            if col not in self.df.columns:
+                continue
+            counts = self.df[col].value_counts()
+            duplicates = counts[counts>=2]
 
-    def clean_column_names(self):
-        self.df.columns = (self.df.columns.astype(str).str.strip().str.lower()
-                           .str.replace(r'\s+', '_', regex=True)
-                           .str.replace(r'[^a-z0-9_]', '', regex=True))
-        return self
-    
-    def drop_constant_columns(self):
-        """Drops columns where all values are the same."""
-        # nunique(dropna=False) counts NaNs as a unique value if they exist
-        # If nunique == 1, the column has only 1 value across all rows
-        cols_to_drop = [col for col in self.df.columns if self.df[col].nunique(dropna=False) <= 1]
-        
-        if cols_to_drop:
-            self.df.drop(columns=cols_to_drop, inplace=True)
-            print(f"Dropped constant columns: {cols_to_drop}")
-        return self
-    
-    def cap_outliers(self, columns, lower_quantile=0.05, upper_quantile=0.95):
-        """Caps numerical values at specific quantiles to reduce outlier impact."""
-        for col in columns:
-            if col in self.df.columns and pd.api.types.is_numeric_dtype(self.df[col]):
-                lower = self.df[col].quantile(lower_quantile)
-                upper = self.df[col].quantile(upper_quantile)
-                
-                # Clip values
-                self.df[col] = self.df[col].clip(lower=lower, upper=upper)
-                print(f"Capped '{col}' between {lower:.2f} and {upper:.2f}")
-        return self
-
-
-    def drop_missing_cols(self, threshold=0.95, exclude=[]):
-        """Drops columns that are missing more than `threshold` percent of data."""
-        mask = self.df.isna().mean() > threshold
-        cols_to_drop = [col for col in self.df.columns[mask] if col not in exclude]
-        if cols_to_drop:
-            self.df.drop(columns=cols_to_drop, inplace=True)
-            print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
-        return self
-
-    def drop_duplicates(self):
-        # Only check hashable columns to avoid crashing on lists
-        unhashable = self._find_unhashable_columns()
-        hashable_subset = [c for c in self.df.columns if c not in unhashable]
-        if hashable_subset:
-            initial = len(self.df)
-            self.df.drop_duplicates(subset=hashable_subset,inplace=True)
-            print(f"Dropped {initial - len(self.df)} duplicates.")
-        return self
+            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
+            if not duplicates.empty:
+                print(duplicates.to_string(header=False))
+            else:
+                print("No values with 2+ appearances.")
+    '''
 
     def resolve_mixed_types(self, interactive=True):
         """
