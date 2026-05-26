@@ -164,7 +164,7 @@ def from_zip(
     print(f"Successfully extracted {extracted_count} files to '{output_dir}'.")
 
 
-def sanitize_filename(filename: str, replacement: str = "_") -> str:
+def sanitize_filename_old(filename: str, replacement: str = "_") -> str:
     # Characters forbidden in filenames on Windows, Linux, and macOS
     # \/:*?"<>| are Windows-specific; \x00 is a null byte (Unix/Windows)
     valid_chars = r'[A-Za-z0-9-_ ËéèêëôöûüàâäîïçÏ]'
@@ -179,7 +179,7 @@ def sanitize_filename(filename: str, replacement: str = "_") -> str:
     return sanitized if sanitized else "untitled"
 
 
-def sanitize_filename_new(filename: str) -> str:
+def sanitize_filename(filename: str, replacement: str = '_') -> str:
     """
     Takes a string and returns a valid, safe filename for all major OSes.
 
@@ -192,7 +192,7 @@ def sanitize_filename_new(filename: str) -> str:
     # The regex `[\\/:"*?<>|]` will match any of the characters inside the brackets.
     # The `\\` is to escape the backslash in the regex pattern.
     invalid_chars = r'[\\/:"*?<>|]'
-    sanitized = re.sub(invalid_chars, '_', filename)
+    sanitized = re.sub(invalid_chars, replacement, filename)
 
     # 2. Define reserved names on Windows (case-insensitive)
     reserved_names = {
@@ -1455,6 +1455,213 @@ class DataFrameCleaner:
 
 
     # --- 2. CLEANING METHODS (Modify the DataFrame) ---
+    #def parse_and_flatten(self,pass):
+    #    if isinstance(val, list):
+    #        return val[0] if len(val) > 0 else None
+    #        
+    #    if isinstance(val, str) and val.strip().startswith('['):
+    #        try:
+    #            actual_list = ast.literal_eval(val)
+    #            return actual_list[0] if isinstance(actual_list, list) and len(actual_list) > 0 else None
+    #        except (ValueError, SyntaxError):
+    #           return None         
+    #   return val
+
+    def combine_columns(self, col1, col2, new_name, sep=' '):
+        """
+        Merges two columns into one. 
+        Handles NaNs so you don't end up with strings like 'John nan'.
+        """
+        if col1 not in self.df.columns or col2 not in self.df.columns:
+            print(f"Error: One of the columns {col1} or {col2} does not exist.")
+            return self
+
+        # Convert to string, but handle NaNs properly
+        # We use .fillna('') so that 'John' + NaN becomes 'John' instead of 'John nan'
+        s1 = self.df[col1].astype(str).replace('nan', '').str.strip()
+        s2 = self.df[col2].astype(str).replace('nan', '').str.strip()
+
+        # Combine them
+        self.df[new_name] = s1 + sep + s2
+        
+        # Clean up potential leading/trailing separators if one side was empty
+        self.df[new_name] = self.df[new_name].str.strip(sep)
+        
+        print(f"Combined '{col1}' and '{col2}' into '{new_name}'")
+        return self
+
+    def extract_first_element(self, column, mode='first'):
+        """
+        Flattens complex columns (Lists or Stringified Lists) into a single value.
+        
+        Modes:
+        'first' : Returns only the first item in the list.
+        'join'  : Returns all items joined by a semicolon (e.g., 'item1; item2').
+        """
+        if column not in self.df.columns:
+            print(f"Error: Column '{column}' not found.")
+            return self
+
+        def _internal_parser(val):
+            # 1. Handle real Python lists
+            if isinstance(val, list):
+                target_list = val
+            # 2. Handle "Stringified" lists: "['a', 'b']"
+            elif isinstance(val, str) and val.strip().startswith('['):
+                try:
+                    target_list = ast.literal_eval(val.strip())
+                except (ValueError, SyntaxError):
+                    target_list = []
+            # 3. It's already a single value
+            else:
+                return val
+
+            # Perform the requested mode
+            if isinstance(target_list, list):
+                if not target_list:
+                    return None
+                if mode == 'first':
+                    return target_list[0]
+                elif mode == 'join':
+                    return "; ".join([str(i) for i in target_list])
+            
+            return val
+
+        self.df[column] = self.df[column].apply(_internal_parser)
+        print(f"Flattened column '{column}' using mode='{mode}'")
+        return self
+
+    def solve_duplicates(self):
+        # Sets to track our decisions
+        df = self.df
+        keep_idx = set()
+        remove_idx = set()
+        
+        # Helper: Calculate completeness (count of non-null columns)
+        # We calculate this once for the whole dataframe for speed
+        df['_completeness_score'] = df.notna().sum(axis=1)
+
+        # ---------------------------------------------------------
+        # STEP 1: Identify Candidate Pairs (Title Based)
+        # ---------------------------------------------------------
+        print("Step 1: Identifying candidate title pairs...")
+        
+        # Map titles to list of indices: {'Title A': [0, 5], 'Title B': [2]}
+        title_map = df.groupby('title').groups
+        unique_titles = list(title_map.keys())
+        
+        candidate_pairs = [] # List of (index_1, index_2)
+
+        # A. Fuzzy Matches (Using your logic)
+        # Note: limit=5 might be too low if you have many matches, 
+        # but for "near matches" per string it is okay.
+        for t1 in unique_titles:
+            matches = process.extract(t1, unique_titles, scorer=fuzz.token_sort_ratio, limit=5)
+            for t2, score, _ in matches:
+                if t1 == t2: continue # Skip exact self-match (handled in B)
+                if score >= TITLE_THRESHOLD:
+                    # We found two DIFFERENT strings that look alike.
+                    # We must compare every row with Title 1 against every row with Title 2
+                    idxs_1 = title_map[t1]
+                    idxs_2 = title_map[t2]
+                    
+                    for i1 in idxs_1:
+                        for i2 in idxs_2:
+                            # Store sorted tuple to avoid checking (1,2) and (2,1)
+                            pair = tuple(sorted((i1, i2)))
+                            candidate_pairs.append(pair)
+
+        # B. Exact Matches (Same title appearing in multiple rows)
+        for title, indices in title_map.items():
+            if len(indices) > 1:
+                # Create pairs for every combination of indices with this title
+                indices = list(indices)
+                for i in range(len(indices)):
+                    for j in range(i + 1, len(indices)):
+                        candidate_pairs.append((indices[i], indices[j]))
+
+        # Deduplicate pairs
+        candidate_pairs = list(set(candidate_pairs))
+        print(f" -> Found {len(candidate_pairs)} candidate row pairs based on Title.")
+
+        # ---------------------------------------------------------
+        # STEP 2: Verify Author & Resolve (Completeness)
+        # ---------------------------------------------------------
+        print("Step 2: Verifying Authors and Resolving...")
+        
+        processed_indices = set() # Track indices we have made a decision on
+
+        for idx1, idx2 in candidate_pairs:
+            # Skip if we already removed one of these (greedy approach)
+            # remove this check if you want to evaluate all overlaps
+            if idx1 in remove_idx or idx2 in remove_idx:
+                continue
+
+            author1 = str(df.loc[idx1, 'authors']) # Ensure string
+            author2 = str(df.loc[idx2, 'authors'])
+
+            # Check Author Similarity
+            auth_score = fuzz.token_sort_ratio(author1, author2)
+            
+            if auth_score >= AUTHOR_THRESHOLD:
+                # --- CONFIRMED DUPLICATE ---
+                processed_indices.add(idx1)
+                processed_indices.add(idx2)
+                
+                # Check Completeness
+                score1 = df.loc[idx1, '_completeness_score']
+                score2 = df.loc[idx2, '_completeness_score']
+                
+                if score1 >= score2:
+                    keep_idx.add(idx1)
+                    remove_idx.add(idx2)
+                else:
+                    keep_idx.add(idx2)
+                    remove_idx.add(idx1)
+            else:
+                # Authors look different, likely not a duplicate
+                pass
+
+        print(f" -> Marked {len(remove_idx)} rows for removal.")
+        print(f" -> Marked {len(keep_idx)} rows to keep (as the 'better' versions).")
+
+        # ---------------------------------------------------------
+        # STEP 3: Check "Unaccounted" Repeated Authors
+        # ---------------------------------------------------------
+        print("\nStep 3: Checking Unaccounted Author Duplicates...")
+        
+        # All indices involved in the duplicate process (either kept or removed)
+        accounted_indices = keep_idx | remove_idx
+        
+        # Find authors that appear > 1 time in the WHOLE dataframe
+        # (We cast to str to ensure hashability if list)
+        author_counts = df['authors'].apply(str).value_counts()
+        repeated_authors = author_counts[author_counts > 1].index
+        
+        unaccounted_results = []
+
+        for auth in repeated_authors:
+            # Get all indices for this author
+            # Note: This filtering might be slow on huge DFs, usually better to iterate groups
+            mask = df['authors'].apply(str) == auth
+            author_indices = set(df.index[mask])
+            
+            # Subtract indices we already handled in Step 2
+            unaccounted = author_indices - accounted_indices
+            
+            #TODO further check: year? promoter?
+            if len(unaccounted) > 1:
+                # These are rows with the same author that were NOT flagged as title duplicates
+                titles = df.loc[list(unaccounted), 'title'].tolist()
+                unaccounted_results.append({
+                    'author': auth,
+                    'count_left': len(unaccounted),
+                    'titles': titles # Show first 3 titles
+                })
+        df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
+        
+        return keep_idx, remove_idx
+
     def drop_short_strings(self, column, min_chars=10):
         """Sets values in a string column to NaN if they are too short."""
         if column in self.df.columns:
@@ -1643,9 +1850,12 @@ class DataFrameCleaner:
         self.df.reset_index(drop=True, inplace=True)
         return self
 
+
+    def remove_missing_values(self):
+        pass
+
     # --- 3. PIPELINE ---
     #TODO 
-        # check first for mixed types and adapt enforce schema
     def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False, interactive=True):
         # 1. Diagnostic & Remediation
         print("\n--- Pipeline Start: Pre-Flight Check ---")
@@ -1692,6 +1902,7 @@ def timed_request(
     delay: float | None = None,
     timeout: int = 10,
     headers: dict | None = None,
+    save_to: str | None = None,
     **kwargs
 ):
     """Makes a robust, timed HTTP request with error handling."""
@@ -1722,10 +1933,21 @@ def timed_request(
             **kwargs
         )
         response.raise_for_status()
+        if save_to:
+            file_path = Path(save_to)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            print(f"[Success] HTTP response saved to: {save_to}")
+
         return response
     except requests.exceptions.RequestException as e:
         # Catching all Request exceptions (HTTPError, ConnectionError, etc)
         print(f"  [Error] Request failed for {url}: {e}")
+        return None
+    except IOError as e:
+        print(f"  [Error] Could not save file to {save_to}: {e}")
         return None
 
 
