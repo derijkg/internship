@@ -1722,7 +1722,6 @@ class DataFrameCleaner:
 
         return self
     
-    '''
     def drop_duplicates(self):
         # Only check hashable columns to avoid crashing on lists
         unhashable = self._find_unhashable_columns()
@@ -1732,6 +1731,9 @@ class DataFrameCleaner:
             self.df.drop_duplicates(subset=hashable_subset,inplace=True)
             print(f"Dropped {initial - len(self.df)} duplicates.")
         return self
+    
+    '''
+
     '''
     '''
         def solve_duplicates(self):
