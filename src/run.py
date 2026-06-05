@@ -17,6 +17,8 @@ import pyarrow  as pa
 import pyarrow.json as pj
 import pyarrow.parquet as pq
 import pyarrow.csv as pv
+import pyarrow.compute as pc
+
 
 
 def main():
@@ -188,6 +190,7 @@ def main():
 
         #delete sb_temp.tsv
 
+    #MERGE SELECTION
     if merge == True:
         #2 FLAT MERGE
         #take from ug what we need
@@ -212,6 +215,59 @@ def main():
         
 
 
+        class TableAuditEngine:
+            def __init__(self, table: pa.Table):
+                self.table = table
+                self.results = {}
+
+            def run_tasks(self, task_registry):
+                """
+                Executes a registry of tasks.
+                Each task must accept a pa.Table and return a pa.Array or pa.ChunkedArray.
+                """
+                for task_name, task_func in task_registry.items():
+                    print(f"Running task: {task_name}...")
+                    # The task returns a PyArrow Array (the result of the vectorized operation)
+                    self.results[task_name] = task_func(self.table)
+                return self.results
+
+        # --- THE TASK LIBRARY (Vectorized Functions) ---
+        # These functions stay entirely in PyArrow/C++ land for maximum speed.
+
+        class AuditTasks:
+            @staticmethod
+            def task_extract_restricted_urls(table):
+                """Task: Extract URLs where access == 'restricted' inside the 'file' list."""
+                file_col = table.column('file')
+                # 1. Reach into list
+                first_elements = pc.list_element(file_col, 0)
+                # 2. Reach into struct
+                access_vals = pc.struct_field(first_elements, 'access')
+                url_vals = pc.struct_field(first_elements, 'url')
+                # 3. Filter
+                mask = pc.equal(access_vals, 'restricted')
+                return url_vals.filter(mask)
+
+            @staticmethod
+            def task_find_invalid_years(table):
+                """Task: Find years that are physically impossible (out of range)."""
+                year_col = table.column('year')
+                # Returns a Boolean Mask (True where year is invalid)
+                mask = pc.or_(pc.less(year_col, 1900), pc.greater(year_col, 2100))
+                # We return the actual 'bad' years
+                return year_col.filter(mask)
+
+            @staticmethod
+            def task_find_null_names(table):
+                """Task: Find rows where name is missing."""
+                # Assuming 'name' is a top-level column
+                return table.column('name').filter(pc.is_null(table.column('name')))
+
+        registry = {
+            "restricted_urls": AuditTasks.task_extract_restricted_urls,
+            "bad_years": AuditTasks.task_find_invalid_years,
+            "missing_names": AuditTasks.task_find_null_names
+        }
 
 
     #STEP 3: GOLD
