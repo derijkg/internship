@@ -43,10 +43,10 @@ def main():
     ug_dl = False
     clean_metadata = False
     merge = True
-    selection = True
-    download_files = True
-    marker_conversion = True
-    markdown_conversion = True
+    selection = False
+    download_files = False
+    marker_conversion = False
+    markdown_conversion = False
 
 
     if run_all == True:
@@ -191,91 +191,86 @@ def main():
         #delete sb_temp.tsv
 
     #MERGE SELECTION
-    if merge == True:
-        #2 FLAT MERGE
-        #take from ug what we need
-            #download link : heuristic : open access?
-            #abstract, add to main frame: dict: {lang: text, ...}
-            #
-        def get_open_access_link(file_list):
-            """
-            Returns URL if access is open AND it is the full text.
-            Fixes the issue of non-downloadable texts making it in.
-            """
-            if isinstance(file_list, (list, np.ndarray)):
-                for f in file_list:
-                    if isinstance(f, dict):
-                        # Strict check for 'open' AND 'fullText'
-                        if f.get('access') == 'open' and f.get('kind') == 'fullText':
-                            return f.get('url')
-            return None
-    
-        def merge_ug_to_sb():
-            return row_to_add
+    if merge == True: #ACTUALLY JUST SELECTS FROM UG
+        ug_clean = Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet')
+        ug_selected = Path('/home/gderijck/internship/data/silver/ug_selected.parquet')
+        ug_table = pq.read_table(ug_clean)
         
+        def add_dutch_abs_col(table, column_name):
+            col = table.column(column_name)
+            dutch_text_chunks = []
 
-
-        class TableAuditEngine:
-            def __init__(self, table: pa.Table):
-                self.table = table
-                self.results = {}
-
-            def run_tasks(self, task_registry):
-                """
-                Executes a registry of tasks.
-                Each task must accept a pa.Table and return a pa.Array or pa.ChunkedArray.
-                """
-                for task_name, task_func in task_registry.items():
-                    print(f"Running task: {task_name}...")
-                    # The task returns a PyArrow Array (the result of the vectorized operation)
-                    self.results[task_name] = task_func(self.table)
-                return self.results
-
-        # --- THE TASK LIBRARY (Vectorized Functions) ---
-        # These functions stay entirely in PyArrow/C++ land for maximum speed.
-
-        class AuditTasks:
+            for chunk in col.chunks:
+                flat_dicts = pc.list_flatten(chunk)
+                langs = pc.struct_field(flat_dicts, 'lang')
+                texts = pc.struct_field(flat_dicts, 'text')
+                is_dut_flat = pc.equal(langs, 'dut').fill_null(False)
+                parent_indices = pc.list_parent_indices(chunk)
+                matching_parents = pc.filter(parent_indices, is_dut_flat).to_numpy()
+                matching_texts = pc.filter(texts, is_dut_flat).to_numpy(zero_copy_only=False)
+                chunk_results = np.empty(len(chunk), dtype=object)
+                if len(matching_parents) > 0:
+                    chunk_results[matching_parents] = matching_texts
+                    dutch_text_chunks.append(pa.array(chunk_results, type=pa.string()))
+            dutch_text_col = pa.chunked_array(dutch_text_chunks, type=pa.string())
+            return table.append_column('abstract_dutch', dutch_text_col)
+        
+        class Rules:
             @staticmethod
-            def task_extract_restricted_urls(table):
-                """Task: Extract URLs where access == 'restricted' inside the 'file' list."""
-                file_col = table.column('file')
-                # 1. Reach into list
-                first_elements = pc.list_element(file_col, 0)
-                # 2. Reach into struct
-                access_vals = pc.struct_field(first_elements, 'access')
-                url_vals = pc.struct_field(first_elements, 'url')
-                # 3. Filter
-                mask = pc.equal(access_vals, 'restricted')
-                return url_vals.filter(mask)
-
-            @staticmethod
-            def task_find_invalid_years(table):
-                """Task: Find years that are physically impossible (out of range)."""
+            def rule_valid_year(table):
                 year_col = table.column('year')
-                # Returns a Boolean Mask (True where year is invalid)
-                mask = pc.or_(pc.less(year_col, 1900), pc.greater(year_col, 2100))
-                # We return the actual 'bad' years
-                return year_col.filter(mask)
+                return pc.and_(pc.greater_equal(year_col, 1980), pc.less_equal(year_col, 2022))
 
             @staticmethod
-            def task_find_null_names(table):
-                """Task: Find rows where name is missing."""
-                # Assuming 'name' is a top-level column
-                return table.column('name').filter(pc.is_null(table.column('name')))
+            def rule_access_is_open(table):
+                # Rule: Access must be 'open' (reaching into the nested struct)
+                file_col = table.column('file')
+                first_elements = pc.list_element(file_col, 0)
+                access_vals = pc.struct_field(first_elements, 'access')
+                return pc.equal(access_vals, 'open')
 
-        registry = {
-            "restricted_urls": AuditTasks.task_extract_restricted_urls,
-            "bad_years": AuditTasks.task_find_invalid_years,
-            "missing_names": AuditTasks.task_find_null_names
-        }
+            @staticmethod
+            def rule_name_not_null(table):
+                # Rule: Name cannot be null
+                return pc.is_valid(table.column('name'))
+            
+            @staticmethod
+            def dutch_abs(table):
+                abs_full_col = table.column('abstract_full')
+                mask_chunks = []
+                for chunk in abs_full_col.chunks:
+                    flat_dicts = pc.list_flatten(chunk)
+                    langs = pc.struct_field(flat_dicts,'lang')
+                    is_dut_flat = pc.equal(langs,'dut').fill_null(False)
+                    parent_indices = pc.list_parent_indices(chunk)
+                    matching_row_numbers = pc.filter(parent_indices, is_dut_flat)
+                    chunk_mask = np.zeros(len(chunk), dtype=bool)
+                    chunk_mask[matching_row_numbers.to_numpy()] = True
+                    mask_chunks.append(pa.array(chunk_mask))
+                return pa.chunked_array(mask_chunks, type=pa.bool_())
+
+        mask_year = Rules.rule_valid_year(ug_table)
+        mask_dutch = Rules.dutch_abs(ug_table)
+
+        final_mask = pc.and_(mask_year, mask_dutch)
+
+        ug_selected_table = ug_table.filter(final_mask)
+        ug_selected_table_dut_col_added = add_dutch_abs_col(ug_selected_table,'abstract_full')
+        print(ug_selected_table_dut_col_added.num_rows)
+        text_lengths = pc.utf8_length(ug_selected_table_dut_col_added.column('abstract_dutch'))
+        length_mask = pc.greater_equal(text_lengths, 100).fill_null(False)
+        final_table = ug_selected_table_dut_col_added.filter(length_mask)
+        print(final_table.num_rows)
+
+        pq.write_table(final_table,ug_selected)
 
 
     #STEP 3: GOLD
-    if selection = True:
+    if selection == True:
         pass
-    if download_files = True:
+    if download_files == True:
         pass
-    if marker_conversion = True:
+    if marker_conversion == True:
         pass
     # SELECT RELEVANT DATA
     # DOWNLOAD FILES & ASSOCIATE IDS
