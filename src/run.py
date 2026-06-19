@@ -18,7 +18,13 @@ import pyarrow.json as pj
 import pyarrow.parquet as pq
 import pyarrow.csv as pv
 import pyarrow.compute as pc
+from langdetect import detect, DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
 
+
+parser = argparse.ArgumentParser(
+    
+)
 
 
 def main():
@@ -194,76 +200,38 @@ def main():
     if merge == True: #ACTUALLY JUST SELECTS FROM UG
         ug_clean = Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet')
         ug_selected = Path('/home/gderijck/internship/data/silver/ug_selected.parquet')
-        ug_table = pq.read_table(ug_clean)
+        table = pq.read_table(ug_clean)
         
-        def add_dutch_abs_col(table, column_name):
-            col = table.column(column_name)
-            dutch_text_chunks = []
+        rows = table.to_pylist()
 
-            for chunk in col.chunks:
-                flat_dicts = pc.list_flatten(chunk)
-                langs = pc.struct_field(flat_dicts, 'lang')
-                texts = pc.struct_field(flat_dicts, 'text')
-                is_dut_flat = pc.equal(langs, 'dut').fill_null(False)
-                parent_indices = pc.list_parent_indices(chunk)
-                matching_parents = pc.filter(parent_indices, is_dut_flat).to_numpy()
-                matching_texts = pc.filter(texts, is_dut_flat).to_numpy(zero_copy_only=False)
-                chunk_results = np.empty(len(chunk), dtype=object)
-                if len(matching_parents) > 0:
-                    chunk_results[matching_parents] = matching_texts
-                    dutch_text_chunks.append(pa.array(chunk_results, type=pa.string()))
-            dutch_text_col = pa.chunked_array(dutch_text_chunks, type=pa.string())
-            return table.append_column('abstract_dutch', dutch_text_col)
-        
-        class Rules:
-            @staticmethod
-            def rule_valid_year(table):
-                year_col = table.column('year')
-                return pc.and_(pc.greater_equal(year_col, 1980), pc.less_equal(year_col, 2022))
+        filtered_data = []
 
-            @staticmethod
-            def rule_access_is_open(table):
-                # Rule: Access must be 'open' (reaching into the nested struct)
-                file_col = table.column('file')
-                first_elements = pc.list_element(file_col, 0)
-                access_vals = pc.struct_field(first_elements, 'access')
-                return pc.equal(access_vals, 'open')
 
-            @staticmethod
-            def rule_name_not_null(table):
-                # Rule: Name cannot be null
-                return pc.is_valid(table.column('name'))
-            
-            @staticmethod
-            def dutch_abs(table):
-                abs_full_col = table.column('abstract_full')
-                mask_chunks = []
-                for chunk in abs_full_col.chunks:
-                    flat_dicts = pc.list_flatten(chunk)
-                    langs = pc.struct_field(flat_dicts,'lang')
-                    is_dut_flat = pc.equal(langs,'dut').fill_null(False)
-                    parent_indices = pc.list_parent_indices(chunk)
-                    matching_row_numbers = pc.filter(parent_indices, is_dut_flat)
-                    chunk_mask = np.zeros(len(chunk), dtype=bool)
-                    chunk_mask[matching_row_numbers.to_numpy()] = True
-                    mask_chunks.append(pa.array(chunk_mask))
-                return pa.chunked_array(mask_chunks, type=pa.bool_())
+        for row in rows:
+            year = row.get('year')
+            abstract_list = row.get('abstract_full')
 
-        mask_year = Rules.rule_valid_year(ug_table)
-        mask_dutch = Rules.dutch_abs(ug_table)
+            if year is not None and 1980 <= year <= 2022:
+                if isinstance(abstract_list, list):
+                    for item in abstract_list:
+                        if isinstance(item, dict) and item.get('lang') == 'dut':
+                            text_content = item.get('text')
+                            if isinstance(text_content, str) and len(text_content) >= 100:
+                                try:
+                                    detected_lang = detect(text_content)
+                                except LangDetectException:
+                                    detected_lang = 'unknown'
+                                
+                                if detected_lang == 'nl':
+                                    row["text_dut"] = text_content
+                                    filtered_data.append(row)
+                                    break
 
-        final_mask = pc.and_(mask_year, mask_dutch)
+        # 3. Load the filtered list of dicts back into a PyArrow Table
+        filtered_table = pa.Table.from_pylist(filtered_data)
 
-        ug_selected_table = ug_table.filter(final_mask)
-        ug_selected_table_dut_col_added = add_dutch_abs_col(ug_selected_table,'abstract_full')
-        print(ug_selected_table_dut_col_added.num_rows)
-        text_lengths = pc.utf8_length(ug_selected_table_dut_col_added.column('abstract_dutch'))
-        length_mask = pc.greater_equal(text_lengths, 100).fill_null(False)
-        final_table = ug_selected_table_dut_col_added.filter(length_mask)
-        print(final_table.num_rows)
-
-        pq.write_table(final_table,ug_selected)
-
+        # 4. Write back to a clean Parquet file
+        pq.write_table(filtered_table, ug_selected)
 
     #STEP 3: GOLD
     if selection == True:

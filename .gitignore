@@ -12,3 +12,5 @@ test.ipynb
 extraction_results.json
 *.log
 data_old/
+src/old/
+test2.ipynb

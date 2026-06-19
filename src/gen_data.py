@@ -1,58 +1,159 @@
+from pathlib import Path
 import pyarrow.parquet as pq
 import pyarrow as pa
 import pandas as pd
-import random
-random.seed(42)
 import nltk
-from ollama import Client
-
-# Download the sentence tokenizer model for Dutch
-nltk.download('punkt_tab')
 nltk.download('punkt')
+nltk.download('punkt_tab')
+import json
+import os
+import subprocess
+import time
+import atexit
+import socket
+import argparse
+import sys
 
-# ==========================================
-# 1. CONFIGURE OLLAMA & PARAMETERS
-# ==========================================
-# Connect using the official Ollama Python Client
-client = Client(host='http://localhost:11434')
+PORT = 11435
 
-# Define the Ollama model and instruction you want to use
-MODEL_CONFIG = {
-    "model_id": "llama3.1", # Ensure you have run `ollama pull llama3.1` in your terminal
-    "instruction": "Herschrijf deze zin zodat het simpeler is voor een leek (B1 niveau). Maak de zin niet langer dan de originele zin."
+# Force Ollama to ignore the broken GPU drivers entirely
+os.environ["OLLAMA_HOST"] = f"127.0.0.1:{PORT}"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Empty string disables GPU/CUDA entirely
+
+def is_port_in_use(port):
+    """Checks if our private server is already active on this node."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+ollama_process = None
+
+if not is_port_in_use(PORT):
+    print(f"Starting background Ollama server on CPU (Port {PORT})...")
+    
+    # Clone the environment and apply settings to the background server
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""  # Force CPU fallback
+    env["OLLAMA_HOST"] = f"127.0.0.1:{PORT}"
+    
+    # Launch Ollama as a background subprocess
+    ollama_process = subprocess.Popen(
+        ["ollama", "serve"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    
+    # Wait for the server to successfully boot up
+    for attempt in range(15):
+        if is_port_in_use(PORT):
+            print("Ollama server successfully launched on CPU.")
+            break
+        time.sleep(1)
+    else:
+        print("Warning: Ollama server initialization timed out. Exiting.")
+        sys.exit(1)
+else:
+    print(f"Ollama server is already running on port {PORT}. Reusing existing instance.")
+
+def shutdown_ollama_server():
+    """Kills the background server process when Python exits."""
+    global ollama_process
+    if ollama_process:
+        print("\nShutting down background Ollama server...")
+        ollama_process.terminate()
+        try:
+            ollama_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ollama_process.kill()
+        print("Server stopped cleanly.")
+
+# Register cleanup
+atexit.register(shutdown_ollama_server)
+
+import ollama
+
+CALC_MODEL_MAPPING = {
+    'calc12': ['qwen3.6:27b'],
+    'calc11': ['qwen3.5:4b'],
+    'calc10': ['gemma4:e4b']
 }
 
-# The list of percentages you want to run sequentially. 
-# 0.10 = 10% of sentences rewritten, 0.50 = 50%, etc.
-PERCENTAGES_TO_RUN = [0.10, 0.25, 0.50]
+def get_models_list():
+    try:
+        current_host = socket.gethostname().split('.')[0]
+        default_calc = current_host if current_host in CALC_MODEL_MAPPING else 'calc12'
+    except Exception:
+        default_calc = 'calc12'
 
-# ==========================================
-# 2. LLM REWRITE FUNCTION
-# ==========================================
-def rewrite_sentence(sentence: str) -> str:
-    """Sends a single sentence to Ollama for rewriting."""
-    system_prompt = (
-        "Je bent een professionele Nederlandse tekstverwerker. "
-        f"Jouw taak is: {MODEL_CONFIG['instruction']} "
-        "Geef UITSLUITEND de herschreven zin terug. Geef geen introductie, geen uitleg en geen aanhalingstekens."
+    parser = argparse.ArgumentParser(description='run llm rewrites on speicifc cluster node')
+    parser.add_argument(
+        '--calc',
+        type=str,
+        choices=list(CALC_MODEL_MAPPING.keys()),
+        default=default_calc,
+        help='specify calc'
     )
+    args = parser.parse_args()
+    selected_models = CALC_MODEL_MAPPING[args.calc]
+    print(f'selected config: {args.calc} -> models_list: {selected_models}')
+    return selected_models
 
+models_list = get_models_list()
+
+
+
+
+
+
+#-------------
+ug_path = Path('/home/gderijck/internship/data/silver/ug_selected.parquet')
+checkpoint_path = Path('/home/gderijck/internship/data/silver/checkpoint_rewrites.jsonl')
+
+ug = pq.read_table(ug_path)
+
+def prepare_tasks(table: pa.Table) -> list:
+    """Explodes the PyArrow table abstracts into indexed sentence tasks."""
+    tasks = []
+    
+    # Ensure there is a unique ID column. If not, generate a row index.
+    if '_id' in table.column_names:
+        ids = table['_id'].to_pylist()
+    else:
+        ids = list(range(len(table)))
+        
+    abstracts = table['text_dut'].to_pylist()
+    
+    for row_id, abstract in zip(ids, abstracts):
+        # Handle string check (adjust if your abstract is nested in a list/dict)
+        if isinstance(abstract, str) and abstract.strip():
+            sentences = nltk.sent_tokenize(abstract)
+            for sent_idx, sentence in enumerate(sentences):
+                tasks.append({
+                    "id": row_id,
+                    "sent_idx": sent_idx,
+                    "text": sentence
+                })
+    return tasks
+
+def rewrite_sentence(model_to_run, system_prompt, sentence):
+    """Sends a single sentence to Ollama for rewriting."""
     try:
         # Using the official Ollama chat implementation
-        response = client.chat(
-            model=MODEL_CONFIG["model_id"],
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": sentence}
-            ],
+        response = ollama.generate(
+            model=model_to_run,
+            system = system_prompt,
+            prompt = sentence,
+            think=False,
             options={
-                "temperature": 0.3, # Low temperature to prevent hallucinations
-                "num_predict": 150  # Ollama's equivalent of max_tokens
-            }
+                "seed": 42,
+                "num_thread": 4
+            },
+            #format = StrucResponse.model_json_schema(),
         )
         
         # Extract the text content from the Ollama response dictionary
-        rewritten = response['message']['content'].strip()
+        rewritten = response['response'].strip()
+        #response['done'] == True confirms it went thru
         
         # Clean up stray quotes if the LLM adds them
         if rewritten.startswith('"') and rewritten.endswith('"'):
@@ -61,101 +162,67 @@ def rewrite_sentence(sentence: str) -> str:
         return rewritten
     
     except Exception as e:
-        print(f"Error calling Ollama ({MODEL_CONFIG['model_id']}): {e}")
-        return sentence # Fallback to original sentence if the API fails
-
-# ==========================================
-# 3. CORE PROCESSING LOGIC (PER PERCENTAGE)
-# ==========================================
-def process_abstract(abstract: str, percentage: float) -> str:
-    """Splits abstract, selects X% of sentences at random, rewrites them, and rebuilds it."""
-    if not isinstance(abstract, str) or not abstract.strip():
-        return abstract
-
-    # Split into Dutch sentences robustly
-    sentences = nltk.sent_tokenize(abstract, language='dutch')
-    total_sents = len(sentences)
+        print(f"Error calling Ollama ({model_to_run}): {e}")
+        sys.exit(1)
     
-    if total_sents == 0:
-        return abstract
+def run_generation(models_to_run, system_prompt, tasks, checkpoint_file:Path):
+    tasks_map = {(task['id'], task['sent_idx']): task for task in tasks}
+    completed_runs = set()
+    if checkpoint_file.exists():
+        print(f'Loading existing progress from {checkpoint_file}')
+        with open(checkpoint_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    record = json.loads(line)
+                    t_id = record['id']
+                    s_idx = record['sent_idx']
+                    for model in models_to_run:
+                        if model in record:
+                            rewritten = record[model]
+                            completed_runs.add((t_id, s_idx, model))
+                            if (t_id, s_idx) in tasks_map:
+                                tasks_map[(t_id, s_idx)][model] = rewritten
+        print(f'Loaded {len(completed_runs)} completed runs. Skipping all of those.')
 
-    # Calculate exactly how many sentences to rewrite
-    count_to_rewrite = int(round(total_sents * percentage))
+
+    for model in models_to_run:
+        print(f'\nStarting model: {model}')
+        for i, task in enumerate(tasks):
+            t_id = task['id']
+            s_idx = task['sent_idx']
+            text = task['text']
     
-    # If the percentage is so low it rounds to 0, just return the original
-    if count_to_rewrite == 0:
-        return abstract
+            if (t_id, s_idx, model) in completed_runs:
+                continue
 
-    # Pick random sentence indices to rewrite
-    indices_to_rewrite = set(random.sample(range(total_sents), count_to_rewrite))
+            print(f'\n[{model}] Rewriting sentence {i+1}/{len(tasks)} (ID: {t_id}, Sent#: {s_idx}, Sentence:)')
+            print(f'{text}')
+            rewritten = rewrite_sentence(model, system_prompt=system_prompt, sentence=text)
+            print(f'{rewritten}')
+            task[model] = rewritten
+            checkpoint_record = {
+                'id': t_id,
+                'sent_idx': s_idx,
+                'text': text,
+                model: rewritten
+            }
+            with open(checkpoint_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(checkpoint_record, ensure_ascii=False) + '\n')
+            completed_runs.add((t_id, s_idx, model))
+    return tasks
 
-    # Process the sentences
-    new_sentences = []
-    for i, sentence in enumerate(sentences):
-        if i in indices_to_rewrite:
-            new_sent = rewrite_sentence(sentence)
-            new_sentences.append(new_sent)
-            print(f"[REWRITTEN] {new_sent}")
-        else:
-            new_sentences.append(sentence)
 
-    # Reconstruct the abstract
-    return " ".join(new_sentences)
 
-# ==========================================
-# 4. PYARROW / PARQUET HANDLING
-# ==========================================
-def run_percentage_pipeline(input_path: str, base_output_path: str, column_name: str):
-    """Loads the parquet file and runs the rewrite logic for each percentage in the list."""
-    
-    print(f"Loading {input_path} via PyArrow...")
-    table = pq.read_table(input_path)
-    original_df = table.to_pandas()
-    
-    if column_name not in original_df.columns:
-        raise ValueError(f"Column '{column_name}' not found in the parquet file.")
+system_prompt = (
+    "Je bent een professionele Nederlandse tekstverwerker."
+    "Jouw taak is: Herschrijf de volgende zin. Bewaar cruciale informatie"
+    "Geef UITSLUITEND de herschreven zin terug."
+)
+tasks = prepare_tasks(ug)
 
-    print(f"Total rows to process: {len(original_df)}")
-
-    # Loop through the list of percentages
-    for pct in PERCENTAGES_TO_RUN:
-        pct_label = int(pct * 100)
-        print(f"\n==================================================")
-        print(f"🚀 STARTING RUN FOR {pct_label}% REWRITE")
-        print(f"==================================================")
-        
-        # Create a fresh copy of the dataframe for this run
-        df_current_run = original_df.copy()
-        processed_abstracts = []
-
-        # Process each row
-        for idx, row in df_current_run.iterrows():
-            print(f"--- Row {idx+1}/{len(df_current_run)} ({pct_label}% run) ---")
-            new_text = process_abstract(row[column_name], pct)
-            processed_abstracts.append(new_text)
-            
-        # Update the column with the new data
-        df_current_run[column_name] = processed_abstracts
-        
-        # Format the output filename (e.g., data_10pct.parquet)
-        output_name = base_output_path.replace(".parquet", f"_{pct_label}pct.parquet")
-        
-        # Convert back to PyArrow Table and save
-        print(f"\n💾 Saving {pct_label}% dataset to {output_name}...")
-        updated_table = pa.Table.from_pandas(df_current_run)
-        pq.write_table(updated_table, output_name)
-        print(f"✅ Finished saving {output_name}!\n")
-
-# ==========================================
-# 5. EXECUTE
-# ==========================================
-if __name__ == "__main__":
-    
-    # Replace these with your actual filenames
-    INPUT_PARQUET = "dutch_dataset.parquet"
-    OUTPUT_PARQUET_BASE = "dutch_dataset_rewritten.parquet" 
-    COLUMN_TO_REWRITE = "abstract"
-    
-    # Uncomment the line below to run!
-    # run_percentage_pipeline(INPUT_PARQUET, OUTPUT_PARQUET_BASE, COLUMN_TO_REWRITE)
-    pass
+output = run_generation(
+    models_to_run=models_list,
+    system_prompt=system_prompt,
+    tasks=tasks,
+    checkpoint_file=checkpoint_path
+)
