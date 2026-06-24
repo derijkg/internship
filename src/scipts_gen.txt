@@ -1,0 +1,13 @@
+calc10
+nohup python -u src/gen_data.py > output_gen_calc10.log 2>&1 &
+
+
+calc11
+nohup python -u src/gen_data.py > output_gen_calc11.log 2>&1 &
+
+
+calc12
+nohup python -u src/gen_data.py > output_gen_calc12.log 2>&1 &
+
+local
+nohup python -u src/data_gen_local.py > output_gemma26b.log 2>&1 &

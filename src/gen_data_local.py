@@ -17,26 +17,11 @@ import re
 import string
 from langdetect import detect, LangDetectException
 
-#paths -------------
-ug_path = Path('/home/gderijck/internship/data/silver/ug_selected.parquet')
-checkpoint_path_final = Path('/home/gderijck/internship/data/silver/checkpoint_rewrites_final.jsonl')
-checkpoint_path = Path('/home/gderijck/internship/data/silver/checkpoint_rewrites.jsonl')
-
-#argparse TODO
-#argparse for different modes
-#   sentence single
-#   full abstract
-#   % context
-
-#table
-ug = pq.read_table(ug_path)
-
-#ollama server
-#TODO setup argparse for using gpu or cpu
 PORT = 11435
 
+# Force Ollama to ignore the broken GPU drivers entirely
 os.environ["OLLAMA_HOST"] = f"127.0.0.1:{PORT}"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Empty string disables GPU/CUDA entirely
 
 def is_port_in_use(port):
     """Checks if our private server is already active on this node."""
@@ -48,10 +33,12 @@ ollama_process = None
 if not is_port_in_use(PORT):
     print(f"Starting background Ollama server on CPU (Port {PORT})...")
     
+    # Clone the environment and apply settings to the background server
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ""  # Force CPU fallback
     env["OLLAMA_HOST"] = f"127.0.0.1:{PORT}"
     
+    # Launch Ollama as a background subprocess
     ollama_process = subprocess.Popen(
         ["ollama", "serve"],
         env=env,
@@ -59,6 +46,7 @@ if not is_port_in_use(PORT):
         stderr=subprocess.DEVNULL
     )
     
+    # Wait for the server to successfully boot up
     for attempt in range(15):
         if is_port_in_use(PORT):
             print("Ollama server successfully launched on CPU.")
@@ -82,13 +70,11 @@ def shutdown_ollama_server():
             ollama_process.kill()
         print("Server stopped cleanly.")
 
-atexit.register(shutdown_ollama_server) 
-#TODO at exit save progress to parquet file
+# Register cleanup
+atexit.register(shutdown_ollama_server)
 
 import ollama
 
-
-#calc distribution
 CALC_MODEL_MAPPING = {
     'calc12': ['qwen3.6:27b'],
     'calc11': ['qwen3.5:4b'],
@@ -115,27 +101,20 @@ def get_models_list():
     print(f'selected config: {args.calc} -> models_list: {selected_models}')
     return selected_models
 
-models_list = get_models_list()
+models_list = ['gemma4:26b']
 
 
 
 
 
 
+#-------------
+ug_path = Path(r'E:\code\dta\internship\data\ug_selected.parquet')
+checkpoint_path_final = Path(r'E:\code\dta\internship\data\checkpoint_rewrites_LOCAL_final.jsonl')
+checkpoint_path = Path(r'E:\code\dta\internship\data\checkpoint_rewrites_LOCAL.jsonl')
 
+ug = pq.read_table(ug_path)
 
-
-
-#logic
-#TODO make function to save to parquet
-#TODO when generating with certain gemma model, only take what comes after <channel|>
-
-#TODO incorporate tasks to do finding into this function
-##TODO different modes
-#   sentence single
-#   % context
-#   abstract full
-#REWRITTEN IN RUN
 def prepare_tasks(table: pa.Table) -> list:
     """Explodes the PyArrow table abstracts into indexed sentence tasks."""
     tasks = []
@@ -193,10 +172,6 @@ def prepare_tasks(table: pa.Table) -> list:
                 })
     return tasks
 
-#TODO different modes
-#   sentence single
-#   % context
-#   abstract full
 def rewrite_sentence(model_to_run, system_prompt, sentence):
     """Sends a single sentence to Ollama for rewriting."""
     try:
@@ -212,11 +187,13 @@ def rewrite_sentence(model_to_run, system_prompt, sentence):
             },
             #format = StrucResponse.model_json_schema(),
         )
-
+        
+        # Extract the text content from the Ollama response dictionary
         rewritten = response['response'].strip()
         rewritten = rewritten.replace('\x00','').replace('\u0000','')
         #response['done'] == True confirms it went thru
-
+        
+        # Clean up stray quotes if the LLM adds them
         if not sentence.startswith('"'):
             if rewritten.startswith('"') and rewritten.endswith('"'):
                 rewritten = rewritten[1:-1]
@@ -249,7 +226,6 @@ def run_generation(models_to_run, system_prompt, tasks, load_file:Path, save_fil
         print(f'Loaded {len(completed_runs)} completed runs. Skipping all of those.')
     
     #adds completed gens from active file
-    #TODO remove this and just save to parquet at exit
     if save_file.exists() and save_file != load_file:
         print(f'Loading active run progress from: {save_file}')
         with open(save_file, 'r', encoding='utf-8') as f:
@@ -294,19 +270,15 @@ def run_generation(models_to_run, system_prompt, tasks, load_file:Path, save_fil
     return tasks
 
 
-#prompts
-#system
+
+
 system_prompt = (
     "Je bent een professionele Nederlandse tekstverwerker."
     "Jouw taak is: Herschrijf de volgende zin. Bewaar cruciale informatie"
     "Geef UITSLUITEND de herschreven zin terug."
 )
-
-
-#execution
-#TODO inc argparse
-#TODO saving to parquet
 tasks = prepare_tasks(ug)
+
 output = run_generation(
     models_to_run=models_list,
     system_prompt=system_prompt,
