@@ -29,6 +29,8 @@ import sys
 import string
 import binascii
 import random
+from ollama import Client
+import torch
 
 #TODO check if paths exist and skip steps accordingkly
 #TODO relative paths
@@ -193,7 +195,6 @@ def is_port_in_use(port: int) -> bool:
 
 def shutdown_ollama_server(process: subprocess.Popen):
     """Kills the background server process on exit."""
-    # Check if the process exists and is still running
     if process and process.poll() is None:
         print("\nShutting down background Ollama server...")
         process.terminate()
@@ -203,61 +204,91 @@ def shutdown_ollama_server(process: subprocess.Popen):
             process.kill()
         print("Server stopped cleanly.")
 
-def start_ollama_server(port: int = 11435, gpu_id: str = "0") -> subprocess.Popen:
+def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Popen:
     """
     Launches a private, user-space Ollama server in the background.
-    Automatically registers a cleanup handler to stop the process on exit.
-    
-    Parameters:
-    - port: The port to bind (default: 11435)
-    - gpu_id: Target GPU ID as string (e.g. "0"). Pass "" or None to force CPU execution.
+    Uses the native GPU-enabled binary rather than the active Conda binary.
     """
-    # Set client-side port environment variable
-    os.environ["OLLAMA_HOST"] = f"127.0.0.1:{port}"
+    gpu_str = str(gpu_id).strip() if gpu_id is not None else ""
     
-    # Configure device targeting (CPU vs. specific GPU)
-    if gpu_id and gpu_id.strip():
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-        device_label = f"GPU {gpu_id}"
+    # Configure the base environment
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
+    
+    # Locate the GPU-enabled binary in your user-local space
+    user_bin = Path.home() / ".local" / "bin" / "ollama"
+    system_bin = Path("/usr/local/bin/ollama")
+    system_bin_alt = Path("/usr/bin/ollama")
+    
+    if user_bin.exists():
+        ollama_executable = str(user_bin)
+    elif system_bin.exists():
+        ollama_executable = str(system_bin)
+    elif system_bin_alt.exists():
+        ollama_executable = str(system_bin_alt)
     else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        device_label = "CPU"
+        ollama_executable = "ollama"
+        print("Warning: GPU-enabled native Ollama binary not found in standard locations.")
+        print("Falling back to PATH, which might default to your Conda environment binary.")
 
-    # Start the server if the port is free
+    # Configure dynamic linking paths for CUDA
+    cuda_libs = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+    
+    # Point to the native CUDA runner libraries we extracted in user space
+    user_libs = str(Path.home() / ".local" / "lib" / "ollama")
+    
+    if "LD_LIBRARY_PATH" in env:
+        env["LD_LIBRARY_PATH"] = f"{user_libs}:{env['LD_LIBRARY_PATH']}:{cuda_libs}"
+    else:
+        env["LD_LIBRARY_PATH"] = f"{user_libs}:{cuda_libs}"
+    
+    # Configure device targeting
+    if gpu_str == "-1":
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
+        device_label = "CPU Only"
+    elif "CUDA_VISIBLE_DEVICES" in env and not gpu_str:
+        device_label = f"GPU {env['CUDA_VISIBLE_DEVICES']} (Inherited from environment)"
+    elif gpu_str:
+        env["CUDA_VISIBLE_DEVICES"] = gpu_str
+        device_label = f"GPU {gpu_str} (with CPU fallback)"
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        device_label = "GPU Auto-Discovery (with CPU fallback)"
+
     if not is_port_in_use(port):
         print(f"Starting background Ollama server on {device_label} (Port {port})...")
+        print(f"Using binary executable: {ollama_executable}")
         
-        # Clone environment settings for the background subprocess
-        env = os.environ.copy()
-        env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
-        env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+        log_path = Path("ollama_server.log")
+        log_file = open(log_path, "w", encoding="utf-8")
         
-        # Launch server process
         process = subprocess.Popen(
-            ["ollama", "serve"],
+            [ollama_executable, "serve"],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stdout=log_file,
+            stderr=subprocess.STDOUT
         )
         
         # Wait for initialization loop
         for attempt in range(15):
             if is_port_in_use(port):
-                print(f"Ollama server successfully launched on {device_label}.")
+                print(f"Ollama server successfully launched.")
                 break
             time.sleep(1)
         else:
             print("Error: Ollama server initialization timed out. Terminating process.")
             process.terminate()
+            log_file.close()
             sys.exit(1)
             
-        # Register the cleanup handler, passing the active process reference directly
         atexit.register(shutdown_ollama_server, process)
         return process
         
     else:
         print(f"Ollama server is already running on port {port}. Reusing existing instance.")
         return None
+    
+
 
 #GENERATION proper
     #save on exit helper
@@ -273,80 +304,200 @@ def save_parquet_on_exit(rows: list[dict], output_path: Path):
         except Exception as e:
             print(f"[Exit Handler] Error during auto-save: {e}")
 
-#prepare tasks for generation
-def prepare_tasks(table: pa.Table, models_list: list[str], percentages: list[int] = None) -> tuple[list[dict], list[dict]]:
+
+#writer to checkpoint only (add to pq at the end of all tasks)
+def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
     """
-    Scans the Parquet table for missing completions across three task types 
-    and returns a flat list of pending tasks and the active rows list.
+    Appends a single successfully generated and validated rewrite to the JSONL checkpoint.
+    """
+    record = {
+        "id": task["id"],
+        "type": task["type"],
+        "model": task["model"],
+        "sent_idx": task.get("sent_idx"),
+        "percentage": task.get("percentage"),
+        'text': task.get('text'),
+        "rewritten": rewritten_text
+    }
+    
+    # Open in append mode ('a')
+    with open(checkpoint_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+#prepare tasks 3 types of task for generation
+#checks state of both pq and checkpoint and builds tasks that are needed
+#validates single sentence legacy lines from checkpoint
+def prepare_tasks(
+    table: pa.Table, 
+    checkpoint_path: Path,
+    models_list: list[str], 
+    percentages: list[int] = None
+) -> tuple[list[dict], list[dict]]:
+    """
+    Unified pipeline that:
+    1. Converts the Parquet table to mutable Python dicts.
+    2. Parses the JSONL checkpoint (handling legacy/modern formats dynamically).
+    3. Aligns sentence rewrites via strict text matching (with index fallback).
+    4. Prints a detailed Checkpoint Merging & Alignment Report.
+    5. Prints the Dataset Generation Status Report.
+    6. Constructs and returns the final flat list of pending tasks.
     """
     if percentages is None:
         percentages = []
 
-    # Convert the PyArrow table to a list of standard mutable Python dicts
+    # 1. Convert PyArrow table to standard Python dicts
     rows = table.to_pylist()
-    tasks = []
-
-    # Determine unique ID key
     id_key = '_id' if '_id' in table.column_names else 'id'
+    rows_map = {row[id_key]: row for row in rows}
 
+    # 2. Parse checkpoint and perform strict text-matching alignment
+    total_loaded = 0
+    text_match_count = 0
+    idx_fallback_count = 0
+    mismatched_discard_count = 0
+    missing_row_discard_count = 0
+    corrupted_count = 0
+
+    if checkpoint_path.exists():
+        print(f"Loading progress from checkpoint: {checkpoint_path}")
+        with open(checkpoint_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    total_loaded += 1
+                    
+                    # Extract variables based on schema (Modern vs. Legacy)
+                    #new
+                    if "type" in record:
+                        row_id = record.get("id")
+                        t_type = record.get("type")
+                        model = record.get("model")
+                        sent_idx = record.get("sent_idx")
+                        pct = record.get("percentage")
+                        orig_text = record.get("text")
+                        rewritten_text = record.get("rewritten")
+                    
+                    #old data single sentence
+                    else:
+                        # Legacy fallback
+                        row_id = record.get("id")
+                        t_type = "sentence"
+                        sent_idx = record.get("sent_idx")
+                        pct = None
+                        orig_text = record.get("text")
+                        
+                        metadata_keys = {"id", "_id", "sent_idx", "text"}
+                        model_keys = [k for k in record.keys() if k not in metadata_keys] 
+                        if not model_keys or sent_idx is None:
+                            mismatched_discard_count += 1
+                            continue
+                        model = model_keys[0]
+                        rewritten_text = record[model]
+
+                    if rewritten_text is None:
+                        mismatched_discard_count += 1
+                        continue
+
+                    # Strip chain-of-thought tags from raw models
+                    if isinstance(rewritten_text, str) and '<channel|>' in rewritten_text:
+                        rewritten_text = rewritten_text.split('<channel|>')[1].strip()
+
+                    row = rows_map.get(row_id)
+                    if not row:
+                        missing_row_discard_count += 1
+                        continue
+
+                    # Execute routing and text verification logic
+                    if t_type == "sentence":
+                        sent_dut = row.get("sent_dut")
+                        if not isinstance(sent_dut, list):
+                            mismatched_discard_count += 1
+                            continue
+
+                        matched_idx = -1
+                        # Step A: Perform strict text-matching verification
+                        if orig_text:
+                            clean_orig = orig_text.strip()
+                            for idx, sent in enumerate(sent_dut):
+                                if sent.strip() == clean_orig:
+                                    matched_idx = idx
+                                    break
+
+                        # discard if strict text match fails
+                        if matched_idx == -1:
+                            mismatched_discard_count += 1
+                            continue
+                        else:
+                            text_match_count += 1
+
+                        task_meta = {"type": t_type, "model": model, "sent_idx": matched_idx, "percentage": pct}
+                        apply_rewrite_to_row(row, task_meta, rewritten_text)
+                    else:
+                        # Non-sentence tasks (percentage/full) do not require index alignment
+                        task_meta = {"type": t_type, "model": model, "sent_idx": sent_idx, "percentage": pct}
+                        apply_rewrite_to_row(row, task_meta, rewritten_text)
+
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    corrupted_count += 1
+                    continue
+
+    # Print Report 1: Alignment Summary
+    if total_loaded > 0:
+        print("\n====================================================")
+        print("          CHECKPOINT MERGING & ALIGNMENT REPORT")
+        print("====================================================")
+        print(f" Total records loaded from checkpoint: {total_loaded}")
+        print(f" Successfully aligned (Exact Text Matches) : {text_match_count}")
+        print(f" Successfully aligned (Index Fallbacks)    : {idx_fallback_count}")
+        print(f" Discarded (Unmatched sentence text/index) : {mismatched_discard_count}")
+        print(f" Discarded (Missing row IDs)               : {missing_row_discard_count}")
+        print(f" Discarded (Corrupted/Malformed lines)     : {corrupted_count}")
+        print("====================================================\n")
+
+    # 4. Scan rows and build the final task queue
+    tasks = []
     for row in rows:
         row_id = row.get(id_key)
-        if row_id is None:
-            continue
-            
         text_dut = row.get('text_dut')
         sent_dut = row.get('sent_dut')
 
-        # Skip rows that don't have valid text or sentence lists
-        if not isinstance(text_dut, str) or not text_dut.strip():
-            continue
-        if not isinstance(sent_dut, list) or not sent_dut:
+        if not isinstance(text_dut, str) or not text_dut.strip() or not isinstance(sent_dut, list) or not sent_dut:
             continue
 
         num_sentences = len(sent_dut)
 
         for model in models_list:
-            # ===============================================================
-            # TASK TYPE 1: Single Sentence (Stored as a list of strings)
-            # ===============================================================
-            # Ensure the column exists as a list matching the length of sent_dut
+            # TASK TYPE 1: Single Sentence
             col_name = f'{model}_single'
             if col_name not in row or not isinstance(row[col_name], list) or len(row[col_name]) != num_sentences:
                 row[col_name] = [None] * num_sentences
 
             for sent_idx, sentence in enumerate(sent_dut):
-                # Only generate a task if this specific sentence is missing a rewrite
                 if row[col_name][sent_idx] is None:
                     tasks.append({
                         "id": row_id,
                         "type": "sentence",
-                        "model": model, #TODO ???
+                        "model": model,
                         "sent_idx": sent_idx,
                         "text": sentence,
-                        "context": text_dut  # Passed in case the LLM needs surrounding context #TODO needed????
+                        "context": text_dut
                     })
 
-            # ===============================================================
             # TASK TYPE 2: %-Based Rewrites with Context
-            # ===============================================================
             for pct in percentages:
-                col_name = f"{model}_{pct}" #good
-                
-                # Only generate if this hybrid abstract hasn't been created yet
+                col_name = f"{model}_{pct}"
                 if col_name not in row or not row[col_name]:
-                    row[col_name] = None  # Initialize
-                    
-                    # Deterministic, stateless seed based on ID and percentage
-                    # This ensures the same sentences are tagged if you restart #TODO EXPLAIN
+                    row[col_name] = None
                     seed_str = f"{row_id}_{pct}".encode("utf-8")
                     seed = binascii.crc32(seed_str)
                     rng = random.Random(seed)
-                    
-                    # Select percentage of sentences to tag
                     num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
                     tagged_indices = set(rng.sample(range(num_sentences), num_to_tag))
                     
-                    # Annotate the abstract with XML-style target tags
                     annotated_sentences = []
                     for idx, sent in enumerate(sent_dut):
                         if idx in tagged_indices:
@@ -358,18 +509,16 @@ def prepare_tasks(table: pa.Table, models_list: list[str], percentages: list[int
                     tasks.append({
                         "id": row_id,
                         "type": "percentage",
-                        "model": model, #TODO AGIAN
+                        "model": model,
                         "percentage": pct,
-                        "text": annotated_abstract
+                        "text": annotated_abstract,
+                        'tagged_indices': list(tagged_indices)
                     })
 
-            # ===============================================================
             # TASK TYPE 3: Full Abstract Rewrite
-            # ===============================================================
             col_name = f"{model}_full"
             if col_name not in row or not row[col_name]:
-                row[col_name] = None  # Initialize
-                
+                row[col_name] = None
                 tasks.append({
                     "id": row_id,
                     "type": "full_abstract",
@@ -379,28 +528,70 @@ def prepare_tasks(table: pa.Table, models_list: list[str], percentages: list[int
 
     return tasks, rows
 
+#checkpoint -> pq
+def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
+    """Helper to route the rewritten string to the correct column in-memory."""
+    if not row:
+        return
+    t_type = task["type"]
+    model = task["model"]
+    
+    if t_type == "sentence":
+        sent_idx = task["sent_idx"]
+        num_sentences = len(row['sent_dut'])
+        if f'{model}_single' not in row or not isinstance(row[f'{model}_single'], list) or len(row[f'{model}_single']) != num_sentences:
+            row[f'{model}_single'] = [None] * num_sentences
+            
+        # Ensure our target index sits strictly inside our allocated boundaries
+        if 0 <= sent_idx < num_sentences:
+            row[f'{model}_single'][sent_idx] = rewritten
+    elif t_type == "percentage":
+        pct = task["percentage"]
+        row[f"{model}_{pct}"] = rewritten
+    elif t_type == "full_abstract":
+        row[f"{model}_full"] = rewritten
+
+
 #pass to ollama and get result
-def rewrite_sentence(model_to_run, system_prompt, sentence):
-    """Sends a single sentence to Ollama for rewriting."""
+def rewrite_sentence(model_to_run, system_prompt, sentence, seed=42):
+    """Sends text to Ollama for rewriting."""
     try:
+        # Retrieve the dynamically set OLLAMA_HOST from the environment
+        # Fall back to localhost:11435 if not set
+        host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
+        
+        # Ensure the string has the HTTP prefix required by the Client library
+        if not host_env.startswith("http://"):
+            host_env = f"http://{host_env}"
+            
+        # Instantiate a client on the exact active port with a 5-minute timeout
+        client = Client(host=host_env, timeout=300)
+
         # Using the official Ollama chat implementation
-        response = ollama.generate(
+        response = client.generate(
             model=model_to_run,
             system = system_prompt,
             prompt = sentence,
             think=False,
             options={
-                "seed": 42,
+                "seed": seed,
+                #'temperature': 0.0,
                 #"num_thread": 4
             },
             #format = StrucResponse.model_json_schema(),
         )
 
         rewritten = response['response'].strip()
+
+        #remove null
         rewritten = rewritten.replace('\x00','').replace('\u0000','')
         #response['done'] == True confirms it went thru
-        #<channel|> gemma response?
-        #if model == 'gemma...
+
+        #remove gemma thinking
+        if isinstance(rewritten, str) and '<channel|>' in rewritten:
+            rewritten = rewritten.split('<channel|>')[1].strip()
+
+        #remove added quotes
         if not sentence.startswith('"'):
             if rewritten.startswith('"') and rewritten.endswith('"'):
                 rewritten = rewritten[1:-1]
@@ -411,21 +602,54 @@ def rewrite_sentence(model_to_run, system_prompt, sentence):
         print(f"Error calling Ollama ({model_to_run}): {e}")
         sys.exit(1)
 
+#unload model helper
+def unload_model(model_name: str):
+    """
+    Sends an empty generate request with keep_alive=0 to explicitly
+    unload the model from GPU VRAM.
+    """
+    print(f"\nUnloading model '{model_name}' from GPU memory...")
+    try:
+        host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
+        if not host_env.startswith("http://"):
+            host_env = f"http://{host_env}"
+            
+        # Initialize client pointing to the active user-space server
+        client = Client(host=host_env, timeout=30)
+        
+        # An empty prompt with keep_alive=0 tells Ollama to release the model's memory allocation
+        client.generate(model=model_name, prompt="", keep_alive=0)
+        print(f"Successfully unloaded '{model_name}'.")
+        time.sleep(2)  # Give the system driver a brief moment to stabilize and reclaim VRAM
+    except Exception as e:
+        print(f"Warning: Could not explicitly unload '{model_name}': {e}")
+
 #generation lopp
-def run_generation(tasks: list[dict], rows: list[dict], system_prompt_mapping: dict, output_path: Path, save_interval: int = 100):
+def run_generation(
+    tasks: list[dict],
+    rows: list[dict],
+    system_prompt_mapping: dict,
+    checkpoint_path: Path,
+    debug_mode: bool = False
+):
     """
-    Iterates through the task list, executes them on the Ollama server, 
-    and writes results directly back to our active rows list with progressive saving.
+    Iterates through the task list and executes them on Ollama.
     """
-    id_key = '_id' if '_id' in rows[0] else 'id'
+    id_key = '_id' if rows and '_id' in rows[0] else 'id' 
     rows_map = {row[id_key]: row for row in rows}
+
+    current_model = None
 
     for i, task in enumerate(tasks):
         t_id = task["id"]
         t_type = task["type"]
         model = task["model"]
         text = task["text"]
-        
+
+        if current_model is not None and model != current_model:
+            unload_model(current_model)
+        current_model = model
+
         row = rows_map.get(t_id)
         if not row:
             continue
@@ -436,221 +660,365 @@ def run_generation(tasks: list[dict], rows: list[dict], system_prompt_mapping: d
             sys.exit(1)
 
         print(f"\n[{model}] Processing Task {i+1}/{len(tasks)} (Type: {t_type}, ID: {t_id})...")
-        
-        rewritten = rewrite_sentence(model, system_prompt, text)
-        
-        # Route output back to our in-memory datastructure
-        if t_type == "sentence":
-            sent_idx = task["sent_idx"]
-            row[f'{model}_single'][sent_idx] = rewritten
-        elif t_type == "percentage":
-            pct = task["percentage"]
-            row[f"{model}_{pct}"] = rewritten
-        elif t_type == "full_abstract":
-            row[f"{model}_full"] = rewritten
 
-        # progressive saving
-        if (i + 1) % save_interval == 0:
-            print(f"\n[Progressive Save] Auto-saving progress ({i+1}/{len(tasks)} tasks completed)...")
-            try:
-                table = pa.Table.from_pylist(rows)
-                pq.write_table(table, output_path)
-                print("[Progressive Save] Save successful.")
-            except Exception as e:
-                print(f"[Progressive Save] Error: {e}")
+        # --- Generation & Validation Retries ---
+        rewritten = None
+        max_attempts = 3
+        for attempt in range(max_attempts):    
+            current_seed = 42+attempt
+            candidate_rewrite = rewrite_sentence(model, system_prompt, text,seed=current_seed)
+            
+            if t_type == 'percentage':
+                    original_sentences = row['sent_dut']
+                    tagged_indices = set(task['tagged_indices'])
+                    
+                    is_valid, reason, stitched_text = validate_percentage_rewrite(
+                        original_sentences, 
+                        candidate_rewrite,  # Pass raw response with tags intact
+                        tagged_indices
+                    )
+                    
+                    if is_valid:
+                        # Save the clean, stitched abstract (tags are already removed inside the validator)
+                        rewritten = stitched_text 
+                        print(f'ORIGINAL: {text}\n')
+                        print(f'REWRITTEN: {rewritten}')
+                        break
+                    else:
+                        print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
+                        # --- DIAGNOSTIC PRINTS ---
+                        print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
+                        print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
+                        print("-" * 50)
+                        if attempt < max_attempts - 1:
+                            print("  Retrying generation...")
+                        else:
+                            print(f"  [Warning] Task {t_id} failed validation. Writing sentinel.")
+                            rewritten = "FAILED_VALIDATION"
+                            break
+                        
+            elif t_type in ('sentence', 'full_abstract'):
+                # Validation check: Ensure the candidate rewrite is structurally different from the input
+                is_valid = candidate_rewrite.strip() != text.strip()
+                
+                if is_valid:
+                    rewritten = candidate_rewrite
+                    print(f'ORIGINAL: {text}\n')
+                    print(f'REWRITTEN: {rewritten}')
+                    break
+                else:
+                    #let through identical short sentences
+                    word_count = len(text.strip().split())
+                    char_count = len(text.strip())
+                    is_short = word_count <= 6 or char_count <= 40
+                    if is_short:
+                        print(f'ORIGINAL: {text}\n')
+                        print(f'REWRITTEN: {rewritten} [Accepted identical output due to short sentence length]')
+                        rewritten = candidate_rewrite
+                        break
 
+                    reason = "The model's rewrite is identical to the original input."
+                    print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
+                    # --- DIAGNOSTIC PRINTS ---
+                    print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
+                    print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
+                    print("-" * 50)
+                    if attempt < max_attempts - 1:
+                        print("  Retrying generation...")
+                    else:
+                        print(f"  [Warning] Task {t_id} failed validation. Writing sentinel.")
+                        rewritten = "FAILED_VALIDATION"
+                        break
+
+        # Apply to in-memory structure
+        apply_rewrite_to_row(row, task, rewritten)
+
+        # Append to checkpoint so we don't repeat this on subsequent runs
+        if not debug_mode:
+            append_to_checkpoint(checkpoint_path, task, rewritten)
+
+    # Clean up the final model when the entire task loop finishes
+    if current_model is not None:
+        unload_model(current_model)
     return rows
 
 
+#check if target sentences in % rewrite were correctly rewritten
+def normalize_text(text: str) -> str:
+    """
+    Standardizes whitespaces, newlines, and quotation marks to prevent 
+    validation failures caused by minor LLM formatting normalizations.
+    """
+    if not text:
+        return ""
+    # Normalize smart quotes and backticks to standard straight typewriter quotes
+    text = text.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("`", "'")
+    # Compress all sequences of whitespace (tabs, newlines, multiple spaces) into a single space
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def validate_percentage_rewrite(
+    original_sents: list[str], 
+    raw_output_text: str, 
+    tagged_indices: set[int]
+) -> tuple[bool, str, str | None]:
+    """
+    Parses the LLM's raw output containing <target> tags.
+    Extracts the edited target sentences, validates them, and stitches them
+    back into the original sentence list to build a pristine final abstract.
+    
+    Returns:
+        (is_valid, reason, stitched_abstract_or_None)
+    """
+    if not raw_output_text:
+        return False, "Empty response from the model", None
+
+    # Use a case-insensitive regex to find all segments wrapped in <target> tags
+    target_pattern = re.compile(r'<target>(.*?)</target>', re.DOTALL | re.IGNORECASE)
+    extracted_targets = target_pattern.findall(raw_output_text)
+    
+    expected_count = len(tagged_indices)
+    actual_count = len(extracted_targets)
+    
+    # 1. Verify that the tag count matches expectations
+    if actual_count != expected_count:
+        return (
+            False, 
+            f"Tag count mismatch. Expected {expected_count} target tags, but found {actual_count}.", 
+            None
+        )
+        
+    # Create a copy of our original unedited sentences
+    stitched_sentences = list(original_sents)
+    sorted_target_indices = sorted(list(tagged_indices))
+    
+    # 2. Iterate and validate each rewrite
+    for idx, rewrite_text in zip(sorted_target_indices, extracted_targets):
+        rewrite_clean = rewrite_text.strip()
+        original_clean = original_sents[idx].strip()
+        
+        # Verify the sentence wasn't deleted
+        if not rewrite_clean:
+            return False, f"Target sentence at index {idx} was returned empty.", None
+            
+        # Verify the sentence was actually modified (using normalized comparison)
+        if normalize_text(rewrite_clean) == normalize_text(original_clean):
+            return False, f"Target sentence at index {idx} was not modified by the model.", None
+            
+        # Stitch the validated rewrite back into the pristine sentence index
+        stitched_sentences[idx] = rewrite_clean
+        
+    # 3. Construct the final stitched abstract without any remaining XML tags
+    final_abstract = " ".join(stitched_sentences)
+    
+    return True, "Success", final_abstract
+
+#calc distribution helper
+def get_models_list():
+    CALC_MODEL_MAPPING = {
+        'calc12': ['qwen3.6:27b','qwen3.5:4b'],
+        'calc11': ['gemma4:e4b','gemma4:26b'],
+    }
+    try:
+        current_host = socket.gethostname().split('.')[0]
+        if current_host not in CALC_MODEL_MAPPING: #ADDED: Replaced inline else assignment containing print and sys.exit(1) statement. In your previous implementation, if the current host was missing, the inline "and" condition evaluated to None, which did not exit the process. Instead, it set default_calc to None, triggering a downstream KeyError on CALC_MODEL_MAPPING[None].
+            print(f"Host '{current_host}' not found in configuration mappings.")
+            sys.exit(1)
+        default_calc = current_host
+    except Exception as e:
+        print(f'Error identifying host config: {e}')
+        sys.exit(1)
+
+    selected_models = CALC_MODEL_MAPPING[default_calc]
+    print(f'selected config: {current_host} -> models_list: {selected_models}')
+    return selected_models
+
 #generation main
 def generation_main(
+    table: pa.Table = None,
     ug_path: Path = Path('data/silver/ug_selected.parquet'),
+    checkpoint_path: Path = None,
     models_list: list[str] = None,
-    percentages_to_run: list[int] = None,
+    percentages_to_run: list[int] = [25, 50, 75],
     port: int = 11435,
-    gpu_id: str = "0",
-    save_interval: int = 100
+    gpu_id: str = None,
+    debug_mode: bool = False,
+    debug_count: int = 5,
+    exclude_percentage: bool = False
 ):
     """
     Fully parameterized main orchestrator for the LLM rewrite pipeline.
     """
-    if models_list is None:
-        models_list = ['qwen3.5:4b', 'gemma4:e4b']
-    if percentages_to_run is None:
-        percentages_to_run = [25, 50, 75]
+    if checkpoint_path is None:
+        checkpoint_path = ug_path.parent / "checkpoint_rewrites.jsonl"
+    else:
+        checkpoint_path = Path(checkpoint_path)
+        print(f'Adding to existing checkpoint path found at {checkpoint_path}')
 
     system_prompts = {
         "sentence": (
-            "Je bent een professionele Nederlandse redacteur.\n"
-            "Herschrijf de volgende zin. Bewaar cruciale informatie.\n"
-            "Geef UITSLUITEND de herschreven zin terug, zonder aanhalingstekens."
+            "You are a professional Dutch editor.\n"
+            "Rewrite the following sentence to make it better while preserving all crucial information.\n"
+            "Provide ONLY the rewritten sentence."
         ),
         "percentage": (
-            "Je bent een professionele Nederlandse redacteur.\n"
-            "Je krijgt een abstract te zien waarin specifieke zinnen zijn gemarkeerd met <target>...</target> tags.\n"
-            "Herschrijf UITSLUITEND de zinnen binnen deze tags. Bewaar cruciale informatie.\n"
-            "Pas de omliggende tekst niet aan. Geef het volledige abstract terug inclusief je wijzigingen, maar zonder de <target> tags." #TODO check if correct sent was changed.
+            "You are a professional Dutch editor.\n"
+            "You will be given a Dutch abstract where specific sentences are enclosed within <target>...</target> tags.\n\n"
+            "YOUR TASKS:\n"
+            "1. Rewrite ONLY the sentences inside the <target>...</target> tags.\n"
+            "2. Make sure the sentences inside the tags are actually edited and different from the original input.\n"
+            "3. Keep the <target> and </target> tags exactly where they are, enclosing your newly rewritten sentences.\n"
+            "4. Output the full abstract including both the untargeted text and your newly edited target sentences.\n\n"
+            "CRITICAL RULES:\n"
+            "- It is absolutely mandatory to preserve the <target> and </target> tags. Do not remove, alter, or misspell the tags themselves.\n"
+            "- If the abstract begins immediately with a <target> tag, you must still rewrite that first sentence. Do not leave the first sentence unedited if it is tagged.\n"
+            "- Do NOT add any introductory or concluding text (e.g., do not say 'Here is your rewrite:'). Output ONLY the final abstract.\n\n"
+            "EXAMPLE:\n"
+            "Input: Dit is de eerste zin. <target>Deze zin moet anders.</target> Dit is de derde zin.\n"
+            "Output: Dit is de eerste zin. <target>Deze specifieke zin dient aangepast te worden.</target> Dit is de derde zin."
         ),
         "full_abstract": (
-            "Je bent een professionele Nederlandse redacteur.\n"
-            "Herschrijf het volledige abstract. Bewaar cruciale informatie.\n"
-            "Geef UITSLUITEND het volledige, herschreven abstract terug."
+            "You are a professional Dutch editor.\n"
+            "Rewrite the entire abstract in Dutch to make it better, while preserving all crucial information.\n"
+            "Provide ONLY the fully rewritten abstract."
         )
     }
     
     # 1. Start Ollama server
     start_ollama_server(port=port, gpu_id=gpu_id)
-    global ollama  # Import globally inside local scope after process bound
+    global ollama
     import ollama
     
     # 2. Load dataset
-    print(f"Loading Parquet data from: {ug_path}")
-    if not ug_path.exists():
-        print(f"Error: Parquet file not found at {ug_path}")
-        sys.exit(1)
-    ug_table = pq.read_table(ug_path)
+    if table is not None:
+        ug_table = table
+    else:
+        print(f"Loading Parquet data from: {ug_path}")
+        if not ug_path.exists():
+            print(f"Error: Parquet file not found at {ug_path}")
+            sys.exit(1)
+        ug_table = pq.read_table(ug_path)
+            
+    # 3. Unified checkpoint load, alignment verification, completion check, and task preparation
+    tasks, rows = prepare_tasks(ug_table, checkpoint_path, models_list, percentages_to_run)
+
+    #exclude percentage option
+    if exclude_percentage:
+        print('EXCLUDING PERCENTAGE TASKS')
+        tasks = [t for t in tasks if t['type']!='percentage']
+
+    #ordering model -> sent -> abs
+    if not models_list:
+        # Fallback: extract unique models in order of appearance if none provided
+        models_list = list(dict.fromkeys([t["model"] for t in tasks]))
+        
+    model_order = {model: idx for idx, model in enumerate(models_list)}
+    type_order = {"sentence": 0, "percentage": 2, "full_abstract": 1}
     
-    # 3. Scan and prepare pending tasks
-    tasks, rows = prepare_tasks(ug_table, models_list, percentages_to_run)
+    tasks.sort(key=lambda x: (
+        model_order.get(x["model"], 99),
+        type_order.get(x["type"], 99)
+    ))
+    
+    if debug_mode:
+        print("\n[DEBUG MODE ACTIVE] Filtering tasks: Keeping exactly 5 tasks of each unique combination of model, task type, and percentage.")
+        counts = {}
+        debug_tasks = []
+        for task in tasks:
+            key = (task.get("model"), task.get("type"), task.get("percentage"))
+            current_count = counts.get(key, 0)
+            if current_count < debug_count:
+                counts[key] = current_count + 1
+                debug_tasks.append(task)
+        tasks = debug_tasks
+        
     print(f"Total pending tasks to generate: {len(tasks)}")
     
     if len(tasks) == 0:
         print("All specified tasks are already completed in the dataset. Exiting.")
+        #if not debug_mode and checkpoint_path.exists(): TODO check if all are inside pq and clean up checkpoints
         return
         
     # 4. Register final emergency fallback exit handler
-    atexit.register(save_parquet_on_exit, rows, ug_path)
+    #if not debug_mode:
+    #    atexit.register(save_parquet_on_exit, rows, ug_path)
+    else: 
+        print('Debug mode active, not saving on exit.')
     
-    # 5. Run generation with progressive saving
-    run_generation(tasks, rows, system_prompts, ug_path, save_interval=save_interval)
+    # 5. Run generation
+    run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
     
-    # 6. Complete clean write back
-    print("\nGeneration finished successfully. Writing final table...")
-    save_parquet_on_exit(rows, ug_path)
-
-def check_dataset_completion(
-        table: pa.Table,
-        models_list: list[str] = ['qwen3.6:27b', 'qwen:3.5:2b', 'gemma4:26b', 'gemma4:e4b'], #TODO ADD MODELS, INTEGRATE INTO HIGHER
-        percentages: list[int] = [25,50,75]
-    ) -> bool:
-    """
-    Scans the Parquet dataset to check if all desired columns are present and fully completed.
-    Prints a detailed completion status report.
-    Returns True if generation is still needed, False if the dataset is 100% complete.
-    """
-    if percentages is None:
-        percentages = []
-
-    rows = table.to_pylist()
-    total_rows = len(rows)
-    
-    if total_rows == 0:
-        print("[Warning] Dataset is empty.")
-        return False
-
-    # Initialize a statistics tracker
-    stats = {}
-    needs_generation = False
-
-    # Setup the statistics schema
-    for model in models_list:
-        stats[f"{model}_single"] = {"completed_sents": 0, "total_sents": 0}
-        for pct in percentages:
-            stats[f"{model}_{pct}"] = {"completed_abstracts": 0, "total_abstracts": total_rows}
-        stats[f"{model}_full"] = {"completed_abstracts": 0, "total_abstracts": total_rows}
-
-    # Scan the dataset row-by-row
-    for row in rows:
-        sent_dut = row.get('sent_dut')
-        num_sentences = len(sent_dut) if isinstance(sent_dut, list) else 0
-
-        for model in models_list:
-            # 1. Check [model]_single (Sentence-level lists)
-            col_single = f"{model}_single"
-            stats[col_single]["total_sents"] += num_sentences
+    # save when done
+    if not debug_mode:
+        try:
+            print("\nGeneration finished successfully. Writing final table to Parquet...")
+            #save_parquet_on_exit(rows, ug_path) #TODO change to write to row func
             
-            if col_single in row and isinstance(row[col_single], list):
-                # Count non-None entries inside the list
-                completed_sents = sum(1 for x in row[col_single] if x is not None)
-                stats[col_single]["completed_sents"] += completed_sents
-                
-                # If there are any missing (None) elements or length mismatches, we need generation
-                if completed_sents < num_sentences or len(row[col_single]) != num_sentences:
-                    needs_generation = True
-            else:
-                needs_generation = True
-
-            # 2. Check [model]_[pct] (Paragraph-level strings)
-            for pct in percentages:
-                col_pct = f"{model}_{pct}"
-                if col_pct in row and isinstance(row[col_pct], str) and row[col_pct].strip():
-                    stats[col_pct]["completed_abstracts"] += 1
-                else:
-                    needs_generation = True
-
-            # 3. Check [model]_full (Paragraph-level strings)
-            col_full = f"{model}_full"
-            if col_full in row and isinstance(row[col_full], str) and row[col_full].strip():
-                stats[col_full]["completed_abstracts"] += 1
-            else:
-                needs_generation = True
-
-    # Print the Dashboard
-    print("\n====================================================")
-    print("           DATASET GENERATION STATUS REPORT")
-    print("====================================================")
-    
-    for col_name, data in stats.items():
-        if "total_sents" in data:
-            completed = data["completed_sents"]
-            total = data["total_sents"]
-            unit = "sentences"
-        else:
-            completed = data["completed_abstracts"]
-            total = data["total_abstracts"]
-            unit = "abstracts"
-            
-        pct_complete = (completed / total * 100) if total > 0 else 0
-        status_icon = "✓" if completed == total else "✗"
-        
-        print(f" {status_icon} {col_name:<25}: {completed:>5} / {total:<5} {unit:<10} ({pct_complete:>6.2f}%)")
-        
-    print("====================================================")
-    
-    if needs_generation:
-        print(" -> Status: GENERATION IS STILL REQUIRED (some cells are missing).\n")
-    else:
-        print(" -> Status: 100% COMPLETE (all columns are fully generated!).\n")
-        
-    return needs_generation
+        except Exception as e:
+            print(f"Error during final Parquet save: {e}. Checkpoint remains preserved for recovery.")
+    else: 
+        print('Debug complete, not saving final output.')
 
 
 
+
+
+
+
+
+#script execution
 def main(): #TODO set default and relative and variable paths + checks for skipping
+    #TODO download section ---------------------------------------------------------------------------------
+    pass
 
-    models_list = ['qwen3.6:27b', 'qwen:3.5:2b', 'gemma4:26b', 'gemma4:e4b'], #TODO ADD MODELS, INTEGRATE INTO HIGHER
-    percentages = [25,50,75]
+    #TODO cleaning section
+    pass
 
-    #selection
-    ug_select = Path('/home/gderijck/internship/data/silver/ug_selected.parquet')
-    if not ug_select:
+    #selection ---------------------------------------------------------------------------------
+    ug_select = Path('/home/gderijck/internship/data/silver/ug_selected.parquet') #TODO make relative
+    table = None 
+    
+    if not ug_select.exists():
         table = select_and_clean_abstracts_ug(
-            input_path=Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet'), #TODO relative
+            input_path=ug_select.parent / 'ug_cleaned.parquet', 
             output_path=ug_select
         )
-    if not table:
-        table = pq.read_parquet(ug_select)
+    if table is None:
+        table = pq.read_table(ug_select)
+
+
+    #generation ---------------------------------------------------------------------------------
+    checkpoint_path = ug_select.parent / "checkpoint_rewrites.jsonl"
+    models_list = ['qwen3.6:27b', 'qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
+    #models_list = ['qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
+    percentages = [25,50,75]
+    tasks, rows = prepare_tasks(
+        table=table,
+        checkpoint_path=checkpoint_path,
+        models_list=models_list,
+        percentages=percentages, 
+    )
     
-    #generation
-    if check_dataset_completion(table=table):
+    active_models_list = get_models_list()
+
+
+    if tasks:
+        print('Starting llm gen')
         generation_main(
             table = table,
-            models_list = models_list,
+            ug_path = ug_select,
+            checkpoint_path=checkpoint_path,
+            models_list = active_models_list,
             percentages_to_run = percentages,
-        ) 
+            debug_mode = False,
+            #debug_count = 1,
+            exclude_percentage=True #TODO fix percentage plssss
+        )
+    else:
+        print('Dataset already populated')
 
+    #---------------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
     main()
-
