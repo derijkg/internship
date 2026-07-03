@@ -15,9 +15,9 @@ This project is part of my internship at the CLiPS research lab at UAntwerpen. I
 
 - LLM generation: 
     From the abstracts three types of tasks are generated using a local Ollama server (port: 11435) running gemma4:e4b, gemma4:26b, qwen3.5:4b and qwen3.6:27b. The results are appended to the checkpoint_rewrites.jsonl file in the silver tier of data. When generation is completed all valid results are added to the dataframe using the following column names:
-        - {model}_single: contains a list of all individually rewritten sentences.
-        - {model}_{pct}: pct has three values: 25, 50 and 75, meaning every model generates three columns. This contains a rewrite of the specified percentage of randomly selected sentences in context of the abstract.
-        - {model}_full: full rewrite of the abstract for the specified model.
+        - model_single: contains a list of all individually rewritten sentences.
+        - model_pct: pct has three values: 25, 50 and 75, meaning every model generates three columns. This contains a rewrite of the specified percentage of randomly selected sentences in context of the abstract.
+        - model_full: full rewrite of the abstract for the specified model.
 
 ## Getting Started
 
@@ -25,8 +25,8 @@ Simply running the run.py file should work.
 
 ### Prerequisites
 
-    - Ollama version 0.24.0 was used for compatibility with hardware.
-    - Packages used for this project were downloaded using conda
+    * Ollama version 0.24.0 was used for compatibility with hardware.
+    * Packages used for this project were downloaded using conda
 
 
 ### Installation
