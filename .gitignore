@@ -20,7 +20,7 @@ test*
 
 # 2. Ignore all folders starting with "old"
 old*/
-
+src/old/
 # 3. Ignore all folders starting with "data"
 data*/
 
@@ -29,3 +29,6 @@ output*
 
 # 5. Ignore "scripts_gen.txt" inside the "src/" folder
 src/scripts_gen.txt
+
+dataset_construction/
+detectors/
