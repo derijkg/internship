@@ -14,3 +14,18 @@ extraction_results.json
 data_old/
 src/old/
 test2.ipynb
+
+# 1. Ignore all files or folders that start with "test"
+test*
+
+# 2. Ignore all folders starting with "old"
+old*/
+
+# 3. Ignore all folders starting with "data"
+data*/
+
+# 4. Ignore all files starting with "output" 
+output*
+
+# 5. Ignore "scripts_gen.txt" inside the "src/" folder
+src/scripts_gen.txt

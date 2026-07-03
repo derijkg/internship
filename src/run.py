@@ -320,9 +320,13 @@ def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str)
         "rewritten": rewritten_text
     }
     
-    # Open in append mode ('a')
     with open(checkpoint_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())  # Force OS writing synchronization
+        except OSError:
+            pass
 
 
 #prepare tasks 3 types of task for generation
@@ -335,23 +339,20 @@ def prepare_tasks(
     percentages: list[int] = None
 ) -> tuple[list[dict], list[dict]]:
     """
-    Unified pipeline that:
-    1. Converts the Parquet table to mutable Python dicts.
-    2. Parses the JSONL checkpoint (handling legacy/modern formats dynamically).
-    3. Aligns sentence rewrites via strict text matching (with index fallback).
-    4. Prints a detailed Checkpoint Merging & Alignment Report.
-    5. Prints the Dataset Generation Status Report.
-    6. Constructs and returns the final flat list of pending tasks.
+    Unified pipeline with strict string matching and actual fallback alignment.
     """
+    import json
     if percentages is None:
         percentages = []
 
     # 1. Convert PyArrow table to standard Python dicts
     rows = table.to_pylist()
     id_key = '_id' if '_id' in table.column_names else 'id'
-    rows_map = {row[id_key]: row for row in rows}
+    
+    # Cast keys to strings to handle any type discrepancies between formats
+    rows_map = {str(row[id_key]): row for row in rows}
 
-    # 2. Parse checkpoint and perform strict text-matching alignment
+    # 2. Parse checkpoint and perform alignment
     total_loaded = 0
     text_match_count = 0
     idx_fallback_count = 0
@@ -370,8 +371,6 @@ def prepare_tasks(
                     record = json.loads(line)
                     total_loaded += 1
                     
-                    # Extract variables based on schema (Modern vs. Legacy)
-                    #new
                     if "type" in record:
                         row_id = record.get("id")
                         t_type = record.get("type")
@@ -380,10 +379,7 @@ def prepare_tasks(
                         pct = record.get("percentage")
                         orig_text = record.get("text")
                         rewritten_text = record.get("rewritten")
-                    
-                    #old data single sentence
                     else:
-                        # Legacy fallback
                         row_id = record.get("id")
                         t_type = "sentence"
                         sent_idx = record.get("sent_idx")
@@ -402,16 +398,15 @@ def prepare_tasks(
                         mismatched_discard_count += 1
                         continue
 
-                    # Strip chain-of-thought tags from raw models
                     if isinstance(rewritten_text, str) and '<channel|>' in rewritten_text:
                         rewritten_text = rewritten_text.split('<channel|>')[1].strip()
 
-                    row = rows_map.get(row_id)
+                    # Align keys via string casting
+                    row = rows_map.get(str(row_id))
                     if not row:
                         missing_row_discard_count += 1
                         continue
 
-                    # Execute routing and text verification logic
                     if t_type == "sentence":
                         sent_dut = row.get("sent_dut")
                         if not isinstance(sent_dut, list):
@@ -425,19 +420,27 @@ def prepare_tasks(
                             for idx, sent in enumerate(sent_dut):
                                 if sent.strip() == clean_orig:
                                     matched_idx = idx
+                                    text_match_count += 1
                                     break
 
-                        # discard if strict text match fails
+                        # Step B: Index fallback if strict match fails
+                        if matched_idx == -1 and sent_idx is not None:
+                            try:
+                                sent_idx_int = int(sent_idx)
+                                if 0 <= sent_idx_int < len(sent_dut):
+                                    matched_idx = sent_idx_int
+                                    idx_fallback_count += 1
+                            except (ValueError, TypeError):
+                                pass
+
+                        # Discard if both strict text match and index fallback fail
                         if matched_idx == -1:
                             mismatched_discard_count += 1
                             continue
-                        else:
-                            text_match_count += 1
 
                         task_meta = {"type": t_type, "model": model, "sent_idx": matched_idx, "percentage": pct}
                         apply_rewrite_to_row(row, task_meta, rewritten_text)
                     else:
-                        # Non-sentence tasks (percentage/full) do not require index alignment
                         task_meta = {"type": t_type, "model": model, "sent_idx": sent_idx, "percentage": pct}
                         apply_rewrite_to_row(row, task_meta, rewritten_text)
 
@@ -445,7 +448,6 @@ def prepare_tasks(
                     corrupted_count += 1
                     continue
 
-    # Print Report 1: Alignment Summary
     if total_loaded > 0:
         print("\n====================================================")
         print("          CHECKPOINT MERGING & ALIGNMENT REPORT")
@@ -471,7 +473,6 @@ def prepare_tasks(
         num_sentences = len(sent_dut)
 
         for model in models_list:
-            # TASK TYPE 1: Single Sentence
             col_name = f'{model}_single'
             if col_name not in row or not isinstance(row[col_name], list) or len(row[col_name]) != num_sentences:
                 row[col_name] = [None] * num_sentences
@@ -487,7 +488,6 @@ def prepare_tasks(
                         "context": text_dut
                     })
 
-            # TASK TYPE 2: %-Based Rewrites with Context
             for pct in percentages:
                 col_name = f"{model}_{pct}"
                 if col_name not in row or not row[col_name]:
@@ -515,7 +515,6 @@ def prepare_tasks(
                         'tagged_indices': list(tagged_indices)
                     })
 
-            # TASK TYPE 3: Full Abstract Rewrite
             col_name = f"{model}_full"
             if col_name not in row or not row[col_name]:
                 row[col_name] = None
@@ -553,54 +552,34 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
 
 
 #pass to ollama and get result
-def rewrite_sentence(model_to_run, system_prompt, sentence, seed=42):
-    """Sends text to Ollama for rewriting."""
-    try:
-        # Retrieve the dynamically set OLLAMA_HOST from the environment
-        # Fall back to localhost:11435 if not set
-        host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
+def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
+    """Sends text to Ollama for rewriting. Passes the active Client instance."""
+    # Using the official Ollama chat implementation
+    response = client.generate(
+        model=model_to_run,
+        system=system_prompt,
+        prompt=sentence,
+        think=False,
+        options={
+            "seed": seed,
+        },
+    )
+
+    rewritten = response['response'].strip()
+
+    # remove null characters
+    rewritten = rewritten.replace('\x00','').replace('\u0000','')
+
+    # remove gemma thinking
+    if isinstance(rewritten, str) and '<channel|>' in rewritten:
+        rewritten = rewritten.split('<channel|>')[1].strip()
+
+    # remove added quotes
+    if not sentence.startswith('"'):
+        if rewritten.startswith('"') and rewritten.endswith('"'):
+            rewritten = rewritten[1:-1]
         
-        # Ensure the string has the HTTP prefix required by the Client library
-        if not host_env.startswith("http://"):
-            host_env = f"http://{host_env}"
-            
-        # Instantiate a client on the exact active port with a 5-minute timeout
-        client = Client(host=host_env, timeout=300)
-
-        # Using the official Ollama chat implementation
-        response = client.generate(
-            model=model_to_run,
-            system = system_prompt,
-            prompt = sentence,
-            think=False,
-            options={
-                "seed": seed,
-                #'temperature': 0.0,
-                #"num_thread": 4
-            },
-            #format = StrucResponse.model_json_schema(),
-        )
-
-        rewritten = response['response'].strip()
-
-        #remove null
-        rewritten = rewritten.replace('\x00','').replace('\u0000','')
-        #response['done'] == True confirms it went thru
-
-        #remove gemma thinking
-        if isinstance(rewritten, str) and '<channel|>' in rewritten:
-            rewritten = rewritten.split('<channel|>')[1].strip()
-
-        #remove added quotes
-        if not sentence.startswith('"'):
-            if rewritten.startswith('"') and rewritten.endswith('"'):
-                rewritten = rewritten[1:-1]
-            
-        return rewritten
-    
-    except Exception as e:
-        print(f"Error calling Ollama ({model_to_run}): {e}")
-        sys.exit(1)
+    return rewritten
 
 #unload model helper
 def unload_model(model_name: str):
@@ -635,6 +614,16 @@ def run_generation(
     """
     Iterates through the task list and executes them on Ollama.
     """
+    import os
+    import time
+    from ollama import Client
+
+    # Instantiate the client once to leverage connection pooling and avoid port exhaustion
+    host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
+    if not host_env.startswith("http://"):
+        host_env = f"http://{host_env}"
+    client = Client(host=host_env, timeout=300)
+
     id_key = '_id' if rows and '_id' in rows[0] else 'id' 
     rows_map = {row[id_key]: row for row in rows}
 
@@ -664,41 +653,55 @@ def run_generation(
         # --- Generation & Validation Retries ---
         rewritten = None
         max_attempts = 3
+
         for attempt in range(max_attempts):    
-            current_seed = 42+attempt
-            candidate_rewrite = rewrite_sentence(model, system_prompt, text,seed=current_seed)
+            current_seed = 42 + attempt
+            try:
+                candidate_rewrite = rewrite_sentence(client, model, system_prompt, text, seed=current_seed)
+            except Exception as e:
+                print(f"  [Error - Attempt {attempt+1}/{max_attempts}] Calling Ollama failed: {e}")
+                if attempt < max_attempts - 1:
+                    print("  Waiting 5 seconds before retrying...")
+                    time.sleep(5)
+                    continue
+                else:
+                    print(f"  [Error] Task {t_id} failed after {max_attempts} attempts. Writing sentinel.")
+                    rewritten = "FAILED_GENERATION"
+                    break
             
+            # --- Scenario A: Percentage-Based Rewrites ---
             if t_type == 'percentage':
-                    original_sentences = row['sent_dut']
-                    tagged_indices = set(task['tagged_indices'])
+                original_sentences = row['sent_dut']
+                tagged_indices = set(task['tagged_indices'])
+                
+                is_valid, reason, stitched_text = validate_percentage_rewrite(
+                    original_sentences, 
+                    candidate_rewrite,  
+                    tagged_indices
+                )
+                
+                if is_valid:
+                    rewritten = stitched_text 
+                    print(f'ORIGINAL: {text}\n')
+                    print(f'REWRITTEN: {rewritten}')
+                    break
+                else:
+                    print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
                     
-                    is_valid, reason, stitched_text = validate_percentage_rewrite(
-                        original_sentences, 
-                        candidate_rewrite,  # Pass raw response with tags intact
-                        tagged_indices
-                    )
+                    # Diagnostic prints
+                    print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
+                    print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
+                    print("-" * 50)
                     
-                    if is_valid:
-                        # Save the clean, stitched abstract (tags are already removed inside the validator)
-                        rewritten = stitched_text 
-                        print(f'ORIGINAL: {text}\n')
-                        print(f'REWRITTEN: {rewritten}')
-                        break
+                    if attempt < max_attempts - 1:
+                        print("  Retrying generation...")
                     else:
-                        print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
-                        # --- DIAGNOSTIC PRINTS ---
-                        print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
-                        print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
-                        print("-" * 50)
-                        if attempt < max_attempts - 1:
-                            print("  Retrying generation...")
-                        else:
-                            print(f"  [Warning] Task {t_id} failed validation. Writing sentinel.")
-                            rewritten = "FAILED_VALIDATION"
-                            break
+                        print(f"  [Warning] Task {t_id} failed validation. Writing sentinel: FAILED_VALIDATION")
+                        rewritten = "FAILED_VALIDATION"
+                        break
                         
+            # --- Scenario B: Single Sentence or Full Abstract Rewrites ---
             elif t_type in ('sentence', 'full_abstract'):
-                # Validation check: Ensure the candidate rewrite is structurally different from the input
                 is_valid = candidate_rewrite.strip() != text.strip()
                 
                 if is_valid:
@@ -707,26 +710,28 @@ def run_generation(
                     print(f'REWRITTEN: {rewritten}')
                     break
                 else:
-                    #let through identical short sentences
+                    # Let through identical short sentences without failing
                     word_count = len(text.strip().split())
                     char_count = len(text.strip())
                     is_short = word_count <= 6 or char_count <= 40
                     if is_short:
+                        rewritten = candidate_rewrite
                         print(f'ORIGINAL: {text}\n')
                         print(f'REWRITTEN: {rewritten} [Accepted identical output due to short sentence length]')
-                        rewritten = candidate_rewrite
                         break
 
                     reason = "The model's rewrite is identical to the original input."
                     print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
-                    # --- DIAGNOSTIC PRINTS ---
+                    
+                    # Diagnostic prints
                     print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
                     print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
                     print("-" * 50)
+                    
                     if attempt < max_attempts - 1:
                         print("  Retrying generation...")
                     else:
-                        print(f"  [Warning] Task {t_id} failed validation. Writing sentinel.")
+                        print(f"  [Warning] Task {t_id} failed validation. Writing sentinel: FAILED_VALIDATION")
                         rewritten = "FAILED_VALIDATION"
                         break
 
@@ -737,7 +742,6 @@ def run_generation(
         if not debug_mode:
             append_to_checkpoint(checkpoint_path, task, rewritten)
 
-    # Clean up the final model when the entire task loop finishes
     if current_model is not None:
         unload_model(current_model)
     return rows
@@ -816,8 +820,8 @@ def validate_percentage_rewrite(
 #calc distribution helper
 def get_models_list():
     CALC_MODEL_MAPPING = {
-        'calc12': ['qwen3.6:27b','qwen3.5:4b'],
-        'calc11': ['gemma4:e4b','gemma4:26b'],
+        'calc12': ['qwen3.5:4b','gemma4:e4b'],
+        'calc11': ['qwen3.6:27b', 'gemma4:26b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -940,10 +944,11 @@ def generation_main(
         return
         
     # 4. Register final emergency fallback exit handler
-    #if not debug_mode:
-    #    atexit.register(save_parquet_on_exit, rows, ug_path)
+    if not debug_mode:
+        #atexit.register(save_parquet_on_exit, rows, ug_path)
+        pass
     else: 
-        print('Debug mode active, not saving on exit.')
+        print('Debug mode active, not saving  to pq on exit.')
     
     # 5. Run generation
     run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
@@ -992,30 +997,23 @@ def main(): #TODO set default and relative and variable paths + checks for skipp
     models_list = ['qwen3.6:27b', 'qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
     #models_list = ['qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
     percentages = [25,50,75]
-    tasks, rows = prepare_tasks(
-        table=table,
-        checkpoint_path=checkpoint_path,
-        models_list=models_list,
-        percentages=percentages, 
-    )
     
     active_models_list = get_models_list()
 
 
-    if tasks:
-        print('Starting llm gen')
-        generation_main(
-            table = table,
-            ug_path = ug_select,
-            checkpoint_path=checkpoint_path,
-            models_list = active_models_list,
-            percentages_to_run = percentages,
-            debug_mode = False,
-            #debug_count = 1,
-            exclude_percentage=True #TODO fix percentage plssss
-        )
-    else:
-        print('Dataset already populated')
+
+    print('Starting llm gen')
+    generation_main(
+        table = table,
+        ug_path = ug_select,
+        checkpoint_path=checkpoint_path,
+        models_list = active_models_list,
+        percentages_to_run = percentages,
+        debug_mode = False,
+        #debug_count = 1,
+        exclude_percentage=True #TODO fix percentage plssss
+    )
+
 
     #---------------------------------------------------------------------------------
 
