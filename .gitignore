@@ -28,7 +28,10 @@ data*/
 output*
 
 # 5. Ignore "scripts_gen.txt" inside the "src/" folder
-src/scripts_gen.txt
+scripts_gen.txt
+experiments/
 
 dataset_construction/
-detectors/
+src/detectors/
+
+.env

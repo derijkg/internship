@@ -21,7 +21,7 @@ This project is part of my internship at the CLiPS research lab at UAntwerpen. I
 
 ## Getting Started
 
-Simply running the run.py file should work.
+Simply running the dataset_construction.py file should work.
 
 ### Prerequisites
 

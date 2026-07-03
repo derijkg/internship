@@ -23,6 +23,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
+# ---------------------------------------------------------------------------
+# Path & Directory Configuration
+# ---------------------------------------------------------------------------
+# Assuming this script is located at 'internship/src/run.py'
+# - Path(__file__).resolve() gets '/absolute/path/to/internship/src/run.py'
+# - .parent gets '/absolute/path/to/internship/src'
+# - .parent.parent gets '/absolute/path/to/internship' (the project root)
+CURRENT_FILE = Path(__file__).resolve()
+PROJECT_ROOT = CURRENT_FILE.parent
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+
 class LockoutException(Exception):
     """Raised when the server blocks our IP address or rate-limits us."""
     pass
@@ -53,7 +64,7 @@ class BaseScraper:
     def __init__(
         self,
         source_name: str,
-        base_folder: Union[str, Path] = "data",
+        base_folder: Union[str, Path] = "data",  # Relative to project root
         columns: Optional[List[str]] = None,
         essential_columns: Optional[List[str]] = None,
         metadata_save_batch_size: int = 100,
@@ -65,13 +76,20 @@ class BaseScraper:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
-        # FIX 4: Initialize failure counters
+        # Initialize failure counters
         self.consecutive_failures = 0
         self.max_consecutive_failures = 5
 
         self.logger = logging.getLogger(self.__class__.__name__)
         self.source_name = source_name
-        self.base_folder = Path(base_folder)
+        
+        # Safely resolve base_folder to an absolute path relative to PROJECT_ROOT
+        # if a relative string or relative Path object is provided.
+        resolved_base = Path(base_folder)
+        if not resolved_base.is_absolute():
+            self.base_folder = (PROJECT_ROOT / resolved_base).resolve()
+        else:
+            self.base_folder = resolved_base.resolve()
         
         # Configuration parameters
         self.metadata_save_batch_size = metadata_save_batch_size
@@ -81,15 +99,17 @@ class BaseScraper:
         # Determine paths and separator
         self.separator = "\t" if use_tsv else ","
         ext = "tsv" if use_tsv else "csv"
-        self.data_path = self.base_folder / "raw_data" / self.source_name / f"{self.source_name}_metadata.{ext}"
-        self.zip_path = self.base_folder / "raw_data" / self.source_name / f"{self.source_name}_files.zip"
+        self.data_path = self.base_folder / "bronze" / self.source_name / f"{self.source_name}_metadata.{ext}"
+        self.zip_path = self.base_folder / "bronze" / self.source_name / f"{self.source_name}_files.zip"
         
         # Dynamic Schema Configuration
         self.columns = columns or self.DEFAULT_COLUMNS
         self.essential_columns = essential_columns or self.ESSENTIAL_METADATA_COLUMNS
         
-        # State Initialization
+        # Ensure target data directories exist before loading or saving
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
+        self.zip_path.parent.mkdir(parents=True, exist_ok=True)
+        
         self.df = self._load_state()
 
         # Session Setup (for reuse, headers, and pooling)
@@ -224,7 +244,6 @@ class BaseScraper:
     def run(self, gather_urls: bool = True, gather_metadata: bool = True, download_files: bool = True):
         self.logger.info(f"--- Starting scraper for: {self.source_name} ---")
 
-        # FIX 5: Intercept lockout exceptions inside run() to save state and exit cleanly
         try:
             # Step 1: Gather URLs
             if gather_urls:
@@ -244,7 +263,6 @@ class BaseScraper:
             # Step 2: Scrape Metadata
             if gather_metadata:
                 self.logger.info("Step 2: Scraping missing metadata...")
-                # Detect rows missing any essential metadata
                 is_missing_metadata = self.df[self.essential_columns].isna().any(axis=1)
                 rows_to_scrape = self.df[is_missing_metadata & self.df["page_link"].notna()]
 
@@ -378,7 +396,7 @@ class HBOScraper(BaseScraper):
         """Orchestrates multi-year, multi-organization traversal."""
         base_url = 'https://hbo-kennisbank.nl'
         
-        # Iterate through every year from 1980 to 2022 separately
+        # Iterate through every year from 2000 to 2022 separately
         for year in range(2000, 2023):
             self.logger.info(f"=========================================")
             self.logger.info(f"PROCESSING YEAR: {year}")
@@ -403,7 +421,6 @@ class HBOScraper(BaseScraper):
                 parts = text_content.split()
                 if parts:
                     try:
-                        # re.sub removes dots/commas to safely parse numbers with thousand separators (e.g. "1.234" -> "1234")
                         raw_number = re.sub(r'[^\d]', '', parts[0])
                         total_hits = int(raw_number) if raw_number else 0
                     except ValueError:
@@ -415,22 +432,14 @@ class HBOScraper(BaseScraper):
                 self.logger.info(f"No entries found for {year}. Moving to next year.")
                 continue
                 
-            # --- CONDITION A: Less than or equal to 500 hits ---
-            # Scrape directly page-by-page
             if total_hits <= 500:
                 self.logger.info(f"Year {year} has <= 500 hits ({total_hits}). Scraping directly.")
                 page_template = f"https://hbo-kennisbank.nl/searchresult?lng-0-u=dut&sort-order=date&date-from={year}&date-until={year}&t-0-k=hbo%3Aproduct&p={{page}}"
                 self._scrape_pages_for_query(page_template, base_url)
-            
-            # --- CONDITION B: More than 500 hits ---
-            # Parse sidebar organizations and crawl each one separately
             else:
                 self.logger.info(f"Year {year} has > 500 hits ({total_hits}). Splitting by organization.")
-                
-                # Locate inputs inside the sidebar container
                 inputs = soup.select('div.search__aside__item__selection input[name="o"]')
                 
-                # Fallback in case class naming varies slightly
                 if not inputs:
                     inputs = soup.find_all("input", attrs={"name": "o"})
                     
@@ -447,9 +456,8 @@ class HBOScraper(BaseScraper):
                 
                 self.logger.info(f"Discovered {len(orgs)} organizations to partition year {year}: {orgs}")
                 
-                # Loop through and crawl each organization's items individually
                 for org in orgs:
-                    self.logger.info(f"-> Starting scrape for organization: '{org}' (Year: {year})") #https://hbo-kennisbank.nl/searchresult?lng-0-u=dut&sort-order=date&date-from=2020&date-until=2020&t-0-k=hbo%3Aproduct&o=Fontys&p=1
+                    self.logger.info(f"-> Starting scrape for organization: '{org}' (Year: {year})")
                     org_template = f"https://hbo-kennisbank.nl/searchresult?lng-0-u=dut&sort-order=date&date-from={year}&date-until={year}&t-0-k=hbo%3Aproduct&o={org}&p={{page}}"
                     self._scrape_pages_for_query(org_template, base_url)
 
@@ -488,7 +496,6 @@ class HBOScraper(BaseScraper):
                 full_url = f"{base_url}{href}" if href.startswith("/") else href
                 current_page_urls.add(full_url)
 
-            # Loop Failsafe: check if the page content matches the previous page
             if previous_page_urls and previous_page_urls == current_page_urls:
                 self.logger.warning(
                     f"Pagination ceiling reached on page {page} (identical page items). "
@@ -499,7 +506,6 @@ class HBOScraper(BaseScraper):
             previous_page_urls = current_page_urls
             patience = 0
 
-            # Filter duplicates against your existing CSV database
             for full_url in current_page_urls:
                 if full_url not in existing_urls:
                     new_rows.append({
@@ -518,7 +524,7 @@ class HBOScraper(BaseScraper):
             page += 1
 
     def _scrape_item_metadata(self, url: str) -> Optional[Dict[str, Any]]:
-        # 1. Define local cache paths first
+        # Define local cache paths first (Relative to the base folder we resolved)
         html_dir = self.base_folder / "raw_data" / self.source_name / "raw_html"
         html_dir.mkdir(parents=True, exist_ok=True)
         item_id = hashlib.md5(url.encode()).hexdigest()[:12]
@@ -526,7 +532,7 @@ class HBOScraper(BaseScraper):
 
         html_content = None
 
-        # 2. Check if the raw HTML was already downloaded locally
+        # Check if the raw HTML was already downloaded locally
         if html_path.exists():
             self.logger.info(f"Using locally cached HTML for {url}")
             try:
@@ -534,7 +540,7 @@ class HBOScraper(BaseScraper):
             except Exception as e:
                 self.logger.error(f"Failed to read local HTML file {html_path}: {e}")
 
-        # 3. If no local copy exists, make the network request
+        # If no local copy exists, make the network request
         if not html_content:
             response = self._request(url)
             if not response:
@@ -542,33 +548,30 @@ class HBOScraper(BaseScraper):
                 return None
             html_content = response.text
             
-            # Save the raw HTML to disk so we have it for future runs
             try:
                 html_path.write_text(html_content, encoding="utf-8")
                 self.logger.debug(f"Saved raw HTML to {html_path}")
             except Exception as e:
                 self.logger.error(f"Failed to save raw HTML to disk: {e}")
 
-        # 4. Initialize parser using the unified html_content
         soup = BeautifulSoup(html_content, "html.parser")
         metadata: Dict[str, Any] = {}
 
-        # 3. Clean and save abstract (<p> child of <div class='detail__body'>)
+        # Clean and save abstract (<p> child of <div class='detail__body'>)
         detail_body = soup.find("div", class_="detail__body")
         abstract = None
         if detail_body:
-            # Look for the direct paragraph child, falling back to any child paragraph if none found directly
             p_tag = detail_body.find("p", recursive=False) or detail_body.find("p")
             if p_tag:
                 abstract = p_tag.get_text(strip=True)
         metadata["abstract"] = abstract
 
-        # 4. Extract keywords
+        # Extract keywords
         keyword_tags = soup.select("a.detail__body__meta__list__item.detail__body__meta__list__item--label")
         keywords_list = [tag.get_text(strip=True) for tag in keyword_tags]
         metadata["keywords"] = "; ".join(keywords_list) if keywords_list else None
 
-        # 5. Extract metadata table inside <div class='detail__aside'>
+        # Extract metadata table inside <div class='detail__aside'>
         detail_aside = soup.find("div", class_="detail__aside")
         if detail_aside:
             for tr in detail_aside.find_all("tr"):
@@ -579,7 +582,7 @@ class HBOScraper(BaseScraper):
                     if key:
                         metadata[key.lower()] = val
 
-        # 6. Extract Title, Subtitle, and Authors inside <div class='detail__header__column ...'>
+        # Extract Title, Subtitle, and Authors inside <div class='detail__header__column ...'>
         header_column = soup.select_one('div[class*="detail__header__column"]')
         title = None
         subtitle = None
@@ -605,7 +608,7 @@ class HBOScraper(BaseScraper):
         metadata["subtitle"] = subtitle
         metadata["authors"] = "; ".join(authors_list) if authors_list else None
 
-        # 7. Extract Download Link (<a class='detail__header__button'>)
+        # Extract Download Link (<a class='detail__header__button'>)
         download_tag = soup.find("a", class_="detail__header__button")
         download_link = None
         if download_tag and download_tag.get("href"):
@@ -627,24 +630,16 @@ class HBOScraper(BaseScraper):
         return metadata
     
     def _strip_layout_headers(self, sent: str) -> tuple[str, Optional[str]]:
-        """Applies highly targeted rules to strip layout elements from the start of a sentence."""
         orig = sent
         sent_cleaned = re.sub(r'[*_]{1,2}', '', orig).strip()
         
-        # Rule A: Start of sentence with run-together word (e.g., "AchtergrondUit..." -> "Uit...")
         sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})([A-Z])', r'\1', sent_cleaned)
-        
-        # Rule B: Start of sentence followed by punctuation/formatting (e.g., "Conclusie: Uit...")
         sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})[\s]*[:.-]+[\s]*', '', sent_cleaned)
-        
-        # Rule C: Start of sentence followed by space AND another uppercase letter (e.g., "Conclusie Uit...")
         sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})\s+([A-Z])', r'\1', sent_cleaned)
         
-        # Rule D: Sentence consists strictly of the heading itself (e.g., "Samenvatting" -> "")
         if re.match(rf'^(?:{self._headings_pattern})$', sent_cleaned):
             sent_cleaned = ""
 
-        # Determine exactly what was removed
         if sent_cleaned != orig:
             if not sent_cleaned:
                 removed = orig
@@ -667,11 +662,9 @@ class HBOScraper(BaseScraper):
         ) -> str:
         
         dutch_abstract = ""
-        # 3. Minimum Character Length Filter
         if isinstance(abstract, str) and len(abstract) >= min_char_length and abstract.strip():
             abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', abstract)
             
-            # 4. Tokenization (Optimized for target language)
             raw_sentences = nltk.sent_tokenize(abstract, language=tokenizer_lang)
             cleaned_sentences = []
             
@@ -702,7 +695,6 @@ class HBOScraper(BaseScraper):
                 else:
                     cleaned_sentences.append(sent)
             
-            # 5. Sentence-Level Language Filter
             dutch_sentences = []
             for sent in cleaned_sentences:
                 try:
@@ -716,7 +708,6 @@ class HBOScraper(BaseScraper):
 
 
 class ScriptiebankScraper(BaseScraper):
-    # Core schema of columns required to track pipeline state and maintain baseline fields
     DEFAULT_COLUMNS = [
         "page_link",
         "download_link",
@@ -739,7 +730,7 @@ class ScriptiebankScraper(BaseScraper):
             source_name="SB",
             columns=self.DEFAULT_COLUMNS,
             essential_columns=self.ESSENTIAL_METADATA_COLUMNS,
-            use_tsv=False,  # Saves to a standard CSV file
+            use_tsv=False,
             **kwargs
         )
         self.base_url = 'https://scriptiebank.be'
@@ -748,12 +739,10 @@ class ScriptiebankScraper(BaseScraper):
         self.download_pattern = re.compile(r"/file/\d+/download\?token=[a-zA-Z0-9_-]+")
 
     def _get_item_id(self, row: pd.Series) -> str:
-        """Generates file names based on the author name to keep them recognizable."""
         author_slug = f"{str(row['first_name']).lower()}_{str(row['last_name']).lower()}".replace(" ", "_")
         return f"{author_slug}_{row.name}"
 
     def _scrape_all_item_urls(self) -> None:
-        """Gathers unique thesis page URLs across pagination with checkpoint saving and loop protection."""
         page = 0
         patience = 0
         existing_urls = set(self.df['page_link'].dropna())
@@ -779,7 +768,6 @@ class ScriptiebankScraper(BaseScraper):
                 page += 1
                 continue
 
-            # Loop Failsafe: Stops immediately if pagination loops back to page 1
             if previous_page_urls and previous_page_urls == current_page_urls:
                 self.logger.warning(
                     f"Pagination ceiling reached on page {page} (identical page items). "
@@ -804,7 +792,6 @@ class ScriptiebankScraper(BaseScraper):
                 new_df = pd.DataFrame(new_rows)
                 self.df = pd.concat([self.df, new_df], ignore_index=True)
                 self.logger.info(f"Added {len(new_rows)} new URLs from page {page}.")
-                # Save progress iteratively so no data is lost on partial runs
                 self._save_state()
 
             page += 1
@@ -812,8 +799,7 @@ class ScriptiebankScraper(BaseScraper):
         self.logger.info(f"URL Crawl finished. Current unique entries in database: {len(self.df)}")
 
     def _scrape_item_metadata(self, url: str) -> Optional[Dict[str, Any]]:
-        """Scrapes item metadata safely using a local HTML cache check."""
-        # 1. Define local cache paths first
+        # Define local cache paths first (Relative to the base folder we resolved)
         html_dir = self.base_folder / "raw_data" / self.source_name / "raw_html"
         html_dir.mkdir(parents=True, exist_ok=True)
         url_hash = hashlib.md5(url.encode()).hexdigest()
@@ -821,7 +807,7 @@ class ScriptiebankScraper(BaseScraper):
 
         html_content = None
 
-        # 2. Check if the raw HTML was already downloaded locally
+        # Check if the raw HTML was already downloaded locally
         if html_path.exists():
             self.logger.info(f"Using locally cached HTML for {url}")
             try:
@@ -829,7 +815,7 @@ class ScriptiebankScraper(BaseScraper):
             except Exception as e:
                 self.logger.error(f"Failed to read local HTML file {html_path}: {e}")
 
-        # 3. If no local copy exists, make the network request
+        # If no local copy exists, make the network request
         if not html_content:
             response = self._request(url)
             if not response:
@@ -837,14 +823,12 @@ class ScriptiebankScraper(BaseScraper):
                 return None
             html_content = response.text
             
-            # Save the raw HTML to disk so we have it for future runs
             try:
                 html_path.write_text(html_content, encoding="utf-8")
                 self.logger.debug(f"Saved raw HTML to {html_path}")
             except Exception as e:
                 self.logger.error(f"Failed to save raw HTML to disk: {e}")
 
-        # 4. Initialize parser using the unified html_content
         try:
             soup = BeautifulSoup(html_content, "html.parser")
             
@@ -870,7 +854,6 @@ class ScriptiebankScraper(BaseScraper):
                 if raw_names_string:
                     promoters_list = [name.strip() for name in raw_names_string.split(',')]
 
-            # Compile metadata dictionary (converting nested lists into clean semicolon-separated strings)
             metadata = {
                 "title": _get_text_safe(soup.find("h1")),
                 "first_name": _get_text_safe(soup.find("div", class_="thesis__first-name")),
@@ -888,11 +871,3 @@ class ScriptiebankScraper(BaseScraper):
         except Exception as e:
             self.logger.error(f"ERROR parsing metadata for {url}: {e}")
             return None
-
-#if __name__ == '__main__':
-    #scraper = HBOScraper()
-    #scraper.run(download_files=False)
-    
-    #metadata = scraper._scrape_item_metadata(url=r'https://hbo-kennisbank.nl/details/amsterdam_dspace_45:oai:dspace.uba.uva.nl:record%2F54036')
-    #print(metadata)
-    #print(metadata['abstract'])

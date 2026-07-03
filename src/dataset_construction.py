@@ -36,6 +36,10 @@ import torch
 #TODO relative paths
 #TODO create dirs and files
 
+#GLOBAL VARS
+BASE_DIR = Path(__file__).resolve().parent #SHOULD RESOLVE TO INTERNSHIP
+
+#FUNCTIONS
 #downloads
 def download_raw_data(
         scriptiebank=False,
@@ -47,7 +51,7 @@ def download_raw_data(
         scraper.run(gather_metadata=True,gather_urls=True,download_files=False) #download selection later
     
     if ugent == True:
-        file_path = Path('data/raw_data/UG/publications.json')
+        file_path = BASE_DIR / 'data' / 'bronze' / 'UG' / 'publications.json' #Path('data/raw_data/UG/publications.json') #TODO RELATIVE PATh
         datadump_url = 'https://biblio.ugent.be/exports/publications.json'
     
         def download_ug(url, save_path):
@@ -76,8 +80,8 @@ def clean_df(df_path, save_path, protected_values=None,schema=None):
 
 
 def clean_ug(
-    ug_path = Path('/home/gderijck/internship/data/raw_data/UG/publications.json'),
-    ug_clean = Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet')
+    ug_path = BASE_DIR / 'data' / 'bronze' / 'UG' / 'publications.json', #Path('/home/gderijck/internship/data/raw_data/UG/publications.json'),
+    ug_clean = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_cleaned.parquet' #Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet')
 ):
     prot_val_ug = {
         'volume': [999,'999',9999,'9999'], #CHANGE TO REGEX
@@ -840,7 +844,7 @@ def get_models_list():
 #generation main
 def generation_main(
     table: pa.Table = None,
-    ug_path: Path = Path('data/silver/ug_selected.parquet'),
+    ug_path: Path = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet',
     checkpoint_path: Path = None,
     models_list: list[str] = None,
     percentages_to_run: list[int] = [25, 50, 75],
@@ -980,7 +984,7 @@ def main(): #TODO set default and relative and variable paths + checks for skipp
     pass
 
     #selection ---------------------------------------------------------------------------------
-    ug_select = Path('/home/gderijck/internship/data/silver/ug_selected.parquet') #TODO make relative
+    ug_select = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet' #TODO make relative
     table = None 
     
     if not ug_select.exists():
@@ -993,7 +997,7 @@ def main(): #TODO set default and relative and variable paths + checks for skipp
 
 
     #generation ---------------------------------------------------------------------------------
-    checkpoint_path = ug_select.parent / "checkpoint_rewrites.jsonl"
+    checkpoint_path = ug_select.parent.parent / "checkpoint_rewrites.jsonl"
     models_list = ['qwen3.6:27b', 'qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
     #models_list = ['qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
     percentages = [25,50,75]
@@ -1014,7 +1018,10 @@ def main(): #TODO set default and relative and variable paths + checks for skipp
         exclude_percentage=True #TODO fix percentage plssss
     )
 
+    #generation for other datasets
+        #HBO
 
+    #
     #---------------------------------------------------------------------------------
 
 
