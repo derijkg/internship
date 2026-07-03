@@ -1,96 +1,153 @@
-import argparse
-from scrape import ScriptiebankScraper
-import pandas as pd
+import hashlib
+import logging
 import re
-import requests
+import time
+import zipfile
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Union
+import pandas as pd
+import requests
+from tqdm import tqdm
+from bs4 import BeautifulSoup
+import nltk
+nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
 from langdetect import detect, LangDetectException
+import string
+import random
+import argparse
+from scrape import ScriptiebankScraper, HBOScraper
 import mu
 import io
-import hashlib
 import ast
 import json
 import numpy as np
 from mu import DataFrameCleaner
-import pyarrow  as pa
+import pyarrow as pa
 import pyarrow.json as pj
 import pyarrow.parquet as pq
 import pyarrow.csv as pv
 import pyarrow.compute as pc
-import nltk
-nltk.download('punkt')
-nltk.download('punkt_tab')
 import os
 import subprocess
-import time
 import atexit
 import socket
-import sys
-import string
 import binascii
-import random
 from ollama import Client
 import torch
 
-#TODO check if paths exist and skip steps accordingkly
-#TODO relative paths
-#TODO create dirs and files
+# GLOBAL VARS
+# - Path(__file__).resolve() points to 'internship/src/run.py'
+# - .parent.parent resolves to the root folder 'internship/'
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-#GLOBAL VARS
-BASE_DIR = Path(__file__).resolve().parent #SHOULD RESOLVE TO INTERNSHIP
-
-#FUNCTIONS
-#downloads
-def download_raw_data(
-        scriptiebank=False,
-        ugent=True
-):
-    #create data folder + raw
-    if scriptiebank == True:
-        scraper = ScriptiebankScraper()
-        scraper.run(gather_metadata=True,gather_urls=True,download_files=False) #download selection later
+# FUNCTIONS
+# downloads
+def download_raw_data(source_name: str, force: bool = False):
+    """
+    Orchestrates downloading raw data depending on the selected source.
+    """
+    bronze_dir = BASE_DIR / 'data' / 'bronze' / source_name
+    bronze_dir.mkdir(parents=True, exist_ok=True)
     
-    if ugent == True:
-        file_path = BASE_DIR / 'data' / 'bronze' / 'UG' / 'publications.json' #Path('data/raw_data/UG/publications.json') #TODO RELATIVE PATh
-        datadump_url = 'https://biblio.ugent.be/exports/publications.json'
-    
-        def download_ug(url, save_path):
-            save_path = Path(save_path)
-            save_path.parent.mkdir(parents=True,exist_ok=True)
-
-            response = requests.get(url)
+    if source_name == 'SB':  # Scriptiebank
+        metadata_file = bronze_dir / "SB_metadata.csv"
+        if not metadata_file.exists() or force:
+            print("[SB] Raw metadata not found or force download enabled. Starting Scriptiebank scraper...")
+            scraper = ScriptiebankScraper(base_folder=BASE_DIR / 'data')
+            scraper.run(gather_metadata=True, gather_urls=True, download_files=False)
+        else:
+            print(f"[SB] Raw metadata already exists at {metadata_file}. Skipping.")
+            
+    elif source_name == 'HBO':  # HBO Kennisbank
+        metadata_file = bronze_dir / "HBO_metadata.csv"
+        if not metadata_file.exists() or force:
+            print("[HBO] Raw metadata not found or force download enabled. Starting HBO scraper...")
+            scraper = HBOScraper(base_folder=BASE_DIR / 'data')
+            scraper.run(gather_metadata=True, gather_urls=True, download_files=False)
+        else:
+            print(f"[HBO] Raw metadata already exists at {metadata_file}. Skipping.")
+            
+    elif source_name == 'UG':  # UGent Publications
+        file_path = bronze_dir / 'publications.json'
+        if not file_path.exists() or force:
+            datadump_url = 'https://biblio.ugent.be/exports/publications.json'
+            print(f"[UG] Downloading UGent datadump from {datadump_url}...")
+            response = requests.get(datadump_url)
             response.raise_for_status()
-
-            with open(save_path, 'wb') as f:
+            with open(file_path, 'wb') as f:
                 f.write(response.content)
-            print("downlaod complete")
+            print("[UG] Download complete.")
+        else:
+            print(f"[UG] Raw publications data already exists at {file_path}. Skipping.")
 
-        download_ug(datadump_url, file_path)
+# cleaning
+def clean_df(df_path, save_path, protected_values=None, schema=None):
+    if not save_path: 
+        raise ValueError('Please input a valid save path')
+    
+    df_path = Path(df_path)
+    save_path = Path(save_path)
+    
+    # Ensure target output directory exists
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-#cleaning
-def clean_df(df_path, save_path, protected_values=None,schema=None):
-    if not save_path: raise 'please input save path'
     if df_path.suffix == '.tsv':
-        df = pd.read_csv(df_path,sep='\t')
-    elif df_path.suffix == '.json': df = pd.read_json(df_path, lines=True)
-    else: raise 'format not supported'
+        df = pd.read_csv(df_path, sep='\t')
+    elif df_path.suffix == '.json': 
+        df = pd.read_json(df_path, lines=True)
+    elif df_path.suffix == '.csv':
+        df = pd.read_csv(df_path)
+    else: 
+        raise ValueError(f'Format {df_path.suffix} not supported')
+        
     cleaner = DataFrameCleaner(df)
-    cleaner.run_auto_pipeline(schema=schema, protected_values=protected_values) #MAKE SURE IT HANDLES NONE
+    cleaner.run_auto_pipeline(schema=schema, protected_values=protected_values)
     cleaner.save_parquet(path=save_path)
 
 
-def clean_ug(
-    ug_path = BASE_DIR / 'data' / 'bronze' / 'UG' / 'publications.json', #Path('/home/gderijck/internship/data/raw_data/UG/publications.json'),
-    ug_clean = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_cleaned.parquet' #Path('/home/gderijck/internship/data/silver/ug_cleaned.parquet')
+def clean_source(
+    source_name: str,
+    input_path: Path = None,
+    output_clean_path: Path = None,
+    protected_values: dict = None
 ):
-    prot_val_ug = {
-        'volume': [999,'999',9999,'9999'], #CHANGE TO REGEX
-        'issue': ['999',999,'9999',9999]
-    }
-    clean_df(ug_path, ug_clean, protected_values=prot_val_ug)
+    """
+    Generalized cleaning setup for any supported dataset.
+    """
+    if input_path is None:
+        bronze_dir = BASE_DIR / 'data' / 'bronze' / source_name
+        if source_name == 'UG':
+            input_path = bronze_dir / 'publications.json'
+        else:
+            # Fallback format for standard csv-based raw dumps
+            input_path = bronze_dir / f"{source_name}_metadata.csv"
+            
+    if output_clean_path is None:
+        output_clean_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_cleaned.parquet"
 
-#clean abstracts and select rows
-def select_and_clean_abstracts_ug(
+    input_path = Path(input_path)
+    output_clean_path = Path(output_clean_path)
+
+    # Ensure parent folders exist
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    output_clean_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Set default protected values specifically for UGent dataset if none provided
+    if protected_values is None and source_name == 'UG':
+        protected_values = {
+            'volume': [999, '999', 9999, '9999'],
+            'issue': ['999', 999, '9999', 9999]
+        }
+    
+    print(f"[{source_name}] Executing cleaning process: {input_path} -> {output_clean_path}")
+    clean_df(input_path, output_clean_path, protected_values=protected_values)
+
+
+# clean abstracts and select rows
+def select_and_clean_abstracts(
+    source_name: str,
     input_path: Path,
     output_path: Path,
     min_year: int = 1980,
@@ -101,19 +158,18 @@ def select_and_clean_abstracts_ug(
     tokenizer_lang: str = 'dutch'
 ) -> pa.Table:
     """
-    Filters, tokenizes, and cleans abstracts from a PyArrow Parquet table.
-    
-    Parameters:
-    - input_path: Path to the raw input Parquet file.
-    - output_path: Path to write the cleaned Parquet file.
-    - min_year: Minimum year (inclusive) to filter.
-    - max_year: Maximum year (inclusive) to filter.
-    - min_char_length: Minimum character length of raw abstract text.
-    - source_lang_tag: Language tag to look for in 'abstract_full' dictionary items.
-    - detect_lang_tag: Target language code for sentence-level filtering (langdetect).
-    - tokenizer_lang: Target language name for NLTK sentence tokenization.
+    Unified abstract extractor. Handles both nested lists of dicts (like UG)
+    and flat string columns (like HBO and Scriptiebank).
     """
-    print(f"Reading input table from: {input_path}")
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[{source_name}] Reading input table from: {input_path}")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found at: {input_path}")
+        
     table = pq.read_table(input_path)
     rows = table.to_pylist()
 
@@ -121,84 +177,113 @@ def select_and_clean_abstracts_ug(
 
     for row in rows:
         year = row.get('year')
+        
         abstract_list = row.get('abstract_full')
+        text_content = None
 
-        # 1. Year Filter
-        if year is not None and min_year <= year <= max_year:
-            if isinstance(abstract_list, list):
-                for item in abstract_list:
-                    # 2. Source Language Tag Filter
-                    if isinstance(item, dict) and item.get('lang') == source_lang_tag:
-                        text_content = item.get('text')
+        # Scenario A: Extract from nested format (UGent Schema)
+        if isinstance(abstract_list, list):
+            for item in abstract_list:
+                if isinstance(item, dict) and item.get('lang') == source_lang_tag:
+                    text_content = item.get('text')
+                    break
+        # Scenario B: Extract from flat strings (HBO 'abstract' or SB 'text_homepage')
+        elif isinstance(row.get('abstract'), str):
+            text_content = row.get('abstract')
+        elif isinstance(row.get('text_homepage'), str):
+            text_content = row.get('text_homepage')
+
+        # Run year filter verification (only applied if the dataset contains year records)
+        year_valid = True
+        if year is not None:
+            try:
+                year_int = int(year)
+                year_valid = min_year <= year_int <= max_year
+            except (ValueError, TypeError):
+                year_valid = False
+
+        if year_valid and text_content:
+            if len(text_content) >= min_char_length and text_content.strip():
+                raw_sentences = nltk.sent_tokenize(text_content, language=tokenizer_lang)
+                cleaned_sentences = []
+                
+                for sent in raw_sentences:
+                    sent = sent.strip()
+                    if not sent:
+                        continue
+                    
+                    should_merge = False
+                    if cleaned_sentences:
+                        if not re.match(r'^[A-Z]', sent):
+                            should_merge = True
+                        elif len(sent) >= 2 and sent[1] in string.punctuation:
+                            should_merge = True
+                    
+                    if should_merge:
+                        cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
+                    else:
+                        cleaned_sentences.append(sent)
+                
+                dutch_sentences = []
+                for sent in cleaned_sentences:
+                    try:
+                        if detect(sent) == detect_lang_tag:
+                            dutch_sentences.append(sent)
+                    except LangDetectException:
+                        continue
                         
-                        # 3. Minimum Character Length Filter
-                        if isinstance(text_content, str) and len(text_content) >= min_char_length and text_content.strip():
-                            
-                            # 4. Tokenization (Optimized for target language)
-                            raw_sentences = nltk.sent_tokenize(text_content, language=tokenizer_lang)
-                            cleaned_sentences = []
-                            
-                            for sent in raw_sentences:
-                                sent = sent.strip()
-                                if not sent:
-                                    continue
-                                
-                                should_merge = False
-                                if cleaned_sentences:
-                                    if not re.match(r'^[A-Z]', sent):
-                                        should_merge = True
-                                    elif len(sent) >= 2 and sent[1] in string.punctuation:
-                                        should_merge = True
-                                
-                                if should_merge:
-                                    cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
-                                else:
-                                    cleaned_sentences.append(sent)
-                            
-                            # 5. Sentence-Level Language Filter
-                            dutch_sentences = []
-                            for sent in cleaned_sentences:
-                                try:
-                                    if detect(sent) == detect_lang_tag:
-                                        dutch_sentences.append(sent)
-                                except LangDetectException:
-                                    continue
-                                    
-                            # 6. Save back to row if valid sentences remain
-                            if dutch_sentences:
-                                # Reconstruct full abstract
-                                dutch_abstract = ' '.join(dutch_sentences)
-                                row['text_dut'] = dutch_abstract
-                                # Save list of sentences
-                                row['sent_dut'] = dutch_sentences
-                                
-                                filtered_data.append(row)
+                if dutch_sentences:
+                    dutch_abstract = ' '.join(dutch_sentences)
+                    row['text_dut'] = dutch_abstract
+                    row['sent_dut'] = dutch_sentences
+                    filtered_data.append(row)
 
-    print(f"Filtering complete. Kept {len(filtered_data)} rows of data.")
+    print(f"[{source_name}] Filtering complete. Kept {len(filtered_data)} rows of data.")
     
-    # Load the filtered list of dicts back into a PyArrow Table
     filtered_table = pa.Table.from_pylist(filtered_data)
 
-    # Write back to a clean Parquet file
-    print(f"Writing cleaned table to: {output_path}")
+    print(f"[{source_name}] Writing cleaned table to: {output_path}")
     pq.write_table(filtered_table, output_path)
-    print("Writing complete.")
+    print(f"[{source_name}] Writing complete.")
     
     return filtered_table
 
 
+# generation
+# ollama server functions
+def kill_process_on_port(port: int):
+    """
+    Attempts to find and terminate any process listening on the specified port.
+    Safely targets only your specific port to avoid affecting other shared processes.
+    """
+    import subprocess
+    import os
+    import signal
+    import time
+    
+    try:
+        # 'lsof -t' returns only the raw PID(s) bound to the port
+        result = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, check=False)
+        pids = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+        
+        for pid_str in pids:
+            pid = int(pid_str)
+            print(f"Found active process (PID {pid}) on port {port}. Force-terminating...")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError as e:
+                print(f"Could not kill PID {pid}: {e}")
+        
+        if pids:
+            time.sleep(1.5)  # Give the operating system a brief moment to release the port socket
+    except Exception as e:
+        print(f"Warning: Port cleanup helper failed: {e}")
 
-
-#generation
-#ollama server functions
-    #helpers
 def is_port_in_use(port: int) -> bool:
-    """Checks if a local port is already active."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 def shutdown_ollama_server(process: subprocess.Popen):
-    """Kills the background server process on exit."""
     if process and process.poll() is None:
         print("\nShutting down background Ollama server...")
         process.terminate()
@@ -209,17 +294,11 @@ def shutdown_ollama_server(process: subprocess.Popen):
         print("Server stopped cleanly.")
 
 def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Popen:
-    """
-    Launches a private, user-space Ollama server in the background.
-    Uses the native GPU-enabled binary rather than the active Conda binary.
-    """
+    kill_process_on_port(port)
     gpu_str = str(gpu_id).strip() if gpu_id is not None else ""
-    
-    # Configure the base environment
     env = os.environ.copy()
     env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
     
-    # Locate the GPU-enabled binary in your user-local space
     user_bin = Path.home() / ".local" / "bin" / "ollama"
     system_bin = Path("/usr/local/bin/ollama")
     system_bin_alt = Path("/usr/bin/ollama")
@@ -233,12 +312,9 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
     else:
         ollama_executable = "ollama"
         print("Warning: GPU-enabled native Ollama binary not found in standard locations.")
-        print("Falling back to PATH, which might default to your Conda environment binary.")
+        print("Falling back to PATH.")
 
-    # Configure dynamic linking paths for CUDA
     cuda_libs = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-    
-    # Point to the native CUDA runner libraries we extracted in user space
     user_libs = str(Path.home() / ".local" / "lib" / "ollama")
     
     if "LD_LIBRARY_PATH" in env:
@@ -246,7 +322,6 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
     else:
         env["LD_LIBRARY_PATH"] = f"{user_libs}:{cuda_libs}"
     
-    # Configure device targeting
     if gpu_str == "-1":
         env["CUDA_VISIBLE_DEVICES"] = "-1"
         device_label = "CPU Only"
@@ -263,7 +338,8 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
         print(f"Starting background Ollama server on {device_label} (Port {port})...")
         print(f"Using binary executable: {ollama_executable}")
         
-        log_path = Path("ollama_server.log")
+        log_path = BASE_DIR / "ollama_server.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "w", encoding="utf-8")
         
         process = subprocess.Popen(
@@ -273,10 +349,9 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
             stderr=subprocess.STDOUT
         )
         
-        # Wait for initialization loop
         for attempt in range(15):
             if is_port_in_use(port):
-                print(f"Ollama server successfully launched.")
+                print("Ollama server successfully launched.")
                 break
             time.sleep(1)
         else:
@@ -287,33 +362,27 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
             
         atexit.register(shutdown_ollama_server, process)
         return process
-        
     else:
         print(f"Ollama server is already running on port {port}. Reusing existing instance.")
         return None
-    
 
-
-#GENERATION proper
-    #save on exit helper
+# GENERATION proper
 def save_parquet_on_exit(rows: list[dict], output_path: Path):
-    """Saves the entire active rows list directly to your Parquet file on exit."""
     if rows:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"\n[Exit Handler] Auto-saving active progress to Parquet: {output_path}...")
         try:
-            # Reconstruct the PyArrow Table and save
             table = pa.Table.from_pylist(rows)
             pq.write_table(table, output_path)
             print("[Exit Handler] Progress saved successfully.")
         except Exception as e:
             print(f"[Exit Handler] Error during auto-save: {e}")
 
-
-#writer to checkpoint only (add to pq at the end of all tasks)
 def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
-    """
-    Appends a single successfully generated and validated rewrite to the JSONL checkpoint.
-    """
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
     record = {
         "id": task["id"],
         "type": task["type"],
@@ -328,35 +397,36 @@ def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str)
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
         try:
-            os.fsync(f.fileno())  # Force OS writing synchronization
+            os.fsync(f.fileno())
         except OSError:
             pass
 
-
-#prepare tasks 3 types of task for generation
-#checks state of both pq and checkpoint and builds tasks that are needed
-#validates single sentence legacy lines from checkpoint
 def prepare_tasks(
     table: pa.Table, 
     checkpoint_path: Path,
     models_list: list[str], 
     percentages: list[int] = None
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Unified pipeline with strict string matching and actual fallback alignment.
-    """
-    import json
+    checkpoint_path = Path(checkpoint_path)
     if percentages is None:
         percentages = []
 
-    # 1. Convert PyArrow table to standard Python dicts
     rows = table.to_pylist()
-    id_key = '_id' if '_id' in table.column_names else 'id'
     
-    # Cast keys to strings to handle any type discrepancies between formats
+    # Dynamic key fallback resolution if the dataset has unconventional naming schemas
+    if '_id' in table.column_names:
+        id_key = '_id'
+    elif 'id' in table.column_names:
+        id_key = 'id'
+    elif 'page_link' in table.column_names:
+        id_key = 'page_link'
+    else:
+        id_key = 'synthetic_id'
+        for idx, r in enumerate(rows):
+            r[id_key] = str(idx)
+
     rows_map = {str(row[id_key]): row for row in rows}
 
-    # 2. Parse checkpoint and perform alignment
     total_loaded = 0
     text_match_count = 0
     idx_fallback_count = 0
@@ -405,7 +475,6 @@ def prepare_tasks(
                     if isinstance(rewritten_text, str) and '<channel|>' in rewritten_text:
                         rewritten_text = rewritten_text.split('<channel|>')[1].strip()
 
-                    # Align keys via string casting
                     row = rows_map.get(str(row_id))
                     if not row:
                         missing_row_discard_count += 1
@@ -418,7 +487,6 @@ def prepare_tasks(
                             continue
 
                         matched_idx = -1
-                        # Step A: Perform strict text-matching verification
                         if orig_text:
                             clean_orig = orig_text.strip()
                             for idx, sent in enumerate(sent_dut):
@@ -427,7 +495,6 @@ def prepare_tasks(
                                     text_match_count += 1
                                     break
 
-                        # Step B: Index fallback if strict match fails
                         if matched_idx == -1 and sent_idx is not None:
                             try:
                                 sent_idx_int = int(sent_idx)
@@ -437,7 +504,6 @@ def prepare_tasks(
                             except (ValueError, TypeError):
                                 pass
 
-                        # Discard if both strict text match and index fallback fail
                         if matched_idx == -1:
                             mismatched_discard_count += 1
                             continue
@@ -464,7 +530,6 @@ def prepare_tasks(
         print(f" Discarded (Corrupted/Malformed lines)     : {corrupted_count}")
         print("====================================================\n")
 
-    # 4. Scan rows and build the final task queue
     tasks = []
     for row in rows:
         row_id = row.get(id_key)
@@ -531,9 +596,7 @@ def prepare_tasks(
 
     return tasks, rows
 
-#checkpoint -> pq
 def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
-    """Helper to route the rewritten string to the correct column in-memory."""
     if not row:
         return
     t_type = task["type"]
@@ -545,7 +608,6 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         if f'{model}_single' not in row or not isinstance(row[f'{model}_single'], list) or len(row[f'{model}_single']) != num_sentences:
             row[f'{model}_single'] = [None] * num_sentences
             
-        # Ensure our target index sits strictly inside our allocated boundaries
         if 0 <= sent_idx < num_sentences:
             row[f'{model}_single'][sent_idx] = rewritten
     elif t_type == "percentage":
@@ -555,10 +617,7 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         row[f"{model}_full"] = rewritten
 
 
-#pass to ollama and get result
 def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
-    """Sends text to Ollama for rewriting. Passes the active Client instance."""
-    # Using the official Ollama chat implementation
     response = client.generate(
         model=model_to_run,
         system=system_prompt,
@@ -570,44 +629,31 @@ def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
     )
 
     rewritten = response['response'].strip()
+    rewritten = rewritten.replace('\x00', '').replace('\u0000', '')
 
-    # remove null characters
-    rewritten = rewritten.replace('\x00','').replace('\u0000','')
-
-    # remove gemma thinking
     if isinstance(rewritten, str) and '<channel|>' in rewritten:
         rewritten = rewritten.split('<channel|>')[1].strip()
 
-    # remove added quotes
     if not sentence.startswith('"'):
         if rewritten.startswith('"') and rewritten.endswith('"'):
             rewritten = rewritten[1:-1]
         
     return rewritten
 
-#unload model helper
 def unload_model(model_name: str):
-    """
-    Sends an empty generate request with keep_alive=0 to explicitly
-    unload the model from GPU VRAM.
-    """
     print(f"\nUnloading model '{model_name}' from GPU memory...")
     try:
         host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
         if not host_env.startswith("http://"):
             host_env = f"http://{host_env}"
             
-        # Initialize client pointing to the active user-space server
         client = Client(host=host_env, timeout=30)
-        
-        # An empty prompt with keep_alive=0 tells Ollama to release the model's memory allocation
         client.generate(model=model_name, prompt="", keep_alive=0)
         print(f"Successfully unloaded '{model_name}'.")
-        time.sleep(2)  # Give the system driver a brief moment to stabilize and reclaim VRAM
+        time.sleep(2)
     except Exception as e:
         print(f"Warning: Could not explicitly unload '{model_name}': {e}")
 
-#generation lopp
 def run_generation(
     tasks: list[dict],
     rows: list[dict],
@@ -615,21 +661,14 @@ def run_generation(
     checkpoint_path: Path,
     debug_mode: bool = False
 ):
-    """
-    Iterates through the task list and executes them on Ollama.
-    """
-    import os
-    import time
-    from ollama import Client
-
-    # Instantiate the client once to leverage connection pooling and avoid port exhaustion
+    checkpoint_path = Path(checkpoint_path)
     host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
     if not host_env.startswith("http://"):
         host_env = f"http://{host_env}"
     client = Client(host=host_env, timeout=300)
 
-    id_key = '_id' if rows and '_id' in rows[0] else 'id' 
-    rows_map = {row[id_key]: row for row in rows}
+    id_key = next((k for k in ['_id', 'id', 'page_link', 'synthetic_id'] if rows and k in rows[0]), None)
+    rows_map = {row[id_key]: row for row in rows} if id_key else {}
 
     current_model = None
 
@@ -654,7 +693,6 @@ def run_generation(
 
         print(f"\n[{model}] Processing Task {i+1}/{len(tasks)} (Type: {t_type}, ID: {t_id})...")
 
-        # --- Generation & Validation Retries ---
         rewritten = None
         max_attempts = 3
 
@@ -673,7 +711,6 @@ def run_generation(
                     rewritten = "FAILED_GENERATION"
                     break
             
-            # --- Scenario A: Percentage-Based Rewrites ---
             if t_type == 'percentage':
                 original_sentences = row['sent_dut']
                 tagged_indices = set(task['tagged_indices'])
@@ -691,8 +728,6 @@ def run_generation(
                     break
                 else:
                     print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
-                    
-                    # Diagnostic prints
                     print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
                     print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
                     print("-" * 50)
@@ -704,7 +739,6 @@ def run_generation(
                         rewritten = "FAILED_VALIDATION"
                         break
                         
-            # --- Scenario B: Single Sentence or Full Abstract Rewrites ---
             elif t_type in ('sentence', 'full_abstract'):
                 is_valid = candidate_rewrite.strip() != text.strip()
                 
@@ -714,7 +748,6 @@ def run_generation(
                     print(f'REWRITTEN: {rewritten}')
                     break
                 else:
-                    # Let through identical short sentences without failing
                     word_count = len(text.strip().split())
                     char_count = len(text.strip())
                     is_short = word_count <= 6 or char_count <= 40
@@ -726,8 +759,6 @@ def run_generation(
 
                     reason = "The model's rewrite is identical to the original input."
                     print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
-                    
-                    # Diagnostic prints
                     print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
                     print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
                     print("-" * 50)
@@ -739,10 +770,8 @@ def run_generation(
                         rewritten = "FAILED_VALIDATION"
                         break
 
-        # Apply to in-memory structure
         apply_rewrite_to_row(row, task, rewritten)
 
-        # Append to checkpoint so we don't repeat this on subsequent runs
         if not debug_mode:
             append_to_checkpoint(checkpoint_path, task, rewritten)
 
@@ -751,17 +780,10 @@ def run_generation(
     return rows
 
 
-#check if target sentences in % rewrite were correctly rewritten
 def normalize_text(text: str) -> str:
-    """
-    Standardizes whitespaces, newlines, and quotation marks to prevent 
-    validation failures caused by minor LLM formatting normalizations.
-    """
     if not text:
         return ""
-    # Normalize smart quotes and backticks to standard straight typewriter quotes
     text = text.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("`", "'")
-    # Compress all sequences of whitespace (tabs, newlines, multiple spaces) into a single space
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -770,25 +792,15 @@ def validate_percentage_rewrite(
     raw_output_text: str, 
     tagged_indices: set[int]
 ) -> tuple[bool, str, str | None]:
-    """
-    Parses the LLM's raw output containing <target> tags.
-    Extracts the edited target sentences, validates them, and stitches them
-    back into the original sentence list to build a pristine final abstract.
-    
-    Returns:
-        (is_valid, reason, stitched_abstract_or_None)
-    """
     if not raw_output_text:
         return False, "Empty response from the model", None
 
-    # Use a case-insensitive regex to find all segments wrapped in <target> tags
     target_pattern = re.compile(r'<target>(.*?)</target>', re.DOTALL | re.IGNORECASE)
     extracted_targets = target_pattern.findall(raw_output_text)
     
     expected_count = len(tagged_indices)
     actual_count = len(extracted_targets)
     
-    # 1. Verify that the tag count matches expectations
     if actual_count != expected_count:
         return (
             False, 
@@ -796,40 +808,32 @@ def validate_percentage_rewrite(
             None
         )
         
-    # Create a copy of our original unedited sentences
     stitched_sentences = list(original_sents)
     sorted_target_indices = sorted(list(tagged_indices))
     
-    # 2. Iterate and validate each rewrite
     for idx, rewrite_text in zip(sorted_target_indices, extracted_targets):
         rewrite_clean = rewrite_text.strip()
         original_clean = original_sents[idx].strip()
         
-        # Verify the sentence wasn't deleted
         if not rewrite_clean:
             return False, f"Target sentence at index {idx} was returned empty.", None
             
-        # Verify the sentence was actually modified (using normalized comparison)
         if normalize_text(rewrite_clean) == normalize_text(original_clean):
             return False, f"Target sentence at index {idx} was not modified by the model.", None
             
-        # Stitch the validated rewrite back into the pristine sentence index
         stitched_sentences[idx] = rewrite_clean
         
-    # 3. Construct the final stitched abstract without any remaining XML tags
     final_abstract = " ".join(stitched_sentences)
-    
     return True, "Success", final_abstract
 
-#calc distribution helper
 def get_models_list():
     CALC_MODEL_MAPPING = {
-        'calc12': ['qwen3.5:4b','gemma4:e4b'],
+        'calc12': ['qwen3.5:4b', 'gemma4:e4b'],
         'calc11': ['qwen3.6:27b', 'gemma4:26b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
-        if current_host not in CALC_MODEL_MAPPING: #ADDED: Replaced inline else assignment containing print and sys.exit(1) statement. In your previous implementation, if the current host was missing, the inline "and" condition evaluated to None, which did not exit the process. Instead, it set default_calc to None, triggering a downstream KeyError on CALC_MODEL_MAPPING[None].
+        if current_host not in CALC_MODEL_MAPPING:
             print(f"Host '{current_host}' not found in configuration mappings.")
             sys.exit(1)
         default_calc = current_host
@@ -841,10 +845,11 @@ def get_models_list():
     print(f'selected config: {current_host} -> models_list: {selected_models}')
     return selected_models
 
-#generation main
+
 def generation_main(
+    source_name: str,
     table: pa.Table = None,
-    ug_path: Path = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet',
+    selected_path: Path = None,
     checkpoint_path: Path = None,
     models_list: list[str] = None,
     percentages_to_run: list[int] = [25, 50, 75],
@@ -854,14 +859,19 @@ def generation_main(
     debug_count: int = 5,
     exclude_percentage: bool = False
 ):
-    """
-    Fully parameterized main orchestrator for the LLM rewrite pipeline.
-    """
+    if selected_path is None:
+        selected_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_selected.parquet"
+    else:
+        selected_path = Path(selected_path)
+        
     if checkpoint_path is None:
-        checkpoint_path = ug_path.parent / "checkpoint_rewrites.jsonl"
+        checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl"
     else:
         checkpoint_path = Path(checkpoint_path)
-        print(f'Adding to existing checkpoint path found at {checkpoint_path}')
+
+    # Ensure parent directories exist before processing
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     system_prompts = {
         "sentence": (
@@ -892,32 +902,26 @@ def generation_main(
         )
     }
     
-    # 1. Start Ollama server
     start_ollama_server(port=port, gpu_id=gpu_id)
     global ollama
     import ollama
     
-    # 2. Load dataset
     if table is not None:
         ug_table = table
     else:
-        print(f"Loading Parquet data from: {ug_path}")
-        if not ug_path.exists():
-            print(f"Error: Parquet file not found at {ug_path}")
+        print(f"Loading Parquet data from: {selected_path}")
+        if not selected_path.exists():
+            print(f"Error: Parquet file not found at {selected_path}")
             sys.exit(1)
-        ug_table = pq.read_table(ug_path)
+        ug_table = pq.read_table(selected_path)
             
-    # 3. Unified checkpoint load, alignment verification, completion check, and task preparation
     tasks, rows = prepare_tasks(ug_table, checkpoint_path, models_list, percentages_to_run)
 
-    #exclude percentage option
     if exclude_percentage:
         print('EXCLUDING PERCENTAGE TASKS')
-        tasks = [t for t in tasks if t['type']!='percentage']
+        tasks = [t for t in tasks if t['type'] != 'percentage']
 
-    #ordering model -> sent -> abs
     if not models_list:
-        # Fallback: extract unique models in order of appearance if none provided
         models_list = list(dict.fromkeys([t["model"] for t in tasks]))
         
     model_order = {model: idx for idx, model in enumerate(models_list)}
@@ -929,7 +933,7 @@ def generation_main(
     ))
     
     if debug_mode:
-        print("\n[DEBUG MODE ACTIVE] Filtering tasks: Keeping exactly 5 tasks of each unique combination of model, task type, and percentage.")
+        print(f"\n[DEBUG MODE ACTIVE] Filtering tasks: Keeping exactly {debug_count} tasks of each combination.")
         counts = {}
         debug_tasks = []
         for task in tasks:
@@ -944,85 +948,224 @@ def generation_main(
     
     if len(tasks) == 0:
         print("All specified tasks are already completed in the dataset. Exiting.")
-        #if not debug_mode and checkpoint_path.exists(): TODO check if all are inside pq and clean up checkpoints
         return
         
-    # 4. Register final emergency fallback exit handler
-    if not debug_mode:
-        #atexit.register(save_parquet_on_exit, rows, ug_path)
-        pass
-    else: 
-        print('Debug mode active, not saving  to pq on exit.')
-    
-    # 5. Run generation
     run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
     
-    # save when done
     if not debug_mode:
         try:
             print("\nGeneration finished successfully. Writing final table to Parquet...")
-            #save_parquet_on_exit(rows, ug_path) #TODO change to write to row func
-            
+            save_parquet_on_exit(rows, selected_path)
         except Exception as e:
             print(f"Error during final Parquet save: {e}. Checkpoint remains preserved for recovery.")
     else: 
         print('Debug complete, not saving final output.')
 
 
+#CONSTRUCTION OF FINAL DATASET
+def consolidate_checkpoints(silver_dir: Union[str, Path] = BASE_DIR / 'data' / 'silver') -> pd.DataFrame:
+    """
+    Traverses the silver directory, parses all source checkpoint JSONL files,
+    and aggregates them into a single, structured Pandas DataFrame.
+    """
+    silver_path = Path(silver_dir)
+    
+    # 1. Discover all checkpoint files matching the pattern
+    # Looks in the silver directory and any subfolders (e.g., silver/UG/)
+    checkpoint_files = list(silver_path.glob("**/checkpoint_rewrites_*.jsonl"))
+    
+    if not checkpoint_files:
+        print(f"No checkpoint files found in {silver_path}")
+        return pd.DataFrame()
+
+    # We use a nested dictionary to aggregate tasks by (source, doc_id)
+    # Key: (source, doc_id) -> Value: aggregated document record
+    aggregated_data = {}
+    
+    # Keep track of all models and percentages discovered dynamically
+    discovered_models = set()
+    discovered_percentages = set()
+
+    # 2. Parse checkpoint files
+    for file_path in checkpoint_files:
+        match = re.search(r"checkpoint_rewrites_([a-zA-Z0-9_-]+)\.jsonl$", file_path.name)
+        if not match:
+            continue
+        source = match.group(1).upper()
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                
+                doc_id = str(record.get("id"))
+                t_type = record.get("type")
+                model = record.get("model")
+                rewritten = record.get("rewritten")
+                orig_text = record.get("text")
+                
+                if not doc_id:
+                    continue
+                
+                key = (source, doc_id)
+                if key not in aggregated_data:
+                    aggregated_data[key] = {
+                        "id": doc_id,
+                        "source": source,
+                        "abstract": None,
+                        "abstract_sent_dict": {},  # temp storage to order by index
+                        "models_single_dict": {},  # {model: {sent_idx: rewritten}}
+                        "models_pct": {},          # {(model, pct): rewritten}
+                        "models_full": {}          # {model: rewritten}
+                    }
+                
+                entry = aggregated_data[key]
+                
+                if model:
+                    discovered_models.add(model)
+                
+                # --- Task parsing ---
+                if t_type == "full_abstract":
+                    if orig_text:
+                        entry["abstract"] = orig_text
+                    if model and rewritten:
+                        entry["models_full"][model] = rewritten
+                        
+                elif t_type == "percentage":
+                    pct = record.get("percentage")
+                    if pct is not None:
+                        discovered_percentages.add(pct)
+                        if model and rewritten:
+                            entry["models_pct"][(model, pct)] = rewritten
+                            
+                elif t_type == "sentence":
+                    sent_idx = record.get("sent_idx")
+                    if sent_idx is not None:
+                        try:
+                            idx = int(sent_idx)
+                            if orig_text:
+                                entry["abstract_sent_dict"][idx] = orig_text
+                            if model and rewritten:
+                                if model not in entry["models_single_dict"]:
+                                    entry["models_single_dict"][model] = {}
+                                entry["models_single_dict"][model][idx] = rewritten
+                        except (ValueError, TypeError):
+                            pass
+
+    # 3. Reconstruct into flat rows for the final DataFrame
+    flat_rows = []
+    for (source, doc_id), entry in aggregated_data.items():
+        row = {
+            "id": entry["id"],
+            "source": entry["source"],
+            "abstract": entry["abstract"]
+        }
+        
+        # Sort and construct the original sentence list
+        sent_dict = entry["abstract_sent_dict"]
+        if sent_dict:
+            max_idx = max(sent_dict.keys())
+            abstract_sent = [sent_dict.get(i) for i in range(max_idx + 1)]
+        else:
+            abstract_sent = []
+        row["abstract_sent"] = abstract_sent
+        
+        # Build dynamic model columns
+        for model in discovered_models:
+            # {model}_single: Reconstruct list of rewritten sentences aligned with indices
+            single_dict = entry["models_single_dict"].get(model, {})
+            if single_dict or sent_dict:
+                max_single_idx = max(list(single_dict.keys()) + list(sent_dict.keys()))
+                model_single_list = [single_dict.get(i) for i in range(max_single_idx + 1)]
+            else:
+                model_single_list = []
+            row[f"{model}_single"] = model_single_list
+            
+            # {model}_{pct}
+            for pct in discovered_percentages:
+                row[f"{model}_{pct}"] = entry["models_pct"].get((model, pct))
+                
+            # {model}_full
+            row[f"{model}_full"] = entry["models_full"].get(model)
+            
+        flat_rows.append(row)
+        
+    return pd.DataFrame(flat_rows)
 
 
 
+# script execution
+def main():
+    parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
+    parser.add_argument(
+        '--source', 
+        type=str, 
+        default='UG', 
+        choices=['UG', 'HBO', 'SB'], 
+        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank)"
+    )
+    parser.add_argument('--force-download', action='store_true', help="Force download the raw files")
+    parser.add_argument('--force-clean', action='store_true', help="Force run the cleaning pipeline")
+    parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
+    args = parser.parse_args()
 
+    source_name = args.source.upper()
 
+    # Ensure necessary pipeline folder outputs are generated
+    (BASE_DIR / 'data' / 'bronze' / source_name).mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / 'data' / 'silver' / source_name).mkdir(parents=True, exist_ok=True)
 
-#script execution
-def main(): #TODO set default and relative and variable paths + checks for skipping
-    #TODO download section ---------------------------------------------------------------------------------
-    pass
+    # 1. Downloads Section
+    download_raw_data(source_name=source_name, force=args.force_download)
 
-    #TODO cleaning section
-    pass
+    # 2. Cleaning Section
+    clean_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_cleaned.parquet"
+    if not clean_path.exists() or args.force_clean:
+        clean_source(source_name=source_name, output_clean_path=clean_path)
 
-    #selection ---------------------------------------------------------------------------------
-    ug_select = BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet' #TODO make relative
+    # 3. Selection Section
+    selected_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_selected.parquet"
     table = None 
     
-    if not ug_select.exists():
-        table = select_and_clean_abstracts_ug(
-            input_path=ug_select.parent / 'ug_cleaned.parquet', 
-            output_path=ug_select
+    if not selected_path.exists():
+        if not clean_path.exists():
+            print(f"Cleaned input not found at {clean_path}. Running cleaning process first...")
+            clean_source(source_name=source_name, output_clean_path=clean_path)
+            
+        table = select_and_clean_abstracts(
+            source_name=source_name,
+            input_path=clean_path, 
+            output_path=selected_path
         )
-    if table is None:
-        table = pq.read_table(ug_select)
-
-
-    #generation ---------------------------------------------------------------------------------
-    checkpoint_path = ug_select.parent.parent / "checkpoint_rewrites.jsonl"
-    models_list = ['qwen3.6:27b', 'qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
-    #models_list = ['qwen3.5:4b', 'gemma4:26b', 'gemma4:e4b']
-    percentages = [25,50,75]
     
+    if table is None:
+        table = pq.read_table(selected_path)
+
+    # 4. Generation Section
+    checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl"
+    percentages = [25, 50, 75]
     active_models_list = get_models_list()
 
-
-
-    print('Starting llm gen')
+    print(f'Starting LLM generation pipeline for source: {source_name}')
     generation_main(
-        table = table,
-        ug_path = ug_select,
+        source_name=source_name,
+        table=table,
+        selected_path=selected_path,
         checkpoint_path=checkpoint_path,
-        models_list = active_models_list,
-        percentages_to_run = percentages,
-        debug_mode = False,
-        #debug_count = 1,
-        exclude_percentage=True #TODO fix percentage plssss
+        models_list=active_models_list,
+        percentages_to_run=percentages,
+        debug_mode=args.debug,
+        exclude_percentage=True
     )
 
-    #generation for other datasets
-        #HBO
 
-    #
-    #---------------------------------------------------------------------------------
+    #GOLD DATAFRAME
+    df = consolidate_checkpoints()
 
 
 if __name__ == "__main__":

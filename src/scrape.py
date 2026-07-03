@@ -31,7 +31,7 @@ logging.basicConfig(
 # - .parent gets '/absolute/path/to/internship/src'
 # - .parent.parent gets '/absolute/path/to/internship' (the project root)
 CURRENT_FILE = Path(__file__).resolve()
-PROJECT_ROOT = CURRENT_FILE.parent
+PROJECT_ROOT = CURRENT_FILE.parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 
 class LockoutException(Exception):

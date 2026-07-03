@@ -21,7 +21,8 @@ This project is part of my internship at the CLiPS research lab at UAntwerpen. I
 
 ## Getting Started
 
-Simply running the dataset_construction.py file should work.
+Simply running the dataset_construction.py file while specifiying the source name should work.
+python src/dataset_construction.py --source UG / HBO
 
 ### Prerequisites
 
