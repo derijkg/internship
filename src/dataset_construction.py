@@ -828,8 +828,8 @@ def validate_percentage_rewrite(
 
 def get_models_list():
     CALC_MODEL_MAPPING = {
-        'calc12': ['qwen3.5:4b', 'gemma4:e4b'],
-        'calc11': ['qwen3.6:27b', 'gemma4:26b'],
+        'calc12': ['gemma4:26b'],
+        'calc11': ['qwen3.6:27b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -952,7 +952,7 @@ def generation_main(
         
     run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
     
-    if not debug_mode:
+    if not debug_mode: #TODO edit to make new
         try:
             print("\nGeneration finished successfully. Writing final table to Parquet...")
             save_parquet_on_exit(rows, selected_path)

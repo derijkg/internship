@@ -27,8 +27,8 @@ data*/
 # 4. Ignore all files starting with "output" 
 output*
 
-# 5. Ignore "scripts_gen.txt" inside the "src/" folder
-scripts_gen.txt
+# 5. Ignore "scripts_gen.txt"
+scipts_gen.txt
 experiments/
 
 dataset_construction/
