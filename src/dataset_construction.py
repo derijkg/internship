@@ -36,6 +36,9 @@ import socket
 import binascii
 from ollama import Client
 import torch
+from pydantic import BaseModel, Field
+import itertools
+
 
 # GLOBAL VARS
 # - Path(__file__).resolve() points to 'internship/src/run.py'
@@ -366,7 +369,9 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
         print(f"Ollama server is already running on port {port}. Reusing existing instance.")
         return None
 
+
 # GENERATION proper
+#not used
 def save_parquet_on_exit(rows: list[dict], output_path: Path):
     if rows:
         output_path = Path(output_path)
@@ -379,6 +384,7 @@ def save_parquet_on_exit(rows: list[dict], output_path: Path):
         except Exception as e:
             print(f"[Exit Handler] Error during auto-save: {e}")
 
+#after generation add to checkpoint.jsonl
 def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +406,76 @@ def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str)
             os.fsync(f.fileno())
         except OSError:
             pass
+
+
+#pydantic 
+#class TargetRewrite(BaseModel):
+#    target_id: int = Field(
+#        description="The matching numeric ID of the target block (e.g., 1 for target_1, 2 for target_2)."
+#    )
+#    #thought_process: str = Field(
+#    #    description="A brief planning note analyzing how to rewrite this block to improve flow and grammar while matching the rest of the abstract's context."
+#    #)
+#    rewritten_text: str = Field(
+#        description="The edited Dutch text for this target block." # Do NOT include any XML or target tags in this output."
+#    )#
+#
+#class PercentageRewrites(BaseModel):
+#    rewrites: list[TargetRewrite] = Field(
+#        description="The list of edits for each numbered target block in sequential order."
+#    )
+
+
+
+#check if % rewrite task was succesfully completed
+def validate_percentage_rewrite(
+    original_sents: list[str], 
+    raw_output_text: str, 
+    tagged_groups: list[list[int]]
+) -> tuple[bool, str, str | None]:
+    if not raw_output_text:
+        return False, "Empty response from the model", None
+
+    # #AD: Parser updated to extract numbered target blocks using backreferences from raw output instead of loading JSON schemas
+    matches = re.findall(r'<target_(\d+)>(.*?)</target_\1>', raw_output_text, re.DOTALL | re.IGNORECASE)
+    
+    # #AD: Defensive map lookup dictionary handles string-to-int conversion securely to prevent ValueError execution crashes
+    rewrites_map = {}
+    for t_id_str, text in matches:
+        text_clean = text.strip()
+        if t_id_str and text_clean:
+            try:
+                parsed_id = int(t_id_str)
+                rewrites_map[parsed_id] = text_clean
+            except (ValueError, TypeError):
+                continue
+
+    stitched_sentences = list(original_sents)
+    
+    #AD: Iterate over target blocks, validate edits against original blocks, and stitch them back
+    for idx, group in enumerate(tagged_groups, 1):
+        rewrite_text = rewrites_map.get(idx)
+        if not rewrite_text:
+            return False, f"Missing target rewrite for target ID {idx} (Verify tag syntax in LLM output)", None
+
+        # Reconstruct the original contiguous block of sentences
+        original_block = " ".join([original_sents[s_idx].strip() for s_idx in group])
+        original_clean = original_block.strip()
+        
+        # Verify changes were made compared to the normalized original text
+        if normalize_text(rewrite_text) == normalize_text(original_clean):
+            return False, f"Target block {idx} was not modified by the model.", None
+            
+        # Place the rewrite in the first index, and clear out subsequent indices in the group
+        stitched_sentences[group[0]] = rewrite_text
+        for subsequent_idx in group[1:]:
+            stitched_sentences[subsequent_idx] = ""
+
+    #AD: Stitch the original untagged sentences and new edits into a single abstract
+    final_abstract = " ".join([sent for sent in stitched_sentences if sent])
+    return True, "Success", final_abstract
+
+
 
 def prepare_tasks(
     table: pa.Table, 
@@ -566,14 +642,36 @@ def prepare_tasks(
                     rng = random.Random(seed)
                     num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
                     tagged_indices = set(rng.sample(range(num_sentences), num_to_tag))
+
+                    groups = []
+                    sorted_indices = sorted(list(tagged_indices))
+                    if sorted_indices:
+                        current_group = [sorted_indices[0]]
+                        for idx in sorted_indices[1:]:
+                            if idx == current_group[-1] + 1:
+                                current_group.append(idx)
+                            else:
+                                groups.append(current_group)
+                                current_group = [idx]
+                        groups.append(current_group)
                     
-                    annotated_sentences = []
-                    for idx, sent in enumerate(sent_dut):
-                        if idx in tagged_indices:
-                            annotated_sentences.append(f"<target>{sent}</target>")
+                    annotated_parts = []
+                    group_starts = {g[0]: g for g in groups}
+                    group_to_id = {g[0]: idx + 1 for idx, g in enumerate(groups)}
+                    
+                    i = 0
+                    while i < num_sentences:
+                        if i in group_starts:
+                            group = group_starts[i]
+                            t_id = group_to_id[i]
+                            block_text = " ".join([sent_dut[idx] for idx in group])
+                            annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
+                            i += len(group)
                         else:
-                            annotated_sentences.append(sent)
-                    annotated_abstract = " ".join(annotated_sentences)
+                            annotated_parts.append(sent_dut[i])
+                            i += 1
+                    
+                    annotated_abstract = " ".join(annotated_parts)
 
                     tasks.append({
                         "id": row_id,
@@ -581,7 +679,7 @@ def prepare_tasks(
                         "model": model,
                         "percentage": pct,
                         "text": annotated_abstract,
-                        'tagged_indices': list(tagged_indices)
+                        'tagged_groups': groups  # List of index groups
                     })
 
             col_name = f"{model}_full"
@@ -595,6 +693,9 @@ def prepare_tasks(
                 })
 
     return tasks, rows
+
+
+
 
 def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
     if not row:
@@ -617,7 +718,8 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         row[f"{model}_full"] = rewritten
 
 
-def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
+def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42, response_format=None):
+    """Sends text to Ollama for rewriting with optional JSON schema constraints."""
     response = client.generate(
         model=model_to_run,
         system=system_prompt,
@@ -629,7 +731,7 @@ def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
     )
 
     rewritten = response['response'].strip()
-    rewritten = rewritten.replace('\x00', '').replace('\u0000', '')
+    rewritten = rewritten.replace('\x00','').replace('\u0000','')
 
     if isinstance(rewritten, str) and '<channel|>' in rewritten:
         rewritten = rewritten.split('<channel|>')[1].strip()
@@ -694,12 +796,19 @@ def run_generation(
         print(f"\n[{model}] Processing Task {i+1}/{len(tasks)} (Type: {t_type}, ID: {t_id})...")
 
         rewritten = None
-        max_attempts = 3
+        max_attempts = 5
 
         for attempt in range(max_attempts):    
             current_seed = 42 + attempt
+                
             try:
-                candidate_rewrite = rewrite_sentence(client, model, system_prompt, text, seed=current_seed)
+                candidate_rewrite = rewrite_sentence(
+                    client, 
+                    model, 
+                    system_prompt, 
+                    text, 
+                    seed=current_seed,
+                )
             except Exception as e:
                 print(f"  [Error - Attempt {attempt+1}/{max_attempts}] Calling Ollama failed: {e}")
                 if attempt < max_attempts - 1:
@@ -713,16 +822,21 @@ def run_generation(
             
             if t_type == 'percentage':
                 original_sentences = row['sent_dut']
-                tagged_indices = set(task['tagged_indices'])
+                tagged_groups = task['tagged_groups']
                 
-                is_valid, reason, stitched_text = validate_percentage_rewrite(
-                    original_sentences, 
-                    candidate_rewrite,  
-                    tagged_indices
-                )
-                
+                try:
+                    is_valid, reason, stitched_text = validate_percentage_rewrite(
+                        original_sentences, 
+                        candidate_rewrite,  
+                        tagged_groups
+                    )
+                except Exception as eval_err:
+                    is_valid = False
+                    reason = f"Internal evaluation parser raised an unhandled exception: {eval_err}"
+                    stitched_text = None
+
                 if is_valid:
-                    rewritten = stitched_text 
+                    rewritten = stitched_text
                     print(f'ORIGINAL: {text}\n')
                     print(f'REWRITTEN: {rewritten}')
                     break
@@ -787,45 +901,9 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def validate_percentage_rewrite(
-    original_sents: list[str], 
-    raw_output_text: str, 
-    tagged_indices: set[int]
-) -> tuple[bool, str, str | None]:
-    if not raw_output_text:
-        return False, "Empty response from the model", None
 
-    target_pattern = re.compile(r'<target>(.*?)</target>', re.DOTALL | re.IGNORECASE)
-    extracted_targets = target_pattern.findall(raw_output_text)
-    
-    expected_count = len(tagged_indices)
-    actual_count = len(extracted_targets)
-    
-    if actual_count != expected_count:
-        return (
-            False, 
-            f"Tag count mismatch. Expected {expected_count} target tags, but found {actual_count}.", 
-            None
-        )
-        
-    stitched_sentences = list(original_sents)
-    sorted_target_indices = sorted(list(tagged_indices))
-    
-    for idx, rewrite_text in zip(sorted_target_indices, extracted_targets):
-        rewrite_clean = rewrite_text.strip()
-        original_clean = original_sents[idx].strip()
-        
-        if not rewrite_clean:
-            return False, f"Target sentence at index {idx} was returned empty.", None
-            
-        if normalize_text(rewrite_clean) == normalize_text(original_clean):
-            return False, f"Target sentence at index {idx} was not modified by the model.", None
-            
-        stitched_sentences[idx] = rewrite_clean
-        
-    final_abstract = " ".join(stitched_sentences)
-    return True, "Success", final_abstract
 
+#select models for differnet calcs
 def get_models_list():
     CALC_MODEL_MAPPING = {
         'calc12': ['gemma4:26b'],
@@ -856,6 +934,7 @@ def generation_main(
     port: int = 11435,
     gpu_id: str = None,
     debug_mode: bool = False,
+    debug_pct_only: bool = False,
     debug_count: int = 5,
     exclude_percentage: bool = False
 ):
@@ -881,19 +960,7 @@ def generation_main(
         ),
         "percentage": (
             "You are a professional Dutch editor.\n"
-            "You will be given a Dutch abstract where specific sentences are enclosed within <target>...</target> tags.\n\n"
-            "YOUR TASKS:\n"
-            "1. Rewrite ONLY the sentences inside the <target>...</target> tags.\n"
-            "2. Make sure the sentences inside the tags are actually edited and different from the original input.\n"
-            "3. Keep the <target> and </target> tags exactly where they are, enclosing your newly rewritten sentences.\n"
-            "4. Output the full abstract including both the untargeted text and your newly edited target sentences.\n\n"
-            "CRITICAL RULES:\n"
-            "- It is absolutely mandatory to preserve the <target> and </target> tags. Do not remove, alter, or misspell the tags themselves.\n"
-            "- If the abstract begins immediately with a <target> tag, you must still rewrite that first sentence. Do not leave the first sentence unedited if it is tagged.\n"
-            "- Do NOT add any introductory or concluding text (e.g., do not say 'Here is your rewrite:'). Output ONLY the final abstract.\n\n"
-            "EXAMPLE:\n"
-            "Input: Dit is de eerste zin. <target>Deze zin moet anders.</target> Dit is de derde zin.\n"
-            "Output: Dit is de eerste zin. <target>Deze specifieke zin dient aangepast te worden.</target> Dit is de derde zin."
+            "Your task is to rewrite only the text segments enclosed in numbered target tags (e.g., <target_1>...</target_1>, <target_3>...</target_3>) so as to improve them.\n"
         ),
         "full_abstract": (
             "You are a professional Dutch editor.\n"
@@ -916,6 +983,11 @@ def generation_main(
         ug_table = pq.read_table(selected_path)
             
     tasks, rows = prepare_tasks(ug_table, checkpoint_path, models_list, percentages_to_run)
+
+    if debug_pct_only:
+        print("\n[DEBUG PCT ONLY ACTIVE] Filtering out non-percentage tasks.")
+        tasks = [t for t in tasks if t['type'] == 'percentage']
+        debug_mode = True  # Force debug count verification below
 
     if exclude_percentage:
         print('EXCLUDING PERCENTAGE TASKS')
@@ -951,15 +1023,6 @@ def generation_main(
         return
         
     run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
-    
-    if not debug_mode: #TODO edit to make new
-        try:
-            print("\nGeneration finished successfully. Writing final table to Parquet...")
-            save_parquet_on_exit(rows, selected_path)
-        except Exception as e:
-            print(f"Error during final Parquet save: {e}. Checkpoint remains preserved for recovery.")
-    else: 
-        print('Debug complete, not saving final output.')
 
 
 #CONSTRUCTION OF FINAL DATASET
@@ -1112,6 +1175,13 @@ def main():
     parser.add_argument('--force-download', action='store_true', help="Force download the raw files")
     parser.add_argument('--force-clean', action='store_true', help="Force run the cleaning pipeline")
     parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
+    
+
+    parser.add_argument(
+        '--debug-pct-only', 
+        action='store_true', 
+        help="Run the LLM generation in debug mode with exactly 5 percentage-type tasks for all active models"
+    )
     args = parser.parse_args()
 
     source_name = args.source.upper()
@@ -1149,7 +1219,13 @@ def main():
     # 4. Generation Section
     checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl"
     percentages = [25, 50, 75]
-    active_models_list = get_models_list()
+    
+
+    if args.debug or args.debug_pct_only:
+        print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
+        active_models_list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
+    else:
+        active_models_list = get_models_list()
 
     print(f'Starting LLM generation pipeline for source: {source_name}')
     generation_main(
@@ -1160,13 +1236,15 @@ def main():
         models_list=active_models_list,
         percentages_to_run=percentages,
         debug_mode=args.debug,
-        exclude_percentage=True
+        debug_pct_only=args.debug_pct_only,
+        exclude_percentage=False
     )
 
-
-    #GOLD DATAFRAME
-    df = consolidate_checkpoints()
-
+    # GOLD DATAFRAME
+    if not (args.debug_pct_only or args.debug):
+        gold_df_path = BASE_DIR / 'data' / 'gold' / 'gold.csv'
+        df = consolidate_checkpoints()
+        df.to_csv(gold_df_path)
 
 if __name__ == "__main__":
     main()
