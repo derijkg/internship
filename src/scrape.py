@@ -53,28 +53,33 @@ class BaseScraper:
         "application/zip": "zip"
     }
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.188"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
     ]
 
     def __init__(
         self,
         source_name: str,
-        base_folder: Union[str, Path] = "data",  # Relative to project root
+        base_folder: Union[str, Path] = "data",
         columns: Optional[List[str]] = None,
         essential_columns: Optional[List[str]] = None,
         metadata_save_batch_size: int = 100,
         download_save_batch_size: int = 50,
         use_tsv: bool = True,
-        min_delay: float = 1.5,
-        max_delay: float = 5.0
+        min_delay: float = 5,
+        max_delay: float = 10,
+        cool_down_duration: int = 300,  # 5 minutes by default
+        max_cool_downs: int = 3         # Max block-recovery retries
     ):
         self.min_delay = min_delay
         self.max_delay = max_delay
+        self.cool_down_duration = cool_down_duration
+        self.max_cool_downs = max_cool_downs
+        self.cool_down_count = 0
 
         # Initialize failure counters
         self.consecutive_failures = 0
@@ -83,39 +88,90 @@ class BaseScraper:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.source_name = source_name
         
-        # Safely resolve base_folder to an absolute path relative to PROJECT_ROOT
-        # if a relative string or relative Path object is provided.
         resolved_base = Path(base_folder)
         if not resolved_base.is_absolute():
             self.base_folder = (PROJECT_ROOT / resolved_base).resolve()
         else:
             self.base_folder = resolved_base.resolve()
         
-        # Configuration parameters
         self.metadata_save_batch_size = metadata_save_batch_size
         self.download_save_batch_size = download_save_batch_size
         self.use_tsv = use_tsv
         
-        # Determine paths and separator
         self.separator = "\t" if use_tsv else ","
         ext = "tsv" if use_tsv else "csv"
         self.data_path = self.base_folder / "bronze" / self.source_name / f"{self.source_name}_metadata.{ext}"
         self.zip_path = self.base_folder / "bronze" / self.source_name / f"{self.source_name}_files.zip"
         
-        # Dynamic Schema Configuration
         self.columns = columns or self.DEFAULT_COLUMNS
         self.essential_columns = essential_columns or self.ESSENTIAL_METADATA_COLUMNS
         
-        # Ensure target data directories exist before loading or saving
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
         self.zip_path.parent.mkdir(parents=True, exist_ok=True)
         
         self.df = self._load_state()
 
-        # Session Setup (for reuse, headers, and pooling)
+        # Dynamic session setup
+        self.session = None
+        self._reset_session()
+
+    def _get_browser_headers(self, referer: Optional[str] = None) -> Dict[str, str]:
+        """Generates realistic browser-like headers with local context and optional navigation."""
+        ua = random.choice(self.USER_AGENTS)
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            # Standard localized language priority for Belgian/Dutch targets
+            "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0"
+        }
+        if referer:
+            headers["Referer"] = referer
+            headers["Sec-Fetch-Site"] = "same-origin"
+        return headers
+
+    def _reset_session(self, referer: Optional[str] = None) -> None:
+        """Tears down current session and initializes a clean environment to bypass cookie tracking."""
+        self.logger.info("Purging requests session: resetting cookie Jar and rotating fingerprint...")
+        if hasattr(self, "session") and self.session:
+            try:
+                self.session.close()
+            except Exception:
+                pass
         self.session = requests.Session()
-        self.user_agent = random.choice(self.USER_AGENTS)
-        self.session.headers.update({"User-Agent": self.user_agent})
+        self.session.headers.update(self._get_browser_headers(referer=referer))
+
+    def _is_block_page(self, response: requests.Response) -> bool:
+        """
+        Determines if a block page occurred. Utilizes structural markers rather
+        than broad keywords to prevent false positives when scraping academic topics.
+        """
+        if response.status_code in [403, 503]:
+            return True
+            
+        if response.status_code == 200:
+            body = response.text.lower()
+            
+            # Structural markers indicating verified verification checks or challenges
+            cloudflare_markers = [
+                "challenge-running", "cf-browser-verification", "just a moment...",
+                "cf-cookie-error", "cloudflare ray id"
+            ]
+            captcha_markers = [
+                "g-recaptcha", "h-captcha", "recaptcha-token", "captcha challenge"
+            ]
+            
+            if any(marker in body for marker in cloudflare_markers) or any(marker in body for marker in captcha_markers):
+                return True
+                
+        return False
 
     def _load_state(self, force: bool = False) -> pd.DataFrame:
         """Loads existing state or initializes a new DataFrame using configured columns."""
@@ -123,7 +179,6 @@ class BaseScraper:
             self.logger.info(f"Loading existing data state from {self.data_path}")
             try:
                 df = pd.read_csv(self.data_path, sep=self.separator)
-                # Ensure all configured columns are present
                 for col in self.columns:
                     if col not in df.columns:
                         df[col] = None
@@ -140,12 +195,26 @@ class BaseScraper:
         self.logger.info(f"State saved to {self.data_path}")
 
     def _request(self, url: str, timeout: int = 30, retries: int = 3, **kwargs) -> Optional[requests.Response]:
-        """Wrapper method with dynamic delays, 429 auto-backoff, and hard 403 exits."""
-        # Track how many times we've paused for a 429 during this single request
+        """Wrapper method with dynamic delays, dynamic referers, 429 back-off, and self-healing blocks."""
         rate_limit_waits = 0
         max_rate_limit_waits = 2 
 
         for attempt in range(retries):
+            # Dynamic referer extraction
+            if "headers" not in kwargs:
+                parsed_url = requests.utils.urlparse(url)
+                host = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                referer = host
+                
+                # Check for pagination patterns and generate a sequential Referer path
+                page_match = re.search(r"[?&]page=(\d+)", url)
+                if page_match:
+                    curr_page = int(page_match.group(1))
+                    if curr_page > 0:
+                        referer = url.replace(f"page={curr_page}", f"page={curr_page - 1}")
+                
+                kwargs["headers"] = self._get_browser_headers(referer=referer)
+
             delay = random.uniform(self.min_delay, self.max_delay)
             self.logger.debug(f"Sleeping for {delay:.2f} seconds before request...")
             time.sleep(delay)
@@ -153,20 +222,33 @@ class BaseScraper:
             try:
                 response = self.session.get(url, timeout=timeout, **kwargs)
                 
-                # --- FAILSAFE 1: Hard Firewall Block (Exit Immediately) ---
-                if response.status_code == 403 or "captcha" in response.text.lower() or "cloudflare" in response.text.lower():
+                # --- FAILSAFE 1: Firewall Block Detected (Cool-down recovery) ---
+                if self._is_block_page(response):
                     self.logger.critical(f"HARD BLOCK DETECTED on URL: {url} (Status: {response.status_code})")
-                    raise LockoutException("The scraper was hard-blocked by the host server's firewall.")
+                    
+                    if self.cool_down_count < self.max_cool_downs:
+                        self.cool_down_count += 1
+                        wait_time = self.cool_down_duration * self.cool_down_count  # Scales on repeated blocks
+                        self.logger.warning(
+                            f"Initiating self-healing block recovery (Attempt {self.cool_down_count}/{self.max_cool_downs}). "
+                            f"Sleeping for {wait_time} seconds to let the host block cool down..."
+                        )
+                        time.sleep(wait_time)
+                        
+                        # Reset Session entirely to drop flagged fingerprints and cookies
+                        self._reset_session()
+                        continue
+                    else:
+                        raise LockoutException("The scraper was hard-blocked and exceeded maximum cool-down recovery attempts.")
 
-                # --- FAILSAFE 2: Temporary Rate Limit (Pause & Wait) ---
+                # --- FAILSAFE 2: Temporary Rate Limit (429 Back-off) ---
                 if response.status_code == 429:
                     rate_limit_waits += 1
                     if rate_limit_waits > max_rate_limit_waits:
                         raise LockoutException("Aborted: Hit the rate limit repeatedly on a single URL.")
 
-                    # Look for the server's suggested wait time, default to 5 minutes (300s)
                     retry_after = response.headers.get("Retry-After")
-                    wait_time = 300  # 5 minutes
+                    wait_time = 300
                     if retry_after:
                         try:
                             wait_time = int(retry_after)
@@ -175,14 +257,13 @@ class BaseScraper:
                     
                     self.logger.warning(
                         f"Rate limit (429) detected on {url}. "
-                        f"Sleeping for {wait_time} seconds to let the block expire..."
+                        f"Sleeping for {wait_time} seconds before retrying..."
                     )
                     time.sleep(wait_time)
-                    continue  # Re-run this loop iteration to retry the request
+                    continue
 
                 # Reset consecutive failure tracking on success
                 self.consecutive_failures = 0
-                
                 response.raise_for_status()
                 return response
 
@@ -313,7 +394,6 @@ class BaseScraper:
                     with zipfile.ZipFile(self.zip_path, "r") as zipf:
                         existing_zip_files = {Path(f).stem for f in zipf.namelist()}
 
-                # Mask items that have a download link but haven't been successfully downloaded yet
                 mask = (self.df["download_link"].notna()) & (self.df["downloaded"] != True)
                 to_download = self.df[mask].index
 
@@ -525,7 +605,7 @@ class HBOScraper(BaseScraper):
 
     def _scrape_item_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         # Define local cache paths first (Relative to the base folder we resolved)
-        html_dir = self.base_folder / "raw_data" / self.source_name / "raw_html"
+        html_dir = self.base_folder / "bronze" / self.source_name / "raw_html"
         html_dir.mkdir(parents=True, exist_ok=True)
         item_id = hashlib.md5(url.encode()).hexdigest()[:12]
         html_path = html_dir / f"{item_id}.html"
@@ -707,6 +787,9 @@ class HBOScraper(BaseScraper):
         return dutch_abstract
 
 
+
+
+
 class ScriptiebankScraper(BaseScraper):
     DEFAULT_COLUMNS = [
         "page_link",
@@ -735,20 +818,57 @@ class ScriptiebankScraper(BaseScraper):
         )
         self.base_url = 'https://scriptiebank.be'
         self.url_template = 'https://scriptiebank.be/?page={page_num}'
-        self.thesis_url_pattern = re.compile(r"https://scriptiebank\.be/scriptie/\d{4}/[a-zA-Z0-9_:-]+")
+        self.thesis_url_pattern = re.compile(r'/scriptie/\d{4}/[a-zA-Z0-9_:-]+')   #re.compile(r"https://scriptiebank\.be/scriptie/\d{4}/[a-zA-Z0-9_:-]+")
         self.download_pattern = re.compile(r"/file/\d+/download\?token=[a-zA-Z0-9_-]+")
 
     def _get_item_id(self, row: pd.Series) -> str:
         author_slug = f"{str(row['first_name']).lower()}_{str(row['last_name']).lower()}".replace(" ", "_")
         return f"{author_slug}_{row.name}"
 
+    def _parse_thesis_text(self, soup: BeautifulSoup) -> Optional[Dict[str, List[str]]]:
+        """
+        Parses the sequence of <h*> and <p> tags inside the thesis text container
+        into a structured dictionary mapping headers to paragraphs.
+        """
+        # Find the container (handles both class variants found in the markup)
+        container = soup.select_one("div.thesis__text, div.thesis_text")
+        if not container:
+            return None
+
+        # Find all header and paragraph tags in their exact document order
+        elements = container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        result = {}
+        current_key = None
+
+        for elem in elements:
+            # If we hit a header tag
+            if elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                header_text = elem.get_text().strip()
+                if header_text:  # Only treat as a key if it actually contains text
+                    current_key = header_text
+                    if current_key not in result:
+                        result[current_key] = []
+            
+            # If we hit a paragraph tag
+            elif elem.name == 'p':
+                # get_text() automatically strips inner tags like <em> without losing text content
+                p_text = elem.get_text().strip()
+                if p_text:  # Skip empty paragraphs
+                    # If we encounter a paragraph before any header, assign it to 'intro_added'
+                    if current_key is None:
+                        current_key = "intro_added"
+                        result[current_key] = []
+                    result[current_key].append(p_text)
+
+        return result if result else None
+    
     def _scrape_all_item_urls(self) -> None:
         page = 0
         patience = 0
         existing_urls = set(self.df['page_link'].dropna())
         previous_page_urls = set()
 
-        while patience <= 3:
+        while patience <= 2:
             url = self.url_template.format(page_num=page)
             self.logger.info(f"Requesting page list: {url}")
 
@@ -760,26 +880,33 @@ class ScriptiebankScraper(BaseScraper):
                 continue
 
             found_urls_on_page = self.thesis_url_pattern.findall(response.text)
-            current_page_urls = set(found_urls_on_page)
+            
+            # Convert any relative URLs to absolute URLs immediately
+            absolute_page_urls = set()
+            for page_url in found_urls_on_page:
+                if page_url.startswith("http"):
+                    absolute_page_urls.add(page_url)
+                else:
+                    # Prepend base url if relative
+                    absolute_page_urls.add(f"{self.base_url}{page_url}")
 
-            if not current_page_urls:
+            if not absolute_page_urls:
                 patience += 1
                 self.logger.info(f"No URLs found on page {page}. Patience: {patience}/4")
                 page += 1
                 continue
 
-            if previous_page_urls and previous_page_urls == current_page_urls:
+            if previous_page_urls and previous_page_urls == absolute_page_urls:
                 self.logger.warning(
                     f"Pagination ceiling reached on page {page} (identical page items). "
                     f"Breaking current query loop."
                 )
                 break
 
-            previous_page_urls = current_page_urls
-            patience = 0
+            previous_page_urls = absolute_page_urls
             new_rows = []
 
-            for full_url in current_page_urls:
+            for full_url in absolute_page_urls:
                 if full_url not in existing_urls:
                     new_rows.append({
                         "page_link": full_url,
@@ -793,21 +920,24 @@ class ScriptiebankScraper(BaseScraper):
                 self.df = pd.concat([self.df, new_df], ignore_index=True)
                 self.logger.info(f"Added {len(new_rows)} new URLs from page {page}.")
                 self._save_state()
+                patience = 0 
+            else:
+                patience += 1 
+                self.logger.info(f"No new URLs found on page {page}. Patience: {patience}/4")
 
             page += 1
         
         self.logger.info(f"URL Crawl finished. Current unique entries in database: {len(self.df)}")
 
+
     def _scrape_item_metadata(self, url: str) -> Optional[Dict[str, Any]]:
-        # Define local cache paths first (Relative to the base folder we resolved)
-        html_dir = self.base_folder / "raw_data" / self.source_name / "raw_html"
+        html_dir = self.base_folder / "bronze" / self.source_name / "raw_html"
         html_dir.mkdir(parents=True, exist_ok=True)
         url_hash = hashlib.md5(url.encode()).hexdigest()
         html_path = html_dir / f"{url_hash}.html"
 
         html_content = None
 
-        # Check if the raw HTML was already downloaded locally
         if html_path.exists():
             self.logger.info(f"Using locally cached HTML for {url}")
             try:
@@ -815,7 +945,6 @@ class ScriptiebankScraper(BaseScraper):
             except Exception as e:
                 self.logger.error(f"Failed to read local HTML file {html_path}: {e}")
 
-        # If no local copy exists, make the network request
         if not html_content:
             response = self._request(url)
             if not response:
@@ -863,7 +992,8 @@ class ScriptiebankScraper(BaseScraper):
                 "promoter": "; ".join(promoters_list) if promoters_list else None,
                 "themes": "; ".join([theme.get_text() for theme in soup.select('div.thesis__themes--item a')]) or None,
                 "keywords": "; ".join([keyword.get_text() for keyword in soup.select('div.thesis__keywords--item a')]) or None,
-                "text_homepage": " ".join([text for tag in soup.select('div.thesis__text p, div.thesis_text h3') if (text:=tag.get_text(strip=True))]) or None,
+                # Assign the parsed structured dictionary here
+                "text_homepage": self._parse_thesis_text(soup),
                 "page_link": url,
                 "download_link": self.base_url + download_match.group(0) if download_match else None
             }

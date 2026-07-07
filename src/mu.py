@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from tqdm import tqdm
 import mimetypes
 from rapidfuzz import process, fuzz
+from collections import defaultdict
     
 # ==============================================================================
 #  IO
@@ -238,8 +239,6 @@ def ensure_dir_for_file(file_path: str):
 # ==============================================================================
 #  data structures
 # ==============================================================================
-class DFCheck():
-    pass
 
 
 
@@ -895,8 +894,17 @@ class SchemaEnforcer:
             elif dtype == 'string':
                 self.df[col] = self.df[col].map(lambda x: self._clean_scalar_str(x, col))
             elif dtype in ['int', 'float', 'number']:
+                # Generate a vectorized mask of matching strings
+                str_series = self.df[col].astype(str).str.strip()
+                garbage_mask = str_series.str.match(self.garbage_regex, na=False)
+                
+                # Exclude protected values from the vectorized garbage mask
                 if col in self.protected_values:
-                     self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
+                    protected_mask = str_series.isin(self.protected_values[col])
+                    garbage_mask = garbage_mask & ~protected_mask
+                    
+                # Replace garbage with NaN in one step, then parse remaining values
+                self.df.loc[garbage_mask, col] = np.nan
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
             elif dtype in ['date', 'datetime']:
                 if col in self.protected_values:
@@ -1284,7 +1292,7 @@ class DataFrameCleaner:
                 }
 
         if verbose and report:
-            self._print_report(report) # Moved printing to a helper for cleanliness
+            self._print_report(report)
         return report
     
     def check_missing_values(self):
@@ -1521,10 +1529,6 @@ class DataFrameCleaner:
         return self
 
     def enforce_schema(self, schema_dict, protected_values=None):
-        """
-        The Master Cleaning Function. 
-        Replaces: strip_whitespace, standardize_missing_values, and unify_na_values.
-        """
         enforcer = SchemaEnforcer(self.df, self.na_placeholders, protected_values)
         self.df = enforcer.apply(schema_dict)
         return self
@@ -1569,7 +1573,7 @@ class DataFrameCleaner:
         return self
     
     # ---------------------------------------------------------
-    # DEDUPLICATION SUITE
+    # DEDUPLICATION
     # ---------------------------------------------------------
 
     def check_duplicates(self):
@@ -2008,11 +2012,11 @@ class DataFrameCleaner:
     # --- 3. PIPELINE ---
     #TODO 
     def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False, interactive=True):
+        self.clean_column_names()
+        
         # 1. Diagnostic & Remediation
         print("\n--- Pipeline Start: Pre-Flight Check ---")
         print('Looking for mixed types')
-        # This will print the report AND ask you what to do
-        # It returns a dict like {'authors': 'list', 'year': 'int'}
         mixed_type_fixes = self.resolve_mixed_types(interactive=interactive)
         # 2. Infer Base Schema
         detected_schema = self.auto_infer_schema()
@@ -2030,10 +2034,10 @@ class DataFrameCleaner:
             detected_schema.update(schema)
         
         # 4. Clean
-        self.clean_column_names().enforce_schema(detected_schema, protected_values)
+        self.enforce_schema(detected_schema, protected_values)
         if drop_empty_cols: self.drop_missing_cols()
-        
-        return self.drop_duplicates().convert_data_types_arrow().summarize()
+        self.drop_duplicates().convert_data_types_arrow().summarize()
+        return self.df
     
     def save_parquet(self, path):
         if path:
