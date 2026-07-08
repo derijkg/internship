@@ -696,570 +696,449 @@ class CorpusManager:
         # include exclude list voor placeholders + specific placeholders
         # per colom # unique waarden
         # 
+import re
+import ast
+import logging
+from pathlib import Path
 import pandas as pd
 import numpy as np
-import re
-from collections import Counter
 import pyarrow as pa
-import ast
+import pyarrow.compute as pc
 
-class SchemaEnforcer:
-    def __init__(self, df, regex_patterns=None, protected_values=None):
-        self.df = df
-        # Regex patterns to identify "garbage" values that act as Nulls
+try:
+    from rapidfuzz import process, fuzz
+except ImportError:
+    try:
+        from fuzzywuzzy import process, fuzz
+    except ImportError:
+        process, fuzz = None, None
+
+
+#TODO allow for csv or parquet output
+#TODO check deduplication
+#TODO check _prune
+#TODO check other pruning like function
+#TODO 
+
+# dfcleaner unified with schemaenforcer
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("RobustDataFrameCleaner")
+
+
+class DataFrameCleaner:
+    """
+    A unified class that combines data cleaning, schema enforcement, structural auditing,
+    and deduplication on Pandas DataFrames (including PyArrow backends).
+    """
+
+    def __init__(self, data, regex_patterns=None, protected_values=None):
+        self.stats = {}
+        self.true_vals = {'y', 'yes', 't', 'true', '1', 'on'}
+        self.false_vals = {'n', 'no', 'f', 'false', '0', 'off'}
+
+        if isinstance(data, pd.DataFrame):
+            self.df = data.copy()
+            self._log_info("DataFrame cleaner initialized, working on a copy.")
+        elif isinstance(data, (Path, str)):
+            try:
+                path = Path(data)
+            except Exception as e:
+                raise ValueError(f"Could not convert string to path: {e}")
+            
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {path}")
+            if path.suffix.lower() != '.parquet':
+                raise ValueError(f"Input file must be a .parquet file, received: {path.suffix}")
+
+            self.df = pd.read_parquet(path, engine='pyarrow', dtype_backend='pyarrow')
+            self._log_info(f"DataFrame cleaner initialized from file: {path.name}")
+        else:
+            raise TypeError("Initialization parameter 'data' must be either a pandas DataFrame or a valid Path/str pointing to a Parquet file.")
+
         if regex_patterns:
             self.garbage_regex = re.compile(regex_patterns)
         else:
             patterns = [
-                r'(?i)^nan$',  # Case insensitive 'nan'
+                r'(?i)^nan$',
                 r'(?i)^(?:n\/?a|null|none|<none>|not reported|unknown|undefined|missing)$',
-                r'^(?:-+$|/+$)',  # Dashes or slashes only
-                r'^\?+$',         # Question marks
-                r'^(?:-99|-9999|999|9999)$', # Common numeric placeholders
+                r'^(?:-+$|/+$)',
+                r'^\?+$',
+                r'^(?:-99|-9999|999|9999)$',
             ]
             combined_pattern = r'^(?:' + '|'.join(patterns) + r')$'
             self.garbage_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
-        
-        # Track detailed statistics
-        # Structure: {col: {'total': 0, 'placeholders': 0, 'mismatch': 0, 'examples': []}}
-        self.stats = {} 
-        
+
+        self.na_placeholders = self.garbage_regex.pattern
         self.protected_values = {k: set(map(str, v)) for k, v in (protected_values or {}).items()}
-        self.true_vals = {'y', 'yes', 't', 'true', '1', 'on'}
-        self.false_vals = {'n', 'no', 'f', 'false', '0', 'off'}
+
+        pd.set_option('display.max_rows', 100)
+
+    # =========================================================================
+    # UNIFORM PRINT & DISPLAY HELPERS
+    # =========================================================================
+
+    def _print_header(self, title: str):
+        border = "=" * 80
+        print(f"\n{border}\n{title.center(80)}\n{border}")
+
+    def _log_info(self, msg: str):
+        logger.info(msg)
+
+    def _log_warning(self, msg: str):
+        logger.warning(msg)
+
+    # =========================================================================
+    # INTERNAL CLEANING & ENFORCING LOGIC (Merged from SchemaEnforcer)
+    # =========================================================================
 
     def _is_garbage(self, val, col_name=None):
-        """Row-level check used inside apply/map functions."""
-        if val is None or val is pd.NA: return True
-        if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val): return True
+        if val is None or val is pd.NA:
+            return True
+        if isinstance(val, (float, int, np.float64, np.int64)) and np.isnan(val):
+            return True
 
         s_val = str(val).strip()
-        if not s_val: return True
+        if not s_val:
+            return True
         if col_name and col_name in self.protected_values:
             if s_val in self.protected_values[col_name]:
-                return False 
-        if self.garbage_regex.match(s_val): return True
+                return False
+        if self.garbage_regex.match(s_val):
+            return True
         return False
-    
-    # --- Cleaning Functions ---
+
     def _prune_empty(self, obj):
-        """Recursively removes empty structures."""
-        # keeps position by adding none
         if isinstance(obj, list):
             cleaned = [self._prune_empty(x) for x in obj]
             if all(x is None for x in cleaned):
                 return None
             return cleaned
-
-        # agressive: removes key, should work with pyarrow
         elif isinstance(obj, dict):
             cleaned = {k: self._prune_empty(v) for k, v in obj.items()}
             cleaned = {k: v for k, v in cleaned.items() if v is not None}
             return cleaned if cleaned else None
-        # Base case
         return None if self._is_garbage(obj) else obj
     
+    def _parse_string_structure(self, val):
+        if not isinstance(val, str):
+            return val
+        val_stripped = val.strip()
+        if val_stripped.startswith(('[', '{')):
+            try:
+                import json
+                return json.loads(val_stripped)
+            except Exception:
+                try:
+                    return ast.literal_eval(val_stripped)
+                except Exception:
+                    pass
+        return val
+
     def _clean_complex(self, val, expected_type, col_name):
-        if self._is_garbage(val, col_name): return None
-        if isinstance(val, np.ndarray): val = val.tolist()
+        if self._is_garbage(val, col_name): 
+            return None
+        if isinstance(val, np.ndarray): 
+            val = val.tolist()
+        
         if isinstance(val, str):
-            try: val = ast.literal_eval(val)
-            except: return None
+            val = self._parse_string_structure(val)
+            if isinstance(val, str): # Parsing failed to resolve string into a container; discard element
+                return None
+                
         if isinstance(val, expected_type):
             return self._prune_empty(val)
         else:
             if expected_type is list and val is not None:
-                print(f'UNEXPECTED DTYPE: {col_name}: {val}\nAttempting recovery through listing value.')
+                self._log_warning(f"UNEXPECTED DTYPE: {col_name}: {val}\nAttempting recovery through listing value.")
                 new_val = [val]
                 return self._prune_empty(new_val)
             else:
-                print(f'UNEXPECTED DTYPE: {col_name}: {val}\nIrrecoverable: {expected_type} value set to None')
+                self._log_warning(f"UNEXPECTED DTYPE: {col_name}: {val}\nIrrecoverable: {expected_type} value set to None")
                 return None
-    
+            
+
     def _clean_bool(self, val, col_name):
-        if self._is_garbage(val, col_name): return None
-        if isinstance(val, bool): return val
+        if self._is_garbage(val, col_name):
+            return None
+        if isinstance(val, bool):
+            return val
         if isinstance(val, (int, float)):
-            if val == 1: return True
-            if val == 0: return False
+            if val == 1:
+                return True
+            if val == 0:
+                return False
             return None
         if isinstance(val, str):
             s = val.strip().lower()
-            if s in self.true_vals: return True
-            if s in self.false_vals: return False
+            if s in self.true_vals:
+                return True
+            if s in self.false_vals:
+                return False
         return None
-    
+
     def _clean_scalar_str(self, val, col_name):
-        # 1. Immediate Garbage Check
-        if self._is_garbage(val, col_name): return None
+        if self._is_garbage(val, col_name): 
+            return None
         
-        # 2. Handle PyArrow Scalars (Unbox to Python objects)
         if hasattr(val, 'as_py'):
             val = val.as_py()
 
-        # 3. String Recovery (Parse "['text']" or "{'text'}")
         if isinstance(val, str):
-            val = val.strip()
-            if val.startswith(('[', '{')):
-                try:
-                    parsed = ast.literal_eval(val)
-                    # Recursively clean the parsed object
-                    return self._clean_scalar_str(parsed, col_name)
-                except:
-                    pass # Keep as string if parsing fails
+            parsed = self._parse_string_structure(val)
+            if parsed is not val:  # Unified parser successfully parsed the string to container structure
+                return self._clean_scalar_str(parsed, col_name)
             
-            if self._is_garbage(val, col_name): return None
+            if self._is_garbage(val, col_name): 
+                return None
             return val
 
-        # 4. Container Recovery (List, Tuple, Array, AND SET)
-        # Added 'set' here to fix the volume issue: {9141} -> 9141
         if isinstance(val, (list, tuple, np.ndarray, set)):
-            # Convert to list for consistent indexing
             if isinstance(val, (np.ndarray, set)): 
                 val = list(val)
             
-            # Filter out internal garbage
             valid_items = [v for v in val if not self._is_garbage(v, col_name)]
             
             if not valid_items:
                 return None
             
-            # RECOVERY STRATEGY: Take the first valid item
-            # Recursively clean it (handles [['Text']])
             return self._clean_scalar_str(valid_items[0], col_name)
 
-        # 5. Dict Recovery (Still unsafe to guess key, drop)
         if isinstance(val, dict):
             return None
 
-        # 6. Numeric/Bool to String
         return str(val).strip()
 
-
-    # --- Analysis Helper (UPDATED) ---
     def _scan_placeholders(self, col):
         """
-        Vectorized scan to count AND identify regex matches.
-        Returns: (count, list_of_unique_matches)
+        Vectorized lookup scan to count and record unique occurrences of 
+        pre-defined NA placeholder configurations in a given column.
         """
         try:
-            # 1. Get non-null values as strings
             s = self.df[col].dropna().astype(str).str.strip()
-            if s.empty: return 0, []
+            if s.empty:
+                return 0, []
 
-            # 2. Exclude Protected Values
             if col in self.protected_values:
                 mask_protected = s.isin(self.protected_values[col])
                 s = s[~mask_protected]
 
-            if s.empty: return 0, []
+            if s.empty:
+                return 0, []
 
-            # 3. Find Matches
-            # Get boolean mask of garbage
             mask_garbage = s.str.match(self.garbage_regex)
-            
-            # Filter the series to just the garbage
             garbage_values = s[mask_garbage]
-            
             count = garbage_values.shape[0]
-            
-            # Get unique examples (limit to top 5 to avoid massive lists)
-            if count > 0:
-                examples = garbage_values.unique().tolist()
-            else:
-                examples = []
-                
+
+            examples = garbage_values.unique().tolist() if count > 0 else []
             return count, examples
-        except:
+        except Exception:
             return 0, []
 
-    def apply(self, schema):
-        print(f"--- Enforcing Schema on {len(schema)} columns ---")
-        
-        for col, dtype in schema.items():
-            if col not in self.df.columns: continue
-            
-            initial_valid = self.df[col].notna().sum()
-            
-            # NEW: Get count AND specific values found
-            n_placeholders, found_examples = self._scan_placeholders(col)
+    # =========================================================================
+    # AUDITING & DIAGNOSTICS (Inspect methods)
+    # =========================================================================
 
-            # --- Transformation ---
-            if dtype == 'list':
-                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list, col))
-            elif dtype == 'dict':
-                self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict, col))
-            elif dtype == 'bool':
-                self.df[col] = self.df[col].map(lambda x: self._clean_bool(x, col))
-            elif dtype == 'string':
-                self.df[col] = self.df[col].map(lambda x: self._clean_scalar_str(x, col))
-            elif dtype in ['int', 'float', 'number']:
-                # Generate a vectorized mask of matching strings
-                str_series = self.df[col].astype(str).str.strip()
-                garbage_mask = str_series.str.match(self.garbage_regex, na=False)
-                
-                # Exclude protected values from the vectorized garbage mask
-                if col in self.protected_values:
-                    protected_mask = str_series.isin(self.protected_values[col])
-                    garbage_mask = garbage_mask & ~protected_mask
-                    
-                # Replace garbage with NaN in one step, then parse remaining values
-                self.df.loc[garbage_mask, col] = np.nan
-                self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-            elif dtype in ['date', 'datetime']:
-                if col in self.protected_values:
-                     self.df[col] = self.df[col].apply(lambda x: np.nan if self._is_garbage(x, col) else x)
-                self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
-
-            final_valid = self.df[col].notna().sum()
-            
-            # --- Stats Calculation ---
-            total_cleaned = initial_valid - final_valid
-            n_mismatch = max(0, total_cleaned - n_placeholders)
-            
-            # Consistency check
-            if total_cleaned < n_placeholders:
-                n_placeholders = total_cleaned
-
-            if total_cleaned > 0:
-                self.stats[col] = {
-                    'total': total_cleaned,
-                    'placeholders': n_placeholders,
-                    'mismatch': n_mismatch,
-                    'examples': found_examples # Store the specific values found
-                }
-
-        # --- Print Detailed Report (UPDATED) ---
-        if self.stats:
-            print("\n[Cleaning Report] Values converted to NaN:\n")
-            # Adjusted widths to fit the new column
-            print(f"{'Column':<20} | {'Total':<6} | {'Regex Match':<11} | {'Type Mismatch':<13} | {'Detected Garbage'}")
-            print("-" * 100)
-            
-            for col, data in self.stats.items():
-                # Format the examples list as a string, truncate if too long
-                ex_str = str(data['examples'])
-                if len(ex_str) > 40: 
-                    ex_str = ex_str[:37] + "..."
-                
-                print(f"{col:<20} | {data['total']:<6} | {data['placeholders']:<11} | {data['mismatch']:<13} | {ex_str}")
-        else:
-            print("\n[Cleaning Report] No values were converted to NaN.\n")
-
-        return self.df
-    
-
-class DataFrameCleaner:
-    """
-    A class to encapsulate a pandas DataFrame and apply a series of
-    common cleaning operations using method chaining.
-    """
-
-    def __init__(self, data):
-        # Create a copy to avoid setting warnings or modifying the original variable unexpectedly
-        if isinstance(data, pd.DataFrame):
-            self.df = data.copy()
-            print('Dataframe cleaner initialized, working on copy')
-        if isinstance(data, (Path, str)):
-            try: path = Path(data)
-            except: raise ValueError(f'couldnt convert string to path, invalid path')
-            if not path.exists(): raise FileNotFoundError(f'file not found {path}')
-            if path.suffix.lower() != '.parquet': raise ValueError(f'Input parquet file. got {path.suffix}')
-
-            self.df = pd.read_parquet(path, engine='pyarrow',dtype_backend='pyarrow')
-            print(f'Dataframe cleaner initialized.')
-
-
-
-        pd.set_option('display.max_rows', None)
-        print('Showing all rows, set back with pd.set_option(\'display.max_rows\', 10 idk)')
-
-
-        # Regex patterns to identify "garbage" values that act as Nulls
-        patterns = [
-            r'(?i)^nan$',  # Case insensitive 'nan'
-            r'(?i)^(?:n\/?a|null|none|<none>|not reported|unknown|undefined|missing)$',
-            r'^(?:-+$|/+$)',  # Dashes or slashes only
-            r'^\?+$',         # Question marks
-            r'^(?:-99|-9999|999|9999)$', # Common numeric placeholders
-        ]
-        self.na_placeholders = '|'.join(patterns)
-
-    # HELPERS
-    def _get_placeholders(self, col):
-        """Helper: Returns a list of unique values matching the garbage regex."""
-        try:
-            # Dropna first to avoid nan errors in unique
-            unique_vals = self.df[col].dropna().unique()
-            
-            # Convert only the unique values to string for regex checking
-            u_series = pd.Series(unique_vals).astype(str)
-            
-            # Check pattern match
-            matches = u_series[u_series.str.match(self.na_placeholders, na=False)]
-            
-            if not matches.empty:
-                return matches.tolist()
-        except Exception:
-            return None
-        return None
-    
     def _find_unhashable_columns(self):
-        """
-        Identifies columns that contain complex nested data (Lists, Dicts, Structs, Arrays).
-        Supports both legacy 'object' columns and modern 'ArrowDtype' columns.
-        """
-        import pyarrow as pa
-        
         unhashable_cols = []
-
         for col in self.df.columns:
             dtype = self.df[col].dtype
-
-            # --- STRATEGY 1: Check PyArrow Dtypes (Metadata) ---
             if isinstance(dtype, pd.ArrowDtype):
                 pa_type = dtype.pyarrow_dtype
-                # Check for nested Arrow types
                 if (pa.types.is_list(pa_type) or 
                     pa.types.is_large_list(pa_type) or 
                     pa.types.is_fixed_size_list(pa_type) or 
                     pa.types.is_struct(pa_type) or 
                     pa.types.is_map(pa_type)):
-                    
                     unhashable_cols.append(col)
                     continue
 
-            # --- STRATEGY 2: Check Object Dtypes (Value Inspection) ---
             if pd.api.types.is_object_dtype(dtype):
                 valid = self.df[col].dropna()
                 if not valid.empty:
                     if isinstance(valid.iloc[0], (list, dict, set, np.ndarray)):
                         unhashable_cols.append(col)
-
         return unhashable_cols
-    
+
+    #recursive
     def _analyze_arrow_data(self, array, indent=0):
-            """
-            Helper: Recursively walks through PyArrow DATA arrays.
-            - If List: Flattens it and recurses.
-            - If Struct: Extracts fields and recurses.
-            - If Atomic: Calculates unique counts, gets sample, and formats output.
-            """
-            import pyarrow as pa
-            import pyarrow.compute as pc
+        prefix = " " * indent
+        arrow_type = array.type
+        
+        KEY_WIDTH = 30    
+        TYPE_WIDTH = 15   
+        SAMPLE_WIDTH = 40 
+
+        if pa.types.is_list(arrow_type):
+            print(f"{prefix}- List of:")
+            self._analyze_arrow_data(array.flatten(), indent + 2)
             
-            prefix = " " * indent
-            arrow_type = array.type
-            
-            # --- ALIGNMENT SETTINGS ---
-            # Adjust these to change the visual width of columns
-            KEY_WIDTH = 30    # Width for "  * fieldname:"
-            TYPE_WIDTH = 15   # Width for "int64", "string", etc.
-            COUNT_WIDTH = 15  # Width for "123 unique"
-            SAMPLE_WIDTH = 40 # Width for sample text
-
-            # CASE 1: LIST
-            if pa.types.is_list(arrow_type):
-                print(f"{prefix}- List of:")
-                flattened = array.flatten()
-                self._analyze_arrow_data(flattened, indent + 2)
+        elif pa.types.is_struct(arrow_type):
+            print(f"{prefix}- Object (Dict) with keys:")
+            for field in arrow_type:
+                child_array = array.field(field.name)
+                label = f"{prefix}  * {field.name}:"
                 
-            # CASE 2: STRUCT / DICT
-            elif pa.types.is_struct(arrow_type):
-                print(f"{prefix}- Object (Dict) with keys:")
-                
-                for field in arrow_type:
-                    # Extract the field column
-                    child_array = array.field(field.name)
-                    
-                    # ALIGNMENT FIX: Pad the key name so the next value starts aligned
-                    # We construct the label "  * name:"
-                    label = f"{prefix}  * {field.name}:"
-                    
-                    # If the child is complex, we print the label and newline
-                    if pa.types.is_list(field.type) or pa.types.is_struct(field.type):
-                        print(label) 
-                        self._analyze_arrow_data(child_array, indent + 6)
-                    # If the child is simple, we print the label PADDIED and stay on same line
-                    else:
-                        # Use ljust to ensure the Type starts at the same horizontal position
-                        # We subtract the indent from KEY_WIDTH to keep alignment relative to nesting
-                        print(f"{label.ljust(KEY_WIDTH + indent)}", end="")
-                        self._analyze_arrow_data(child_array, indent=0)
-
-            # CASE 3: ATOMIC -> STATS & SAMPLE
-            else:
-                total_count = len(array)
-                if total_count == 0:
-                    print(f"{arrow_type} (Empty)")
-                    return
-
-                # 1. Get Stats
-                unique_vals = pc.unique(array)
-                n_unique = len(unique_vals)
-                
-                ratio = n_unique / total_count
-                if n_unique == 1: cat_label = "CONSTANT"
-                elif ratio > 0.9: cat_label = "ID/TEXT"
-                elif ratio < 0.1 or n_unique < 50: cat_label = "CATEGORY"
-                else: cat_label = "DENSE"
-
-                # 2. Get Sample (Safely)
-                # Slice first 50 items to find a non-null without scanning everything
-                sample_slice = array.slice(0, 50) 
-                non_null_slice = sample_slice.drop_null()
-                
-                if len(non_null_slice) > 0:
-                    val = non_null_slice[0].as_py() # Convert to Python object
-                    val_str = str(val).replace('\n', ' ') # Remove newlines for clean print
-                    if len(val_str) > SAMPLE_WIDTH - 3: 
-                        val_str = val_str[:SAMPLE_WIDTH-3] + "..."
+                if pa.types.is_list(field.type) or pa.types.is_struct(field.type):
+                    print(label) 
+                    self._analyze_arrow_data(child_array, indent + 6)
                 else:
-                    val_str = "NULL"
+                    print(f"{label.ljust(KEY_WIDTH + indent)}", end="")
+                    self._analyze_arrow_data(child_array, indent=0)
+        else:
+            total_count = len(array)
+            if total_count == 0:
+                print(f"{arrow_type} (Empty)")
+                return
 
-                # 3. Format Output (Columns)
-                # If indent is 0, we are inline with a Key, so don't print prefix
-                current_prefix = prefix if indent > 0 else ""
-                
-                # Formatted strings using f-string padding
-                # < : Left Align, > : Right Align
-                type_str = f"{str(arrow_type)}".ljust(TYPE_WIDTH)
-                count_str = f"{n_unique} unique".rjust(10) # e.g. "   5 unique" #TODO where unique counts are below 10 or so, print all possible values
-                sample_str = f"sample: {val_str}".ljust(SAMPLE_WIDTH + 8) # +8 for "sample: " length
+            unique_vals = pc.unique(array)
+            n_unique = len(unique_vals)
+            ratio = n_unique / total_count
+            
+            if n_unique == 1:
+                cat_label = "CONSTANT"
+            elif ratio > 0.9:
+                cat_label = "ID/TEXT"
+            elif ratio < 0.1 or n_unique < 50:
+                cat_label = "CATEGORY"
+            else:
+                cat_label = "DENSE"
 
-                print(f"{current_prefix}{type_str} | {count_str} | {sample_str} | ({cat_label})")
+            sample_slice = array.slice(0, 50).drop_null()
+            if len(sample_slice) > 0:
+                val_str = str(sample_slice[0].as_py()).replace('\n', ' ')
+                if len(val_str) > SAMPLE_WIDTH - 3: 
+                    val_str = val_str[:SAMPLE_WIDTH-3] + "..."
+            else:
+                val_str = "NULL"
+
+            current_prefix = prefix if indent > 0 else ""
+            type_str = f"{str(arrow_type)}".ljust(TYPE_WIDTH)
+            count_str = f"{n_unique} unique".rjust(12)
+            sample_str = f"sample: {val_str}".ljust(SAMPLE_WIDTH + 8)
+
+            print(f"{current_prefix}{type_str} | {count_str} | {sample_str} | ({cat_label})")
 
     def _get_python_type_name(self, val):
-        """Helper to get a clean string representation of a type."""
         return type(val).__name__
 
+    def summarize(self, exclude_cols=None, subset=None):
+        """
+        Prints a structured summary table of the working DataFrame, reflecting types,
+        missing counts, percentage nulls, observed placeholders, and data samples.
+        """
+        self._print_header(f"DataFrame Summary (Shape: {self.df.shape[0]} rows x {self.df.shape[1]} cols)")
+        
+        print("\n--- DUPLICATE COUNT AUDIT ---")
+        self.check_duplicates(exclude_cols=exclude_cols, subset=subset)
+        print("-" * 80)
 
+        # Build clean structural overview DataFrame
+        summary = pd.DataFrame(index=self.df.columns)
+        summary['missing#'] = self.df.isna().sum()
+        summary['missing%'] = (self.df.isna().mean() * 100).round(2)
+        summary['dtypes'] = self.df.dtypes.astype(str)
 
-    # --- 1. CHECKING METHODS (Inspect without modifying) ---
-    def summarize(self):
-            """
-            Prints a comprehensive summary table combining dtypes, missing values, 
-            samples, and detected placeholder garbage values.
-            """
-            print(f"\n--- DataFrame Summary (Shape: {self.df.shape} (rows, cols)) ---")
-            print(f"\nDUPLICATES")
-            self.check_duplicates()
-            print('-'*20)
-            print(f"\nGetting dataframe overview...")
-            summary = pd.DataFrame(index=self.df.columns)
-            summary['missing#'] = self.df.isna().sum()
-            summary['missing%'] = (self.df.isna().mean() * 100).round(2)
-            summary['dtypes'] = self.df.dtypes.astype(str)
-
-            unhashable_cols = self._find_unhashable_columns()
-            unique_counts = pd.Series(0, index=self.df.columns, dtype='int64')
-            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
-            if hashable_cols:
-                unique_counts[hashable_cols] = self.df[hashable_cols].nunique(dropna=True)
-                
-            for col in unhashable_cols:
-                unique_counts[col] = -1 # MAYBE CHECK PER ATOMIC VALUE, PLACEHOLDER, TODO
-
-            summary['unique#'] = unique_counts.astype(int)
-            # ----------------------------------
-
-            samples = []
-            found_placeholders = []
+        unhashable_cols = self._find_unhashable_columns()
+        unique_counts = pd.Series(0, index=self.df.columns, dtype='int64')
+        hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
+        if hashable_cols:
+            unique_counts[hashable_cols] = self.df[hashable_cols].nunique(dropna=True)
             
-            for col in self.df.columns:
-                valid_values = self.df[col].dropna()
-                if not valid_values.empty:
-                    val_str = str(valid_values.iloc[0])
-                    samples.append(val_str[:40] + "..." if len(val_str) > 40 else val_str)
-                else:
-                    samples.append(np.nan)
+        for col in unhashable_cols:
+            unique_counts[col] = -1  # Placeholder marker for complex columns
 
-                if col in hashable_cols:
-                    matches = self._get_placeholders(col)
-                    if matches:
-                        found_placeholders.append(str(matches))
-                    else:
-                        found_placeholders.append("")
-                else:
-                    found_placeholders.append("")
+        summary['unique#'] = unique_counts.astype(int)
 
-            summary['sample_val'] = samples
-            summary['placeholders'] = found_placeholders
-
-            order = ['missing#', 'missing%', 'unique#', 'sample_val', 'placeholders', 'dtypes']
-            summary = summary[order]
-    
-            # --- FORCE LEFT ALIGNMENT ---
-            max_len = summary['dtypes'].map(len).max() if not summary.empty else 10
-            
-            # 2. Define a formatter
-            formatters = {
-                'dtypes': lambda x: f"{x:<{max_len}}"
-            }
-
-            # 3. Apply formatter in to_string
-            print(summary.sort_values('dtypes', ascending=False).to_string(formatters=formatters))
-            print('\n')
-            print("-"*20)
-
-            self.audit_mixed_types()
-            print('-'*20)
-
-            if unhashable_cols:
-                print(f"\nChecking unhashable column structures...")
-                self.analyze_structure_recursive()
+        samples = []
+        found_placeholders = []
+        
+        for col in self.df.columns:
+            valid_values = self.df[col].dropna()
+            if not valid_values.empty:
+                val_str = str(valid_values.iloc[0])
+                samples.append(val_str[:40] + "..." if len(val_str) > 40 else val_str)
             else:
-                print('\nNo complex nested columns found.')
-            return self
-    
-    
-    def analyze_structure_recursive(self, sample_size=5000):
-            """
-            Converts unhashable columns to PyArrow arrays to infer the schema
-            AND calculates unique value counts at every level of nesting.
-            """
-            import pyarrow as pa
-            
-            unhashable_cols = self._find_unhashable_columns()
-            if not unhashable_cols:
-                return self
+                samples.append(np.nan)
 
-            print(f"\n--- Deep Structure & Stats (Sample n={sample_size}) ---")
-
-            for col in unhashable_cols:
-                # 1. Get Sample Data
-                valid_data = self.df[col].dropna()
-                if valid_data.empty:
-                    continue
-                
-                # Cap sample size
-                if len(valid_data) > sample_size:
-                    valid_data = valid_data.sample(n=sample_size, random_state=42)
-                
-                print(f"Column '{col}':")
+            if col in hashable_cols:
+                # Optimized logic retrieval
                 try:
-                    # 2. Create PyArrow Array (Holds the actual data in memory)
-                    arrow_array = pa.array(valid_data)
-                    
-                    # 3. Pass the DATA (not just the type) to the helper
-                    self._analyze_arrow_data(arrow_array, indent=2)
-                    
-                except pa.ArrowInvalid:
-                    print(f"  [!] Mixed types detected. Cannot infer strict schema.")
-                except Exception as e:
-                    print(f"  [!] Error: {e}")
-                
-                print("") 
-                
-            print("-----------------------------------------------------\n")
+                    unique_vals = self.df[col].dropna().unique()
+                    u_series = pd.Series(unique_vals).astype(str)
+                    matches = u_series[u_series.str.match(self.na_placeholders, na=False)]
+                    found_placeholders.append(str(matches.tolist()) if not matches.empty else "")
+                except Exception:
+                    found_placeholders.append("")
+            else:
+                found_placeholders.append("")
+
+        summary['sample_val'] = samples
+        summary['placeholders'] = found_placeholders
+
+        order = ['missing#', 'missing%', 'unique#', 'sample_val', 'placeholders', 'dtypes']
+        summary = summary[order]
+
+        # Format printing column sizes explicitly for clean reading
+        max_len = summary['dtypes'].map(len).max() if not summary.empty else 10
+        formatters = {'dtypes': lambda x: f"{x:<{max_len}}"}
+        
+        print("\n--- COLUMN ATTRIBUTES ---")
+        print(summary.sort_values('dtypes', ascending=False).to_string(formatters=formatters))
+        print("-" * 80)
+
+        self.audit_mixed_types()
+        print("-" * 80)
+
+        if unhashable_cols:
+            print("\n--- NESTED COMPLEX DATA STRUCTURES ---")
+            self.analyze_structure_recursive()
+        else:
+            self._log_info("No complex nested columns found in structural layout.")
+        return self
+
+    #TODO useless function just integrate into analyzearrow data???
+    def analyze_structure_recursive(self, sample_size=5000):
+        unhashable_cols = self._find_unhashable_columns()
+        if not unhashable_cols:
             return self
 
-    def get_samples(self, columns=None, number=5):  # add func for str as well as list
+        print(f"\n--- Deep Structure & Stats (Sample size limit: {sample_size}) ---")
+        for col in unhashable_cols:
+            valid_data = self.df[col].dropna()
+            if valid_data.empty:
+                continue
+            
+            if len(valid_data) > sample_size:
+                valid_data = valid_data.sample(n=sample_size, random_state=42)
+            
+            print(f"Column '{col}':")
+            try:
+                arrow_array = pa.array(valid_data)
+                self._analyze_arrow_data(arrow_array, indent=2)
+            except pa.ArrowInvalid:
+                self._log_warning(f"  [!] Mixed type configuration on column '{col}'. Cannot infer strict Arrow schema.")
+            except Exception as e:
+                self._log_warning(f"  [!] Structural parser failure: {e}")
+            print("")
+        return self
+
+    def get_samples(self, columns=None, number=5):
         valid = [c for c in columns or [] if c in self.df.columns]
-        if (invalid := set(columns or []) - set(valid)): print(f"Invalid: {invalid}")
+        invalid = set(columns or []) - set(valid)
+        if invalid:
+            self._log_warning(f"Columns not found in DataFrame index: {invalid}")
+            
         for col in valid:
             s = self.df[col].dropna()
-            print(f"Column: {col}, {type(s.iloc[0])}", *s.sample(min(number, len(s))), "-" * 30, sep="\n") 
+            if s.empty:
+                print(f"Column: {col} is empty.")
+                continue
+            self._print_header(f"Samples for column '{col}' ({type(s.iloc[0]).__name__})")
+            for item in s.sample(min(number, len(s))):
+                print(f" > {item}")
+            print("-" * 40)
         return self
 
     def audit_mixed_types(self, verbose=True):
@@ -1267,13 +1146,15 @@ class DataFrameCleaner:
         candidates = self.df.select_dtypes(include=['object']).columns
         
         for col in candidates:
+            inferred_type = pd.api.types.infer_dtype(self.df[col], skipna=True)
+            if not inferred_type.startswith("mixed"):
+                continue
+
             valid_series = self.df[col].dropna()
             if valid_series.empty:
                 continue
 
             type_series = valid_series.apply(self._get_python_type_name)
-            
-            # 3. Get counts from the series we already created
             type_counts = type_series.value_counts()
             
             if len(type_counts) > 1:
@@ -1292,195 +1173,175 @@ class DataFrameCleaner:
                 }
 
         if verbose and report:
-            self._print_report(report)
+            print("\n--- MIXED DATA TYPE CONFLICTS ---")
+            for col, r_data in report.items():
+                print(f"Column: {col}")
+                print(f"  * Majority Representation: {r_data['majority_type']} ({r_data['majority_pct']:.2f}%)")
+                print(f"  * Outliers Encountered: {r_data['outliers']}")
+                print(f"  * Type Breakdown: {r_data['breakdown']}")
         return report
-    
+
     def check_missing_values(self):
-        """Prints a report of missing values."""
-        # Calculate isna once to save time
         na_counts = self.df.isna().sum()
-        # Filter only columns with missing values
         missing_data = na_counts[na_counts > 0]
         
         if not missing_data.empty:
-            print("\n--- Missing Values Report ---")
-            # Vectorized calculation of percentage
+            self._print_header("Missing Value Verification")
             percentages = (missing_data / len(self.df)) * 100
             report = pd.DataFrame({
                 'Missing Count': missing_data,
-                'Percentage': percentages.round(2)
+                'Percentage (%)': percentages.round(2)
             })
             print(report)
         else:
-            print("\nNo standard missing values (NaN) found.")
+            self._log_info("No missing NaN values detected.")
         return self
-    
-    def auto_infer_schema(self, sample_size=1000):
-            import pyarrow as pa
-            import numpy as np
-            import ast
 
-            inferred = {}
-            # Optimization: Don't sample if df is small
-            sample_size = min(len(self.df), sample_size)
-            print(f"--- Auto-Inferring Schema (Sample n={sample_size}) ---")
 
-            for col in self.df.columns:
-                valid = self.df[col].dropna()
-                if valid.empty: continue
-                
-                if len(valid) > sample_size: 
-                    valid = valid.sample(n=sample_size, random_state=42)
+    def auto_infer_schema(self, sample_pct=0.05, min_sample=1000, max_sample=50000):
+        if self.df.empty:
+            self._log_warning("Working DataFrame is empty. Bypassing schema inference.")
+            return {}
 
-                # --- PHASE 1: Native Checks (Fast) ---
-                if pd.api.types.is_bool_dtype(self.df[col]): 
-                    inferred[col] = 'bool'; continue
-                if pd.api.types.is_integer_dtype(self.df[col]): 
-                    inferred[col] = 'int'; continue
-                if pd.api.types.is_float_dtype(self.df[col]): 
-                    inferred[col] = 'float'; continue
-                if pd.api.types.is_datetime64_any_dtype(self.df[col]): 
-                    inferred[col] = 'datetime'; continue
+        total_rows = len(self.df)
+        calculated_sample = int(total_rows * sample_pct)
+        sample_size = max(min(calculated_sample, max_sample), min_sample)
+        sample_size = min(sample_size, total_rows)
 
-                # --- PHASE 2: Mixed Type Guard (Crucial for Object Columns) ---
-                # If a column contains multiple python types (e.g. str AND int), default to string
-                # to avoid data loss.
-                if pd.api.types.is_object_dtype(self.df[col]):
-                    # We apply type() to get the class of each value
-                    types_found = valid.apply(type).unique()
-                    if len(types_found) > 1:
-                        inferred[col] = 'string'
-                        # Optional: Print warning if you want to know
-                        print(f"  > MIXED TYPE Detected '{col}' as STRING (Mixed Types found)")
-                        continue
+        inferred = {}
+        self._log_info(
+            f"Auto-inferring schema dynamically. Sample size configured to n={sample_size} "
+            f"(calculated from {sample_pct * 100}% of {total_rows} rows)."
+        )
 
-                # --- PHASE 3: Numeric-as-Boolean Check ---
-                if pd.api.types.is_numeric_dtype(self.df[col]):
-                    unique_nums = valid.unique()
-                    # Check if it only contains 0 and 1
-                    if set(unique_nums).issubset({0, 1, 0.0, 1.0}):
-                        inferred[col] = 'bool'
-                        print(f"  > Detected '{col}' as BOOL (Binary Numeric)")
-                        continue
-                    # Fallback to standard numeric
-                    elif pd.api.types.is_integer_dtype(self.df[col]): inferred[col] = 'int'
-                    else: inferred[col] = 'float'
+        for col in self.df.columns:
+            valid = self.df[col].dropna()
+            if valid.empty:
+                continue
+            
+            if len(valid) > sample_size: 
+                valid = valid.sample(n=sample_size, random_state=42)
+
+            if pd.api.types.is_bool_dtype(self.df[col]): 
+                inferred[col] = 'bool'
+                continue
+            if pd.api.types.is_integer_dtype(self.df[col]): 
+                inferred[col] = 'int'
+                continue
+            if pd.api.types.is_float_dtype(self.df[col]): 
+                inferred[col] = 'float'
+                continue
+            if pd.api.types.is_datetime64_any_dtype(self.df[col]): 
+                inferred[col] = 'datetime'
+                continue
+
+            if pd.api.types.is_object_dtype(self.df[col]):
+                inferred_type = pd.api.types.infer_dtype(valid, skipna=True)
+                if inferred_type in ['mixed-integer', 'mixed-integer-float']:
+                    inferred[col] = 'string'
+                    self._log_info(f"  > Mixed numeric profile for '{col}' ({inferred_type}). Assigned fallback target 'string'.")
                     continue
 
-                # --- PHASE 4: Object Inspection ---
-                try:
-                    first_val = valid.iloc[0]
+            if pd.api.types.is_numeric_dtype(self.df[col]):
+                unique_nums = valid.unique()
+                if set(unique_nums).issubset({0, 1, 0.0, 1.0}):
+                    inferred[col] = 'bool'
+                    self._log_info(f"  > Boolean binary structure detected in numeric column: '{col}' -> mapped 'bool'")
+                    continue
+                elif pd.api.types.is_integer_dtype(self.df[col]): 
+                    inferred[col] = 'int'
+                else: 
+                    inferred[col] = 'float'
+                continue
+
+            try:
+                first_val = valid.iloc[0]
+                if hasattr(first_val, 'as_py'):
+                    first_val = first_val.as_py()
+
+                is_complex_object = isinstance(first_val, (list, dict, set, np.ndarray))
+
+                if not is_complex_object:
+                    raw_uniques = pd.Series(valid.unique()).dropna()
+                    unique_vals = raw_uniques.astype(str).str.lower().unique()
                     
-                    # FIX: Handle PyArrow Scalars if data loaded with pyarrow backend
-                    if hasattr(first_val, 'as_py'):
-                        first_val = first_val.as_py()
-
-                    is_complex_object = isinstance(first_val, (list, dict, set, np.ndarray))
-
-                    # --- BOOLEAN DETECTION (String Scalar) ---
-                    if not is_complex_object:
-                        # Convert to string to safely check for 'yes'/'no'
-                        unique_vals = valid.astype(str).str.lower().unique()
+                    if len(unique_vals) <= 10:
+                        u_series = pd.Series(unique_vals)
+                        mask_clean = ~u_series.str.match(self.na_placeholders)
+                        clean_vals = u_series[mask_clean].tolist()
                         
-                        if len(unique_vals) <= 10: 
-                            u_series = pd.Series(unique_vals)
-                            # Filter garbage using regex
-                            mask_clean = ~u_series.str.match(self.na_placeholders)
-                            clean_vals = u_series[mask_clean].tolist()
-                            
-                            if clean_vals:
-                                if set(clean_vals).issubset(self.enforcer.true_vals | self.enforcer.false_vals):
-                                    inferred[col] = 'bool'
-                                    print(f"  > Detected '{col}' as BOOL (Semantic String)")
-                                    continue
+                        if clean_vals and set(clean_vals).issubset(self.true_vals | self.false_vals):
+                            inferred[col] = 'bool'
+                            self._log_info(f"  > Semantic Boolean flags inferred from text: '{col}' -> mapped 'bool'")
+                            continue
 
-                    # --- PHASE 5: Deep Arrow Inference (Complex Types) ---
-                    def normalize(x):
-                        # FIX: Handle Arrow Scalars row-by-row
-                        if hasattr(x, 'as_py'): x = x.as_py()
-                        
-                        if isinstance(x, np.ndarray): return x.tolist()
-                        if isinstance(x, str) and x.strip().startswith(('[','{')):
-                            try: return ast.literal_eval(x)
-                            except: pass
-                        return x
-                    
-                    sample_list = valid.apply(normalize).tolist()
-                    arrow_type = pa.array(sample_list).type
-                    
-                    if pa.types.is_list(arrow_type): inferred[col] = 'list'; print(f"  > Detected '{col}' as LIST")
-                    elif pa.types.is_struct(arrow_type) or pa.types.is_map(arrow_type): inferred[col] = 'dict'; print(f"  > Detected '{col}' as DICT")
-                    else: inferred[col] = 'string'
-
-                except Exception:
+                def normalize(x):
+                    if hasattr(x, 'as_py'): 
+                        x = x.as_py()
+                    if isinstance(x, np.ndarray): 
+                        return x.tolist()
+                    if isinstance(x, str) and x.strip().startswith(('[', '{')):
+                        try: 
+                            return ast.literal_eval(x)
+                        except Exception: 
+                            pass
+                    return x
+                
+                sample_list = valid.apply(normalize).tolist()
+                arrow_type = pa.array(sample_list).type
+                
+                if pa.types.is_list(arrow_type): 
+                    inferred[col] = 'list'
+                elif pa.types.is_struct(arrow_type) or pa.types.is_map(arrow_type): 
+                    inferred[col] = 'dict'
+                else: 
                     inferred[col] = 'string'
-                    
-            return inferred
+            except Exception:
+                inferred[col] = 'string'
+                
+        return inferred
 
 
-    # --- 2. CLEANING METHODS (Modify the DataFrame) ---
-    #def parse_and_flatten(self,pass):
-    #    if isinstance(val, list):
-    #        return val[0] if len(val) > 0 else None
-    #        
-    #    if isinstance(val, str) and val.strip().startswith('['):
-    #        try:
-    #            actual_list = ast.literal_eval(val)
-    #            return actual_list[0] if isinstance(actual_list, list) and len(actual_list) > 0 else None
-    #        except (ValueError, SyntaxError):
-    #           return None         
-    #   return val
+    # =========================================================================
+    # CORE CLEANING OPERATIONS (Modify methods)
+    # =========================================================================
+
+    def parse_and_flatten(self, col, mode='first'):
+        """
+        Parses complex structure columns and flattens nested elements.
+        """
+        return self.extract_first_element(col, mode=mode)
 
     def combine_columns(self, col1, col2, new_name, sep=' '):
-        """
-        Merges two columns into one. 
-        Handles NaNs so you don't end up with strings like 'John nan'.
-        """
         if col1 not in self.df.columns or col2 not in self.df.columns:
-            print(f"Error: One of the columns {col1} or {col2} does not exist.")
+            self._log_warning(f"Action ignored. Missing columns: '{col1}' or '{col2}'.")
             return self
 
-        # Convert to string, but handle NaNs properly
-        # We use .fillna('') so that 'John' + NaN becomes 'John' instead of 'John nan'
         s1 = self.df[col1].astype(str).replace('nan', '').str.strip()
         s2 = self.df[col2].astype(str).replace('nan', '').str.strip()
 
-        # Combine them
         self.df[new_name] = s1 + sep + s2
-        
-        # Clean up potential leading/trailing separators if one side was empty
         self.df[new_name] = self.df[new_name].str.strip(sep)
         
-        print(f"Combined '{col1}' and '{col2}' into '{new_name}'")
+        self._log_info(f"Merged columns '{col1}' and '{col2}' into unified target: '{new_name}'")
         return self
 
     def extract_first_element(self, column, mode='first'):
-        """
-        Flattens complex columns (Lists or Stringified Lists) into a single value.
-        
-        Modes:
-        'first' : Returns only the first item in the list.
-        'join'  : Returns all items joined by a semicolon (e.g., 'item1; item2').
-        """
         if column not in self.df.columns:
-            print(f"Error: Column '{column}' not found.")
+            self._log_warning(f"Extraction failed. Column not found: '{column}'.")
             return self
 
         def _internal_parser(val):
-            # 1. Handle real Python lists
             if isinstance(val, list):
                 target_list = val
-            # 2. Handle "Stringified" lists: "['a', 'b']"
             elif isinstance(val, str) and val.strip().startswith('['):
                 try:
                     target_list = ast.literal_eval(val.strip())
                 except (ValueError, SyntaxError):
                     target_list = []
-            # 3. It's already a single value
             else:
                 return val
 
-            # Perform the requested mode
             if isinstance(target_list, list):
                 if not target_list:
                     return None
@@ -1488,122 +1349,203 @@ class DataFrameCleaner:
                     return target_list[0]
                 elif mode == 'join':
                     return "; ".join([str(i) for i in target_list])
-            
             return val
 
         self.df[column] = self.df[column].apply(_internal_parser)
-        print(f"Flattened column '{column}' using mode='{mode}'")
+        self._log_info(f"Extracted/flattened elements inside target column '{column}' using mode='{mode}'")
         return self
 
     def drop_short_strings(self, column, min_chars=10):
-        """Sets values in a string column to NaN if they are too short."""
         if column in self.df.columns:
-            # Calculate lengths (handling existing NaNs gracefully)
             lengths = self.df[column].astype(str).str.len()
-            
-            # Find indices where length is valid (not nan) but below threshold
-            # We check 'notna' to distinguish between "short string" and "already empty"
             mask = (lengths < min_chars) & (self.df[column].notna())
-            
             count = mask.sum()
             if count > 0:
                 self.df.loc[mask, column] = np.nan
-                print(f"Cleaned '{column}': Removed {count} values shorter than {min_chars} chars.")
+                self._log_info(f"Cleaned column '{column}': Nullified {count} values shorter than {min_chars} characters.")
         return self
     
     def reset_data(self, df_original):
-        """
-        Replaces the current (cleaned) dataframe with a fresh copy of the original.
-        Useful for restarting the pipeline without re-initializing the whole class.
-        """
-        print("Resetting DataFrame to original state...")
-        
-        # Create a fresh copy so we don't mutate the external variable
+        self._log_info("Resetting working DataFrame back to the original source DataFrame...")
         self.df = df_original.copy()
-        
-        # IMPORTANT: We must clear any previous analysis/enforcer state
-        # Re-initialize the enforcer with the new data
-        self.enforcer = SchemaEnforcer(self.df, self.na_placeholders)
-        
-        print(f"Reset complete. Shape: {self.df.shape}")
+        self.stats = {}
         return self
 
+
     def enforce_schema(self, schema_dict, protected_values=None):
-        enforcer = SchemaEnforcer(self.df, self.na_placeholders, protected_values)
-        self.df = enforcer.apply(schema_dict)
+        """
+        Enforces type checking rules over structural columns. Modifies working state.
+        """
+        self._print_header(f"Enforcing Schema Constraints Across {len(schema_dict)} Columns")
+        
+        if protected_values:
+            self.protected_values = {k: set(map(str, v)) for k, v in protected_values.items()}
+
+        for col, dtype in schema_dict.items():
+            if col not in self.df.columns:
+                continue
+            
+            initial_valid = self.df[col].notna().sum()
+            n_placeholders = 0
+            found_examples = []
+
+            # --- Fast Path Optimization ---
+            if dtype == 'bool' and pd.api.types.is_bool_dtype(self.df[col]):
+                if initial_valid == len(self.df): # No missing values to resolve
+                    continue
+
+            # --- Transformation & Verification Logic ---
+            if dtype == 'list':
+                if initial_valid > 0:
+                    n_placeholders, found_examples = self._scan_placeholders(col)
+                    self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, list, col))
+            elif dtype == 'dict':
+                if initial_valid > 0:
+                    n_placeholders, found_examples = self._scan_placeholders(col)
+                    self.df[col] = self.df[col].apply(lambda x: self._clean_complex(x, dict, col))
+            elif dtype == 'bool':
+                if initial_valid > 0:
+                    n_placeholders, found_examples = self._scan_placeholders(col)
+                    self.df[col] = self.df[col].map(lambda x: self._clean_bool(x, col))
+            elif dtype == 'string':
+                if initial_valid > 0:
+                    n_placeholders, found_examples = self._scan_placeholders(col)
+                    self.df[col] = self.df[col].map(lambda x: self._clean_scalar_str(x, col))
+            elif dtype in ['int', 'float', 'number']:
+                original_valid_mask = self.df[col].notna()
+                coerced = pd.to_numeric(self.df[col], errors='coerce')
+                failed_mask = original_valid_mask & coerced.isna()
+                
+                failed_vals = self.df.loc[failed_mask, col].dropna()
+                if not failed_vals.empty:
+                    failed_str = failed_vals.astype(str).str.strip()
+                    is_garbage = failed_str.str.match(self.garbage_regex, na=False)
+                    if col in self.protected_values:
+                        is_protected = failed_str.isin(self.protected_values[col])
+                        is_garbage = is_garbage & ~is_protected
+                    
+                    n_placeholders = is_garbage.sum()
+                    found_examples = failed_str[is_garbage].unique().tolist()
+                
+                self.df[col] = coerced
+
+            elif dtype in ['date', 'datetime']:
+                original_valid_mask = self.df[col].notna()
+                coerced = pd.to_datetime(self.df[col], errors='coerce')
+                failed_mask = original_valid_mask & coerced.isna()
+                
+                failed_vals = self.df.loc[failed_mask, col].dropna()
+                if not failed_vals.empty:
+                    failed_str = failed_vals.astype(str).str.strip()
+                    is_garbage = failed_str.str.match(self.garbage_regex, na=False)
+                    if col in self.protected_values:
+                        is_protected = failed_str.isin(self.protected_values[col])
+                        is_garbage = is_garbage & ~is_protected
+                    
+                    n_placeholders = is_garbage.sum()
+                    found_examples = failed_str[is_garbage].unique().tolist()
+                
+                self.df[col] = coerced
+
+            final_valid = self.df[col].notna().sum()
+            
+            total_cleaned = initial_valid - final_valid
+            n_mismatch = max(0, total_cleaned - n_placeholders)
+            if total_cleaned < n_placeholders:
+                n_placeholders = total_cleaned
+
+            if total_cleaned > 0:
+                self.stats[col] = {
+                    'total': total_cleaned,
+                    'placeholders': n_placeholders,
+                    'mismatch': n_mismatch,
+                    'examples': found_examples
+                }
+
+        if self.stats:
+            print(f"\n{'='*100}")
+            print(f"| {'CLEANING REPORT: STRIPPED CONVERSIONS TO NaN':^96} |")
+            print(f"{'='*100}")
+            print(f"| {'Column':<20} | {'Total':<8} | {'Regex Match':<12} | {'Mismatch':<10} | {'Detected Sample Placeholders':<35} |")
+            print(f"{'-'*100}")
+            for col, data in self.stats.items():
+                ex_str = str(data['examples'])
+                if len(ex_str) > 35: 
+                    ex_str = ex_str[:32] + "..."
+                print(f"| {col:<20} | {data['total']:<8} | {data['placeholders']:<12} | {data['mismatch']:<10} | {ex_str:<35} |")
+            print(f"{'='*100}\n")
+        else:
+            self._log_info("Schema validation complete: No garbage or type mismatches were found.")
+
         return self
+
 
     def clean_column_names(self):
         self.df.columns = (self.df.columns.astype(str).str.strip().str.lower()
                            .str.replace(r'\s+', '_', regex=True)
                            .str.replace(r'[^a-z0-9_]', '', regex=True))
+        self._log_info("Cleaned and normalized all DataFrame column labels to standard snake_case.")
         return self
     
     def drop_constant_columns(self):
-        """Drops columns where all values are the same."""
-        # nunique(dropna=False) counts NaNs as a unique value if they exist
-        # If nunique == 1, the column has only 1 value across all rows
         cols_to_drop = [col for col in self.df.columns if self.df[col].nunique(dropna=False) <= 1]
-        
         if cols_to_drop:
             self.df.drop(columns=cols_to_drop, inplace=True)
-            print(f"Dropped constant columns: {cols_to_drop}")
+            self._log_info(f"Dropped non-informative constant columns: {cols_to_drop}")
         return self
     
     def cap_outliers(self, columns, lower_quantile=0.05, upper_quantile=0.95):
-        """Caps numerical values at specific quantiles to reduce outlier impact."""
         for col in columns:
             if col in self.df.columns and pd.api.types.is_numeric_dtype(self.df[col]):
                 lower = self.df[col].quantile(lower_quantile)
                 upper = self.df[col].quantile(upper_quantile)
-                
-                # Clip values
                 self.df[col] = self.df[col].clip(lower=lower, upper=upper)
-                print(f"Capped '{col}' between {lower:.2f} and {upper:.2f}")
+                self._log_info(f"Capped outlier values in numeric column '{col}' between quantiles: ({lower:.2f}, {upper:.2f})")
         return self
 
-
-    def drop_missing_cols(self, threshold=0.95, exclude=[]):
-        """Drops columns that are missing more than `threshold` percent of data."""
+    #leave this to rot please
+    def drop_missing_cols(self, threshold=0.95, exclude=None):
+        exclude = exclude or []
         mask = self.df.isna().mean() > threshold
         cols_to_drop = [col for col in self.df.columns[mask] if col not in exclude]
         if cols_to_drop:
             self.df.drop(columns=cols_to_drop, inplace=True)
-            print(f"Dropped columns (> {threshold*100}% missing): {cols_to_drop}")
+            self._log_info(f"Dropped high-density missing value columns (> {threshold*100}% empty): {cols_to_drop}")
         return self
     
-    # ---------------------------------------------------------
-    # DEDUPLICATION
-    # ---------------------------------------------------------
+    # =========================================================================
+    # DEDUPLICATION PIPELINE
+    # =========================================================================
 
-    def check_duplicates(self):
-        """
-        A diagnostic tool. Simply reports how many exact duplicate rows 
-        exist, ignoring unhashable (list/dict) columns.
-        """
+
+    def check_duplicates(self, exclude_cols=None, subset=None):
+        exclude_cols = exclude_cols or []
         unhashable_cols = self._find_unhashable_columns()
         
-        if unhashable_cols:
-            print(f"\n[Audit] Warning: Excluding unhashable columns from duplicate check: {unhashable_cols}")
-            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
-            if not hashable_cols:
-                print("[Audit] No hashable columns available to check.")
-                return self
-            dupes = self.df.duplicated(subset=hashable_cols).sum()
+        if subset is not None:
+            hashable_cols = [c for c in subset if c in self.df.columns and c not in unhashable_cols]
+            invalid_or_unhashable = set(subset) - set(hashable_cols)
+            if invalid_or_unhashable:
+                self._log_warning(f"Excluding invalid or unhashable columns from specified subset: {list(invalid_or_unhashable)}")
         else:
-            dupes = self.df.duplicated().sum()
+            all_exclusions = set(unhashable_cols) | set(exclude_cols)
+            if all_exclusions:
+                self._log_warning(f"Excluding columns from precise duplicates calculation: {list(all_exclusions)}")
+            hashable_cols = [c for c in self.df.columns if c not in all_exclusions]
+
+        if not hashable_cols:
+            print("No remaining primitive hashable columns left to check.")
+            return self
+
+        dupes = self.df.duplicated(subset=hashable_cols).sum()
 
         if dupes > 0:
-            print(f"[Audit] Found {dupes} exact duplicate rows.")
+            print(f"Detected {dupes} duplicate rows matching on checked columns: {hashable_cols}")
         else:
-            print("[Audit] No exact duplicates found.")
+            print(f"No duplicate rows encountered matching on checked columns: {hashable_cols}")
         return self
 
     def show_column_duplicates(self, cols):
-        """
-        A diagnostic tool. Shows which specific values in specific columns 
-        appear more than once.
-        """
         if isinstance(cols, str):
             cols = [cols]
             
@@ -1613,23 +1555,27 @@ class DataFrameCleaner:
             counts = self.df[col].value_counts()
             duplicates = counts[counts >= 2]
 
-            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
+            self._print_header(f"Value Duplicates Audit on Column: '{col}' (Total Repeated Values: {len(duplicates)})")
             if not duplicates.empty:
                 print(duplicates.to_string(header=False))
             else:
-                print("No values with 2+ appearances.")
+                print("No values encountered with multiple duplicate references.")
         return self
 
-    def drop_exact_duplicates(self):
-        """
-        The 'Low-Hanging Fruit'. Removes rows that are 100% identical 
-        in all hashable columns.
-        """
+    def drop_exact_duplicates(self, exclude_cols=None, subset=None):
         unhashable = self._find_unhashable_columns()
-        hashable_subset = [c for c in self.df.columns if c not in unhashable]
+        
+        if subset is not None:
+            hashable_subset = [c for c in subset if c in self.df.columns and c not in unhashable]
+            invalid_or_unhashable = set(subset) - set(hashable_subset)
+            if invalid_or_unhashable:
+                self._log_warning(f"Excluding invalid or unhashable columns from specified subset: {list(invalid_or_unhashable)}")
+        else:
+            exclude_cols = exclude_cols or []
+            hashable_subset = [c for c in self.df.columns if c not in unhashable and c not in exclude_cols]
         
         if not hashable_subset:
-            print("Cannot drop exact duplicates: No hashable columns found.")
+            self._log_warning("Unable to execute exact duplicate drop. No hashable columns found.")
             return self
 
         initial_len = len(self.df)
@@ -1637,40 +1583,37 @@ class DataFrameCleaner:
         dropped = initial_len - len(self.df)
         
         if dropped > 0:
-            print(f"Dropped {dropped} exact duplicate rows.")
+            self._log_info(f"Successfully dropped {dropped} identical duplicate rows based on criteria columns: {hashable_subset}")
         else:
-            print("No exact duplicates found to drop.")
+            self._log_info("Exact duplicate check completed. No rows require dropping.")
         return self
 
     def resolve_fuzzy_duplicates(self, title_col='title', author_col='authors', 
                                 title_threshold=60, author_threshold=80):
-        """
-        The 'Heavy Lifter'. Uses fuzzy matching to find 'near-duplicates' 
-        and resolves them based on data completeness.
-        """
-        if title_col not in self.df.columns or author_col not in self.df.columns:
-            print(f"Error: Columns '{title_col}' or '{author_col}' not found.")
+        if process is None or fuzz is None:
+            self._log_warning("Fuzzy logic resolution skipped. Please install 'rapidfuzz' or 'fuzzywuzzy' first.")
             return self
 
-        print(f"Starting fuzzy deduplication (Title Thresh: {title_threshold}, Author Thresh: {author_threshold})...")
+        if title_col not in self.df.columns or author_col not in self.df.columns:
+            self._log_warning(f"Fuzzy resolution cancelled. Target columns do not exist in index: '{title_col}', '{author_col}'.")
+            return self
+
+        self._log_info(f"Initiating fuzzy deduplication loop (Title threshold: {title_threshold}, Author threshold: {author_threshold})")
         
-        # 1. Setup Tracking
         keep_idx = set()
         remove_idx = set()
-        # Calculate completeness (non-null count) for the resolution phase
         self.df['_completeness_score'] = self.df.notna().sum(axis=1)
 
-        # 2. Identify Candidate Pairs
-        print(" -> Step 1: Identifying candidate title pairs...")
         title_map = self.df.groupby(title_col).groups
         unique_titles = list(title_map.keys())
         candidate_pairs = []
 
-        # A. Fuzzy Title Matches
+        # Find potential approximate duplicate pairings
         for t1 in unique_titles:
             matches = process.extract(t1, unique_titles, scorer=fuzz.token_sort_ratio, limit=5)
             for t2, score, _ in matches:
-                if t1 == t2: continue
+                if t1 == t2: 
+                    continue
                 if score >= title_threshold:
                     idxs_1 = title_map[t1]
                     idxs_2 = title_map[t2]
@@ -1679,7 +1622,7 @@ class DataFrameCleaner:
                             pair = tuple(sorted((i1, i2)))
                             candidate_pairs.append(pair)
 
-        # B. Exact Title Matches
+        # Catch exact text variations
         for title, indices in title_map.items():
             if len(indices) > 1:
                 indices = list(indices)
@@ -1688,22 +1631,16 @@ class DataFrameCleaner:
                         candidate_pairs.append((indices[i], indices[j]))
 
         candidate_pairs = list(set(candidate_pairs))
-        print(f" -> Found {len(candidate_pairs)} candidate pairs.")
+        self._log_info(f"  * Generated {len(candidate_pairs)} candidate duplicate pairs based on title alignment.")
 
-        # 3. Verify Authors and Resolve
-        print(" -> Step 2: Verifying Authors and Resolving by Completeness...")
-        
         for idx1, idx2 in candidate_pairs:
-            # Skip if we already decided on one of these rows
             if idx1 in remove_idx or idx2 in remove_idx:
                 continue
 
-            # Extract authors as strings for comparison
             auth1 = str(self.df.loc[idx1, author_col])
             auth2 = str(self.df.loc[idx2, author_col])
 
             if fuzz.token_sort_ratio(auth1, auth2) >= author_threshold:
-                # Confirmed Duplicate. Choose the 'best' one.
                 score1 = self.df.loc[idx1, '_completeness_score']
                 score2 = self.df.loc[idx2, '_completeness_score']
                 
@@ -1714,337 +1651,209 @@ class DataFrameCleaner:
                     keep_idx.add(idx2)
                     remove_idx.add(idx1)
 
-        # 4. Cleanup
         self.df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
         
-        # Apply the removal
         if remove_idx:
             self.df.drop(index=list(remove_idx), inplace=True)
-            print(f"Resolved {len(remove_idx)} fuzzy duplicates.")
+            self._log_info(f"Fuzzy resolution removed {len(remove_idx)} duplicate rows, retaining higher-completeness items.")
         else:
-            print("No fuzzy duplicates resolved.")
+            self._log_info("Fuzzy deduplication complete. No near-duplicate targets removed.")
 
         return self
     
-    def drop_duplicates(self):
-        # Only check hashable columns to avoid crashing on lists
+
+    def drop_duplicates(self, check_unhashable=True, exclude_cols=None, subset=None):
         unhashable = self._find_unhashable_columns()
-        hashable_subset = [c for c in self.df.columns if c not in unhashable]
+        
+        if subset is not None:
+            hashable_subset = [c for c in subset if c in self.df.columns and c not in unhashable]
+            invalid_or_unhashable = set(subset) - set(hashable_subset)
+            if invalid_or_unhashable:
+                self._log_warning(f"Excluding invalid or unhashable columns from specified subset: {list(invalid_or_unhashable)}")
+        else:
+            exclude_cols = exclude_cols or []
+            hashable_subset = [c for c in self.df.columns if c not in unhashable and c not in exclude_cols]
+            
         if hashable_subset:
             initial = len(self.df)
-            self.df.drop_duplicates(subset=hashable_subset,inplace=True)
-            print(f"Dropped {initial - len(self.df)} duplicates.")
+            self.df.drop_duplicates(subset=hashable_subset, inplace=True)
+            self._log_info(f"Checked for duplicates on columns:{hashable_subset}")
+            self._log_info(f"Removed {initial - len(self.df)} duplicate rows based on columns: {hashable_subset}")
         return self
     
-    '''
 
-    '''
-    '''
-        def solve_duplicates(self):
-        # Sets to track our decisions
-        df = self.df
-        keep_idx = set()
-        remove_idx = set()
-        
-        # Helper: Calculate completeness (count of non-null columns)
-        # We calculate this once for the whole dataframe for speed
-        df['_completeness_score'] = df.notna().sum(axis=1)
 
-        # ---------------------------------------------------------
-        # STEP 1: Identify Candidate Pairs (Title Based)
-        # ---------------------------------------------------------
-        print("Step 1: Identifying candidate title pairs...")
-        
-        # Map titles to list of indices: {'Title A': [0, 5], 'Title B': [2]}
-        title_map = df.groupby('title').groups
-        unique_titles = list(title_map.keys())
-        
-        candidate_pairs = [] # List of (index_1, index_2)
 
-        # A. Fuzzy Matches (Using your logic)
-        # Note: limit=5 might be too low if you have many matches, 
-        # but for "near matches" per string it is okay.
-        for t1 in unique_titles:
-            matches = process.extract(t1, unique_titles, scorer=fuzz.token_sort_ratio, limit=5)
-            for t2, score, _ in matches:
-                if t1 == t2: continue # Skip exact self-match (handled in B)
-                if score >= TITLE_THRESHOLD:
-                    # We found two DIFFERENT strings that look alike.
-                    # We must compare every row with Title 1 against every row with Title 2
-                    idxs_1 = title_map[t1]
-                    idxs_2 = title_map[t2]
-                    
-                    for i1 in idxs_1:
-                        for i2 in idxs_2:
-                            # Store sorted tuple to avoid checking (1,2) and (2,1)
-                            pair = tuple(sorted((i1, i2)))
-                            candidate_pairs.append(pair)
-
-        # B. Exact Matches (Same title appearing in multiple rows)
-        for title, indices in title_map.items():
-            if len(indices) > 1:
-                # Create pairs for every combination of indices with this title
-                indices = list(indices)
-                for i in range(len(indices)):
-                    for j in range(i + 1, len(indices)):
-                        candidate_pairs.append((indices[i], indices[j]))
-
-        # Deduplicate pairs
-        candidate_pairs = list(set(candidate_pairs))
-        print(f" -> Found {len(candidate_pairs)} candidate row pairs based on Title.")
-
-        # ---------------------------------------------------------
-        # STEP 2: Verify Author & Resolve (Completeness)
-        # ---------------------------------------------------------
-        print("Step 2: Verifying Authors and Resolving...")
-        
-        processed_indices = set() # Track indices we have made a decision on
-
-        for idx1, idx2 in candidate_pairs:
-            # Skip if we already removed one of these (greedy approach)
-            # remove this check if you want to evaluate all overlaps
-            if idx1 in remove_idx or idx2 in remove_idx:
-                continue
-
-            author1 = str(df.loc[idx1, 'authors']) # Ensure string
-            author2 = str(df.loc[idx2, 'authors'])
-
-            # Check Author Similarity
-            auth_score = fuzz.token_sort_ratio(author1, author2)
-            
-            if auth_score >= AUTHOR_THRESHOLD:
-                # --- CONFIRMED DUPLICATE ---
-                processed_indices.add(idx1)
-                processed_indices.add(idx2)
-                
-                # Check Completeness
-                score1 = df.loc[idx1, '_completeness_score']
-                score2 = df.loc[idx2, '_completeness_score']
-                
-                if score1 >= score2:
-                    keep_idx.add(idx1)
-                    remove_idx.add(idx2)
-                else:
-                    keep_idx.add(idx2)
-                    remove_idx.add(idx1)
-            else:
-                # Authors look different, likely not a duplicate
-                pass
-
-        print(f" -> Marked {len(remove_idx)} rows for removal.")
-        print(f" -> Marked {len(keep_idx)} rows to keep (as the 'better' versions).")
-
-        # ---------------------------------------------------------
-        # STEP 3: Check "Unaccounted" Repeated Authors
-        # ---------------------------------------------------------
-        print("\nStep 3: Checking Unaccounted Author Duplicates...")
-        
-        # All indices involved in the duplicate process (either kept or removed)
-        accounted_indices = keep_idx | remove_idx
-        
-        # Find authors that appear > 1 time in the WHOLE dataframe
-        # (We cast to str to ensure hashability if list)
-        author_counts = df['authors'].apply(str).value_counts()
-        repeated_authors = author_counts[author_counts > 1].index
-        
-        unaccounted_results = []
-
-        for auth in repeated_authors:
-            # Get all indices for this author
-            # Note: This filtering might be slow on huge DFs, usually better to iterate groups
-            mask = df['authors'].apply(str) == auth
-            author_indices = set(df.index[mask])
-            
-            # Subtract indices we already handled in Step 2
-            unaccounted = author_indices - accounted_indices
-            
-            #TODO further check: year? promoter?
-            if len(unaccounted) > 1:
-                # These are rows with the same author that were NOT flagged as title duplicates
-                titles = df.loc[list(unaccounted), 'title'].tolist()
-                unaccounted_results.append({
-                    'author': auth,
-                    'count_left': len(unaccounted),
-                    'titles': titles # Show first 3 titles
-                })
-        df.drop(columns=['_completeness_score'], inplace=True, errors='ignore')
-        
-        return keep_idx, remove_idx
-    '''
-    '''
-        def check_duplicates(self):
-        """Checks for duplicate rows, skipping unhashable columns."""
-        unhashable_cols = self._find_unhashable_columns()
-        
-        if unhashable_cols:
-            print(f"\nWarning: Excluding unhashable columns from duplicate check: {unhashable_cols}")
-            hashable_cols = [c for c in self.df.columns if c not in unhashable_cols]
-            if not hashable_cols:
-                print("No hashable columns to check.")
-                return self
-            dupes = self.df.duplicated(subset=hashable_cols).sum()
-        else:
-            dupes = self.df.duplicated().sum()
-
-        if dupes > 0:
-            print(f"\nFound {dupes} duplicate rows.")
-        else:
-            print("\nNo duplicates found.")
-        return self
-
-    def show_duplicates(self, cols):
-        if isinstance(cols, str):
-            cols = [cols]
-        for col in cols:
-            if col not in self.df.columns:
-                continue
-            counts = self.df[col].value_counts()
-            duplicates = counts[counts>=2]
-
-            print(f"\n--- '{col}' (Total Duplicates: {len(duplicates)}) ---")
-            if not duplicates.empty:
-                print(duplicates.to_string(header=False))
-            else:
-                print("No values with 2+ appearances.")
-    '''
-
-    def resolve_mixed_types(self, interactive=True):
-        """
-        Uses audit results to prompt the user for resolution strategies.
-        Returns a schema dictionary with the user's choices.
-        """
+    def resolve_mixed_types(self, interactive=False):
         report = self.audit_mixed_types(verbose=True)
         if not report:
             return {}
 
         schema_overrides = {}
-        
-        # Map Python type names to your SchemaEnforcer names
         type_map = {
             'str': 'string', 'int': 'int', 'float': 'float', 
             'bool': 'bool', 'list': 'list', 'dict': 'dict',
-            'ndarray': 'list' # Convert numpy arrays to lists usually
+            'ndarray': 'list'
         }
 
         if not interactive:
-            print("\n[Non-Interactive Mode] Skipping manual resolution (defaulting to safe inference).")
+            self._log_info("Non-interactive mode: Bypassing manual outlier resolution.")
             return {}
 
-        print("\n--- Mixed Type Resolution ---")
+        self._print_header("Mixed Type Interaction Resolution Console")
         for col, data in report.items():
             maj_type = data['majority_type']
             maj_schema = type_map.get(maj_type, 'string')
             
-            print(f"\nColumn: '{col}'")
-            print(f" > Majority: {maj_type} ({data['majority_pct']:.1f}%)")
-            print(f" > Minority Types: {[k for k in data['breakdown'] if k != maj_type]}")
-            print(f" > Outlier Examples: {data['outliers']}")
+            print(f"\nConflict in Column: '{col}'")
+            print(f"  * Majority Representation: {maj_type} ({data['majority_pct']:.1f}%)")
+            print(f"  * Conflict Types: {[k for k in data['breakdown'] if k != maj_type]}")
+            print(f"  * Representative Outlier Values: {data['outliers']}")
+            print("\nOptions:")
+            print(f"  [1] Force values to Majority Representation type ('{maj_schema}') -> Invalid values coerced to NaN")
+            print("  [2] Map complete column elements to string -> Retains value, drops specialized indexing")
+            print("  [3] Manually type assign casting")
+            print("  [4] Skip resolution and proceed with automated estimation rules")
             
-            print(f"Options:")
-            print(f"  [1] Coerce to Majority ('{maj_schema}') -> Outliers become NaN")
-            print(f"  [2] Convert ALL to String -> Preserves data, loses type")
-            print(f"  [3] Force specific type (Enter manually)")
-            print(f"  [4] Skip (Let auto-inference decide)")
-            
-            choice = input(f"Action for '{col}': ").strip()
-            
+            choice = input(f"Select action option [1-4] for '{col}': ").strip()
             if choice == '1':
                 schema_overrides[col] = maj_schema
-                print(f" -> Set schema for '{col}' to '{maj_schema}' (Strict)")
+                self._log_info(f" -> Forced column '{col}' schema target to: '{maj_schema}'")
             elif choice == '2':
                 schema_overrides[col] = 'string'
-                print(f" -> Set schema for '{col}' to 'string' (Safe)")
+                self._log_info(f" -> Cast column '{col}' items completely to string representations.")
             elif choice == '3':
-                manual = input("Enter schema type (int, float, string, bool, list, dict): ").strip()
+                manual = input("Enter schema choice keyword (int, float, string, bool, list, dict): ").strip()
                 if manual in type_map.values():
                     schema_overrides[col] = manual
+                    self._log_info(f" -> Applied manual type mapping for '{col}': '{manual}'")
                 else:
-                    print("Invalid type, skipping.")
+                    self._log_warning("Invalid input. Proceeding with automated estimation rules.")
             else:
-                print(" -> Skipped.")
+                self._log_info(f"Action bypassed on '{col}'.")
                 
         return schema_overrides
     
     def convert_data_types_pandas(self):
-        """Uses pandas convert_dtypes to infer best types."""
         self.df = self.df.convert_dtypes()
-        print("Converted column types.")
-        print(self.df.dtypes)
+        self._log_info("Mapped schema format to native Pandas nullable type system backend.")
         return self
     
     def convert_data_types_arrow(self):
-        """
-        The Final Step: Convert everything to PyArrow backends.
-        This locks in the schema and optimizes memory.
-        
-        """
-        print("Step 1: Auto converting to PyArrow-backed types...")
+        self._log_info("Converting columns to PyArrow-backed types for memory optimization...")
         try:
-            # automatic conversion
             self.df = self.df.convert_dtypes(dtype_backend="pyarrow")
-            
-            # Manual override for List/Structs if they remained objects
-            # (Optional: PyArrow backend usually catches lists if they are clean)
-            print(self.df.dtypes)
         except Exception as e:
-            print(f"PyArrow conversion warning: {e}")
+            self._log_warning(f"Automated PyArrow backend casting warning: {e}")
 
-        print('Step 2: converting object types')
         for col in self.df.select_dtypes(include=['object']):
             try:
                 arrow_array = pa.array(self.df[col].dropna())
-
                 self.df[col] = self.df[col].astype(pd.ArrowDtype(arrow_array.type))
-                print(f' > {col}: {arrow_array.type}')
+                self._log_info(f"  > Cast column '{col}' to arrow structure type: {arrow_array.type}")
             except Exception:
                 pass
-        print('Conversion complete.')
+        self._log_info("Backend conversion to PyArrow formats completed.")
         return self
     
     def reset_index(self):
         self.df.reset_index(drop=True, inplace=True)
         return self
 
+    def remove_missing_values(self, how='any', subset=None):
+        """
+        Drops missing rows completely using standard dropna behaviors.
+        """
+        initial = len(self.df)
+        self.df.dropna(how=how, subset=subset, inplace=True)
+        dropped = initial - len(self.df)
+        self._log_info(f"Dropped {dropped} rows containing null attributes with criteria how='{how}'.")
+        return self
 
-    def remove_missing_values(self):
-        pass
+    # =========================================================================
+    # PIPELINE EXECUTION
+    # =========================================================================
 
-    # --- 3. PIPELINE ---
-    #TODO 
-    def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False, interactive=True):
-        self.clean_column_names()
+    def run_auto_pipeline(self, schema=None, protected_values=None, drop_empty_cols=False, interactive=False, dedupe_exclude=None, dedupe_subset=None):
+        self._print_header("Initializing Automated Cleaning Pipeline Execution")
         
-        # 1. Diagnostic & Remediation
-        print("\n--- Pipeline Start: Pre-Flight Check ---")
-        print('Looking for mixed types')
+        #self.clean_column_names()
+        #TODO deduplicate edge cases where cols get same name
+        #TODO clean schema col names
+
+        self._log_info("Step 1: Auditing mixed datatype structures...")
         mixed_type_fixes = self.resolve_mixed_types(interactive=interactive)
-        # 2. Infer Base Schema
+        
+        self._log_info("Step 2: Performing dynamic auto-inference logic...")
         detected_schema = self.auto_infer_schema()
         
-        # 3. Merge Schemas
-        # Priority: Manual Overrides (args) > Interactive Fixes > Auto Detect
         if mixed_type_fixes:
-            print(f"Applying {len(mixed_type_fixes)} mixed-type resolutions...")
+            self._log_info(f"Applying {len(mixed_type_fixes)} manual overrides resolved during audits.")
             detected_schema.update(mixed_type_fixes)
-        else:
-            print('No mixed types found.')
             
         if schema:
-            print(f"Applying {len(schema)} manual overrides...")
+            self._log_info(f"Applying {len(schema)} static user schema instructions.")
             detected_schema.update(schema)
         
-        # 4. Clean
+        self._log_info("Step 3: Enforcing integrated schema transformations...")
         self.enforce_schema(detected_schema, protected_values)
-        if drop_empty_cols: self.drop_missing_cols()
-        self.drop_duplicates().convert_data_types_arrow().summarize()
+        
+        if drop_empty_cols: 
+            self.drop_missing_cols() #stay dead
+            
+        self._log_info("Step 4: Executing deduplication filters and locking database in Arrow representations...")
+        self.convert_data_types_arrow()
+        self.drop_duplicates(exclude_cols=dedupe_exclude, subset=dedupe_subset)
+        self.summarize()
+        
+        self._log_info("Pipeline execution successfully completed.")
         return self.df
     
-    def save_parquet(self, path):
-        if path:
-            self.df.to_parquet(path, engine='pyarrow', index=False)
-        else:
-            print('No path given')
+    
+    def save(self, path, file_format='csv', **kwargs):
+        """
+        Saves the processed DataFrame to disk in either CSV or Parquet format.
+        
+        Parameters:
+        -----------
+        path : str or Path
+            The file path where the DataFrame should be saved.
+        file_format : str, default 'csv'
+            The format to use. Supported options are 'csv' and 'parquet'.
+            If the provided path extension is .csv or .parquet/.pq, it takes precedence.
+        **kwargs : dict
+            Optional keyword arguments passed directly to Pandas' `to_csv()` or `to_parquet()`.
+        """
+        if not path:
+            self._log_warning("Save command ignored. Missing valid path parameter.")
+            return self
 
+        target_path = Path(path)
+        fmt = file_format.lower().strip()
+
+        # Deduce and override format dynamically based on path suffix if applicable
+        suffix = target_path.suffix.lower()
+        if suffix == '.csv':
+            fmt = 'csv'
+        elif suffix in ['.parquet', '.pq']:
+            fmt = 'parquet'
+
+        if fmt == 'csv':
+            # Default options for CSV (can be overridden by kwargs)
+            save_args = {'index': False}
+            save_args.update(kwargs)
+            self.df.to_csv(target_path, **save_args)
+            self._log_info(f"Successfully saved CSV format to disk: {target_path}")
+        elif fmt in ['parquet', 'pq']:
+            # Default options for Parquet (can be overridden by kwargs)
+            save_args = {'engine': 'pyarrow', 'index': False}
+            save_args.update(kwargs)
+            self.df.to_parquet(target_path, **save_args)
+            self._log_info(f"Successfully saved Parquet format to disk: {target_path}")
+        else:
+            raise ValueError(f"Unsupported file format '{file_format}'. Supported values are 'csv' or 'parquet'.")
+
+        return self
 
 # ==============================================================================
 #  requests
@@ -2106,6 +1915,270 @@ def timed_request(
         return None
 
 
+from pathlib import Path
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+
+class PyarrowHelper:
+    def __init__(self, source):
+        """
+        Initializes the helper, keeps the Parquet metadata reader open,
+        and caches essential metadata elements.
+        """
+        self.source = Path(source)
+        if not self.source.exists():
+            raise FileNotFoundError(f"Parquet file not found at: {self.source}")
+            
+        # 1. Open metadata reader (very fast, does not read actual rows)
+        self.pf = pq.ParquetFile(self.source)
+        
+        # 2. Cache metadata parameters to avoid redundant IO
+        self.all_cols = self.pf.schema_arrow.names
+        self.num_rows = self.pf.metadata.num_rows
+        
+        # Placeholder for lazy-loaded table cache
+        self._table = None
+
+    @property
+    def table(self):
+        """
+        Lazily loads and caches the full PyArrow Table only if accessed.
+        """
+        if self._table is None:
+            self._table = pq.read_table(self.source)
+        return self._table
+
+    @property
+    def file_size(self) -> str:
+        """
+        Returns the file size on disk formatted in Megabytes.
+        """
+        bytes_size = self.source.stat().st_size
+        mb_size = bytes_size / (1024 * 1024)
+        return f"{mb_size:.2f} MB"
+
+    def head(self, num=5) -> pd.DataFrame:
+        """
+        Returns a visual Pandas DataFrame preview of the first `num` rows 
+        without loading the entire Parquet file.
+        """
+        table_slice = pq.read_table(self.source).slice(0, num)
+        return table_slice.to_pandas()
+
+    def info(self) -> pd.DataFrame:
+        """
+        Compiles structural profiling metrics (data types, null counts, 
+        null percentages, nested status) for all columns.
+        
+        Returns a Pandas DataFrame for neat notebook rendering.
+        """
+        metrics = []
+        for col_name in self.all_cols:
+            col_idx = self.all_cols.index(col_name)
+            
+            # Extract Arrow Data Type and check nested status
+            arrow_type = self.pf.schema_arrow.field(col_idx).type
+            is_nested = isinstance(
+                arrow_type, 
+                (pa.ListType, pa.StructType, pa.MapType, pa.LargeListType, pa.FixedSizeListType)
+            )
+            
+            # Fetch null counts
+            null_count = self._get_null_count(col_name)
+            null_pct = (null_count / self.num_rows * 100) if self.num_rows > 0 else 0.0
+            
+            metrics.append({
+                "Column": col_name,
+                "Type": str(arrow_type),
+                "Null Count": null_count,
+                "Null %": f"{null_pct:.2f}%",
+                "Nested?": is_nested
+            })
+            
+        return pd.DataFrame(metrics)
+
+    def _get_null_count(self, col_name: str) -> int:
+        """
+        Attempts to read null counts directly from the Parquet metadata.
+        Falls back to a memory-efficient compute scan if statistics are missing.
+        """
+        col_idx = self.all_cols.index(col_name)
+        null_count = 0
+        has_stats = True
+        
+        # Check metadata row groups for pre-computed statistics
+        for rg_idx in range(self.pf.num_row_groups):
+            rg = self.pf.metadata.row_group(rg_idx)
+            stats = rg.column(col_idx).statistics
+            if stats is not None and stats.has_null_count:
+                null_count += stats.null_count
+            else:
+                has_stats = False
+                break
+                
+        if has_stats:
+            return null_count
+            
+        # Fallback if metadata lacks statistics
+        single_col_table = pq.read_table(self.source, columns=[col_name])
+        col_data = single_col_table[col_name]
+        return pc.sum(pc.is_null(col_data)).as_py()
+
+    def show_vals(self, col, num=10):
+        """
+        Loads only the specified column and prints a small list of sample values.
+        """
+        # Read only the target column to keep memory footprint low
+        table = pq.read_table(self.source, columns=[col])
+        sample_values = table[col].slice(0, num).to_pylist()
+        print(f'{col}: {sample_values}')
+
+    def show_value_counts(self, col=None, num=10, exclude=None):
+        """
+        Calculates value counts natively within PyArrow for the specified columns,
+        sorts the frequencies in descending order, and displays the top results.
+        
+        If col=None, runs for all columns by default (excluding specified ones).
+        """
+        # 1. Normalize the 'exclude' list
+        if exclude is None:
+            exclude_list = []
+        elif isinstance(exclude, str):
+            exclude_list = [exclude]
+        elif isinstance(exclude, list):
+            exclude_list = exclude
+        else:
+            raise ValueError("The 'exclude' argument must be a string or a list of strings.")
+            
+        # 2. Determine which columns to check
+        if col is None:
+            cols_to_check = [c for c in self.all_cols if c not in exclude_list]
+        else:
+            if isinstance(col, str):
+                temp_cols = [col]
+            elif isinstance(col, list):
+                temp_cols = col
+            else:
+                raise ValueError("The 'col' argument must be a string or a list of strings.")
+            
+            cols_to_check = [c for c in temp_cols if c not in exclude_list]
+
+        if not cols_to_check:
+            print("No columns left to check after applying exclusion filters.")
+            return
+
+        # 3. Process each column
+        for col_name in cols_to_check:
+            if col_name not in self.all_cols:
+                print(f"Column '{col_name}' not found in source.")
+                print("-" * 45)
+                continue
+                
+            table = pq.read_table(self.source, columns=[col_name])
+            col_data = table[col_name]
+            
+            try:
+                counts = pc.value_counts(col_data)
+                
+                # Convert StructArray to Table to allow native sorting (handles ChunkedArrays)
+                if isinstance(counts, pa.ChunkedArray):
+                    counts_table = pa.Table.from_batches([
+                        pa.RecordBatch.from_struct_array(chunk) 
+                        for chunk in counts.chunks
+                    ])
+                else:
+                    counts_table = pa.Table.from_batches([
+                        pa.RecordBatch.from_struct_array(counts)
+                    ])
+                
+                sorted_table = counts_table.sort_by([("counts", "descending")])
+                top_results = sorted_table.slice(0, num)
+                
+                print(f"Top {num} Value Counts for '{col_name}':")
+                results_list = top_results.to_pylist()
+                if not results_list:
+                    print("  - (No values found)")
+                else:
+                    for row in results_list:
+                        print(f"  - {row['counts']}: {row['values']}")
+                print("-" * 45)
+                
+            except Exception:
+                print(f"Column '{col_name}':")
+                print(f"  - [Skipped] Cannot compute value counts natively (complex/nested type: {col_data.type})")
+                print("-" * 45)
 
 
+
+    def show_duplicates(self, col=None, exclude=None):
+        """
+        Inspects duplication metrics for Parquet columns with optional exclusions.
+        """
+        # Normalize the 'exclude' list
+        if exclude is None:
+            exclude_list = []
+        elif isinstance(exclude, str):
+            exclude_list = [exclude]
+        elif isinstance(exclude, list):
+            exclude_list = exclude
+        else:
+            raise ValueError("The 'exclude' argument must be a string or a list of strings.")
+            
+        # Determine which columns to check
+        if col is None:
+            cols_to_check = [c for c in self.all_cols if c not in exclude_list]
+            is_summary_mode = True
+        else:
+            is_summary_mode = False
+            if isinstance(col, str):
+                temp_cols = [col]
+            elif isinstance(col, list):
+                temp_cols = col
+            else:
+                raise ValueError("The 'col' argument must be a string or a list of strings.")
+            
+            cols_to_check = [c for c in temp_cols if c not in exclude_list]
+
+        if not cols_to_check:
+            print("No columns left to check after applying exclusion filters.")
+            return
+
+        # Process each column
+        for col_name in cols_to_check:
+            if col_name not in self.all_cols:
+                print(f"Column '{col_name}' not found in source.")
+                print("-" * 45)
+                continue
+                
+            table = pq.read_table(self.source, columns=[col_name])
+            col_data = table[col_name]
+            total_rows = len(col_data)
+            
+            try:
+                counts = pc.value_counts(col_data)
+                dup_mask = pc.greater(counts.field('counts'), 1)
+                dupes = pc.filter(counts.field('values'), dup_mask)
+                
+                if is_summary_mode:
+                    num_unique = len(counts)
+                    num_dup_rows = total_rows - num_unique
+                    num_distinct_duped = len(dupes)
+                    
+                    print(f"Column '{col_name}':")
+                    print(f"  - Total rows: {total_rows}")
+                    print(f"  - Unique values: {num_unique}")
+                    print(f"  - Duplicate entries (redundant rows): {num_dup_rows}")
+                    print(f"  - Distinct values with duplicates: {num_distinct_duped}")
+                    print("-" * 45)
+                else:
+                    print(f"Duplicate values in '{col_name}':")
+                    print(dupes.to_pylist())
+                    print("-" * 45)
+                    
+            except Exception:
+                print(f"Column '{col_name}':")
+                print(f"  - Total rows: {total_rows}")
+                print(f"  - [Skipped] Cannot compute duplicates natively (complex/nested type: {col_data.type})")
+                print("-" * 45)
 

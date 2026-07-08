@@ -288,6 +288,7 @@ class BaseScraper:
         """Removes illegal characters from a filename string."""
         return re.sub(r'[\\/*?:"<>|]', "", name)
 
+    # functions which must be implemented by the subclass
     def _scrape_all_item_urls(self) -> None:
         raise NotImplementedError("Subclasses must implement _scrape_all_item_urls")
 
@@ -445,21 +446,23 @@ class BaseScraper:
             sys.exit(1)
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 class HBOScraper(BaseScraper):
-    DEFAULT_COLUMNS = ["download_link", 'page_link', "authors", 'abstract','downloaded','source']
+    DEFAULT_COLUMNS = ["download_link", 'page_link', "authors", 'abstract', 'downloaded', 'source']
     ESSENTIAL_METADATA_COLUMNS = ["abstract"]
-    HEADING_WORDS = [
-        "achtergrond", "inleiding", "doelstelling", "methode", "methoden", 
-        "resultaat", "resultaten", "conclusie", "conclusies", "discussie", 
-        "aanbeveling", "aanbevelingen", "samenvatting", "abstract", 
-        "trefwoorden", "kernwoorden"
-    ]
 
     def __init__(self, **kwargs):
-        headings_list = []
-        for h in self.HEADING_WORDS:
-            headings_list.extend([h.lower(),h.capitalize(),h.upper()])
-        self._headings_pattern = '|'.join(set(headings_list))
         super().__init__(
             source_name='HBO',
             columns=self.DEFAULT_COLUMNS,
@@ -473,7 +476,7 @@ class HBOScraper(BaseScraper):
         return f"{author_slug}_{row.name}"
     
     def _scrape_all_item_urls(self) -> None:
-        """Orchestrates multi-year, multi-organization traversal."""
+        """goes by years specified and checks number of hits, if hits > 500 it goes by all organizations separately to prevent page looping back to 1 after 500 results."""
         base_url = 'https://hbo-kennisbank.nl'
         
         # Iterate through every year from 2000 to 2022 separately
@@ -492,6 +495,7 @@ class HBOScraper(BaseScraper):
                 
             soup = BeautifulSoup(response.text, 'html.parser')
 
+            # number of hits
             # Find the strong tag that holds the translation key for the search count
             strong_tag = soup.find("strong", attrs={"data-key": "num-results"})
             total_hits = 0
@@ -637,7 +641,7 @@ class HBOScraper(BaseScraper):
         soup = BeautifulSoup(html_content, "html.parser")
         metadata: Dict[str, Any] = {}
 
-        # Clean and save abstract (<p> child of <div class='detail__body'>)
+        # Save abstract (<p> child of <div class='detail__body'>)
         detail_body = soup.find("div", class_="detail__body")
         abstract = None
         if detail_body:
@@ -705,86 +709,7 @@ class HBOScraper(BaseScraper):
             else:
                 metadata["year"] = None
 
-        if metadata['abstract']:
-            metadata['abstract'] = self._clean_abstract(metadata['abstract'])
         return metadata
-    
-    def _strip_layout_headers(self, sent: str) -> tuple[str, Optional[str]]:
-        orig = sent
-        sent_cleaned = re.sub(r'[*_]{1,2}', '', orig).strip()
-        
-        sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})([A-Z])', r'\1', sent_cleaned)
-        sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})[\s]*[:.-]+[\s]*', '', sent_cleaned)
-        sent_cleaned = re.sub(rf'^(?:{self._headings_pattern})\s+([A-Z])', r'\1', sent_cleaned)
-        
-        if re.match(rf'^(?:{self._headings_pattern})$', sent_cleaned):
-            sent_cleaned = ""
-
-        if sent_cleaned != orig:
-            if not sent_cleaned:
-                removed = orig
-            else:
-                idx = orig.find(sent_cleaned)
-                if idx != -1:
-                    removed = orig[:idx]
-                else:
-                    removed = f"'{orig}' -> '{sent_cleaned}'"
-            return sent_cleaned, removed
-            
-        return orig, None
-
-    def _clean_abstract(
-            self,
-            abstract: str,
-            min_char_length: int = 100,
-            tokenizer_lang: str = 'dutch',
-            detect_lang_tag: str = 'nl'
-        ) -> str:
-        
-        dutch_abstract = ""
-        if isinstance(abstract, str) and len(abstract) >= min_char_length and abstract.strip():
-            abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', abstract)
-            
-            raw_sentences = nltk.sent_tokenize(abstract, language=tokenizer_lang)
-            cleaned_sentences = []
-            
-            for sent in raw_sentences:
-                sent = sent.strip()
-                if not sent:
-                    continue
-                
-                cleaned_sent, removed = self._strip_layout_headers(sent)
-                
-                if removed:
-                    self.logger.debug(f"Stripped layout header: {repr(removed)}")
-                
-                if not cleaned_sent:
-                    continue
-                
-                sent = cleaned_sent
-
-                should_merge = False
-                if cleaned_sentences:
-                    if not re.match(r'^[A-Z]', sent):
-                        should_merge = True
-                    elif len(sent) >= 2 and sent[1] in string.punctuation:
-                        should_merge = True
-                
-                if should_merge:
-                    cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
-                else:
-                    cleaned_sentences.append(sent)
-            
-            dutch_sentences = []
-            for sent in cleaned_sentences:
-                try:
-                    if detect(sent) == detect_lang_tag:
-                        dutch_sentences.append(sent)
-                except LangDetectException:
-                    continue
-            if dutch_sentences:
-                dutch_abstract = ' '.join(dutch_sentences)
-        return dutch_abstract
 
 
 
