@@ -756,6 +756,10 @@ class ScriptiebankScraper(BaseScraper):
         into a structured dictionary mapping headers to paragraphs.
         """
         # Find the container (handles both class variants found in the markup)
+        #TODO more in depth check op h tag length, als het te lang is dan voeg je het maar toe als text
+        #TODO herstructureren van de keys, h1: dit dat, 
+        #TODO miss ook al unified abstract maken
+        #TODO alle subfields van div text checken
         container = soup.select_one("div.thesis__text, div.thesis_text")
         if not container:
             return None

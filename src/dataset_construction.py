@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import ast
 import pyarrow as pa
@@ -18,32 +19,48 @@ from langdetect import detect, LangDetectException
 import string
 from tqdm import tqdm
 import numpy as np
+import nltk
 
-#targets
+# Self-healing NLTK tokenizer download safeguards
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    try:
+        nltk.download('punkt_tab', quiet=True)
+    except Exception:
+        nltk.download('punkt', quiet=True)
+
+# Set base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SOURCES_CONFIG = {
     'UG': {
         'raw_file': BASE_DIR / 'data' / 'bronze' / 'UG' / 'publications.json',
-        'clean_file': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_cleaned.parquet',
-        'selected_file': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet',
+        'clean_file_pq': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_cleaned.parquet',
+        'clean_file_csv': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_cleaned.csv',
+        'selected_file_pq': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.parquet',
+        'selected_file_csv': BASE_DIR / 'data' / 'silver' / 'UG' / 'ug_selected.csv',
     },
     'HBO': {
         'raw_file': BASE_DIR / 'data' / 'bronze' / 'HBO' / 'HBO_metadata.csv',
-        'clean_file': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_cleaned.parquet',
-        'selected_file': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_selected.parquet',
+        'clean_file_pq': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_cleaned.parquet',
+        'clean_file_csv': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_cleaned.csv',
+        'selected_file_pq': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_selected.parquet',
+        'selected_file_csv': BASE_DIR / 'data' / 'silver' / 'HBO' / 'hbo_selected.csv',
     },
     'SB': {
         'raw_file': BASE_DIR / 'data' / 'bronze' / 'SB' / 'SB_metadata.csv',
-        'clean_file': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_cleaned.parquet',
-        'selected_file': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_selected.parquet',
+        'clean_file_pq': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_cleaned.parquet',
+        'clean_file_csv': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_cleaned.csv',
+        'selected_file_pq': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_selected.parquet',
+        'selected_file_csv': BASE_DIR / 'data' / 'silver' / 'SB' / 'sb_selected.csv',
     }
 }
 
 
-# -------------------------
-# download
-
+# =====================================================================
+# DOWNLOAD STEP
+# =====================================================================
 def download_raw_data(source_name: str, output_path: Path):
     """
     Downloads raw data from scrapers or remote endpoints.
@@ -69,32 +86,24 @@ def download_raw_data(source_name: str, output_path: Path):
         print("[UG] Download complete.")
 
 
-# ------------------------
-# cleaning
-"""
-Loads a csv, parquet or json file file
-unifies all null values (NaN, None..) string sentinel values like 'nan', '-', '/'
-detects semantically logical dtypes, detects nested python structures (list, dicts) in strings
-saves to either csv or parquet
-"""
-#TODO clean individual abstr
-
-
-# Helper to prevent semantic false positives on codes and identifiers
+# =====================================================================
+# SEMANTIC OPTIMIZER HELPERS
+# =====================================================================
 def is_identifier_name(name: str) -> bool:
     if not name:
         return False
     name_lower = name.lower()
     identifiers = {
-        '_id', #'code', 'num', 'phone', 'zip', 'postal', 'serial', 'ssn', 
+        '_id',# 'code', 'num', 'phone', 'zip', 'postal', 'serial', 'ssn', 
         #'ein', 'vabb', 'wos', 'arxiv', 'pubmed', 'esci', 'issn', 'isbn', 
         #'doi', 'ugent_id', 'biblio_id', 'handle', 'sha256'
     }
     return any(keyword in name_lower for keyword in identifiers)
 
+
 def detect_logical_array(
     array: pa.Array,
-    field_name: str = None, # Propagated down the recursion stack for semantic context
+    field_name: str = None,
     infer_dates: bool = True,
     infer_booleans: bool = True,
     infer_numbers: bool = True,
@@ -118,7 +127,6 @@ def detect_logical_array(
             category_ratio_threshold, category_max_unique, max_category_string_len
         )
         return pa.ListArray.from_arrays(offsets=array.offsets, values=optimized_values, mask=array.is_null())
-        
     elif pa.types.is_large_list(arrow_type):
         flattened = array.flatten()
         optimized_values = detect_logical_array(
@@ -126,7 +134,6 @@ def detect_logical_array(
             category_ratio_threshold, category_max_unique, max_category_string_len
         )
         return pa.LargeListArray.from_arrays(offsets=array.offsets, values=optimized_values, mask=array.is_null())
-        
     elif pa.types.is_fixed_size_list(arrow_type):
         flattened = array.flatten()
         optimized_values = detect_logical_array(
@@ -160,11 +167,8 @@ def detect_logical_array(
         index_type = pa.int16() if n_unique <= 32767 else pa.int32()
         return pa.DictionaryArray.from_arrays(pc.cast(array.indices, index_type), optimized_values)
 
-    # -------------------------------------------------------------
-    # SEMANTIC INFERENCE: INTEGER ARRAYS
-    # -------------------------------------------------------------
+    # Standardize Integers
     elif pa.types.is_integer(arrow_type):
-        # A. Infer Unix Timestamps (Safeguard: Never run on ID or Code fields)
         if infer_dates and not is_identifier_name(field_name):
             try:
                 min_max = pc.min_max(array).as_py()
@@ -177,7 +181,6 @@ def detect_logical_array(
             except Exception:
                 pass
 
-        # B. Infer Booleans flags masquerading as 0 and 1
         if infer_booleans:
             try:
                 unique_vals = {v.as_py() for v in pc.unique(array) if v.is_valid}
@@ -188,12 +191,8 @@ def detect_logical_array(
 
         return pc.cast(array, pa.int64())
 
-    # -------------------------------------------------------------
-    # SEMANTIC INFERENCE: FLOATING ARRAYS (Now cleans NaNs recursively)
-    # -------------------------------------------------------------
     elif pa.types.is_floating(arrow_type):
         try:
-            # 1. Clean NaNs by turning them into actual nulls (integers cannot hold NaNs)
             is_nan_mask = pc.fill_null(pc.is_nan(array), False)
             if pc.any(is_nan_mask).as_py():
                 null_scalar = pa.scalar(None, type=arrow_type)
@@ -202,13 +201,11 @@ def detect_logical_array(
             pass
 
         try:
-            # 2. Check if all non-null numbers are equivalent to integers (e.g., 801001.0 == 801001)
             floor_array = pc.floor(array)
             is_integer_valued = pc.equal(array, floor_array)
             is_integer_valued = pc.fill_null(is_integer_valued, True)
             
             if pc.all(is_integer_valued).as_py():
-                # 3. Cast to standard int64 and recursively let the integer block handle it
                 int_array = pc.cast(array, pa.int64())
                 return detect_logical_array(
                     int_array, field_name, infer_dates, infer_booleans, infer_numbers,
@@ -217,26 +214,24 @@ def detect_logical_array(
         except Exception:
             pass
 
-        # Default to standard 64-bit floats
         return pc.cast(array, pa.float64())
 
-    # -------------------------------------------------------------
-    # SEMANTIC INFERENCE: STRING ARRAYS
-    # -------------------------------------------------------------
+    # Standardize Strings (Handles text placeholder sanitization and nested recursion)
     elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
         try:
             sentinels = [
-                "nan", "none", "null", "-", "--", "---", "_", "unknown", "missing", "niet beschikbaar"
-                "<none>", "n/a", "na", "not reported", 
-                "/",   # Safely matches single forward-slash placeholders
-                "\\"   # Safely matches single backslash placeholders (escaped as double-backslash)
-            ] #TODO can be expanded
-            lower_array = pc.ascii_lower(array)
+                "nan", "none", "null", "-", "--", "---", "_", "unknown", "missing", "niet beschikbaar",
+                "<none>", "n/a", "na", "not reported", "/", "\\"
+            ]
+            trimmed_array = pc.utf8_trim_whitespace(array)
+            lower_array = pc.ascii_lower(trimmed_array)
             is_sentinel_mask = pc.is_in(lower_array, value_set=pa.array(sentinels))
             
             if pc.any(is_sentinel_mask).as_py():
                 null_scalar = pa.scalar(None, type=arrow_type)
-                array = pc.if_else(is_sentinel_mask, null_scalar, array)
+                array = pc.if_else(is_sentinel_mask, null_scalar, trimmed_array)
+            else:
+                array = trimmed_array
         except Exception:
             pass
 
@@ -244,11 +239,10 @@ def detect_logical_array(
         if non_null_count == 0:
             return array
 
-        # A. Infer Booleans from string flags
         if infer_booleans:
             try:
                 unique_vals = {str(v.as_py()).strip().lower() for v in pc.unique(array) if v.is_valid}
-                if unique_vals.issubset({"true", "false", "t", "f", "yes", "no", "y", "n", "1", "0","1.0","0.0"}) and len(unique_vals) > 0:
+                if unique_vals.issubset({"true", "false", "t", "f", "yes", "no", "y", "n", "1", "0", "1.0", "0.0"}) and len(unique_vals) > 0:
                     bool_list = []
                     for val in array:
                         py_val = val.as_py()
@@ -261,13 +255,11 @@ def detect_logical_array(
             except Exception:
                 pass
 
-        # B. Infer Numeric Values (Digits & Decimals)
         if infer_numbers:
             try:
                 is_digit_mask = pc.ascii_is_decimal(array)
                 is_digit_mask = pc.fill_null(is_digit_mask, True)
                 if pc.all(is_digit_mask).as_py():
-                    # Protect postal codes, serials, and leading-zero IDs
                     has_leading_zero = pc.any(pc.and_(pc.starts_with(array, "0"), pc.not_equal(array, "0"))).as_py()
                     if not has_leading_zero:
                         int_array = pc.cast(array, pa.int64())
@@ -287,7 +279,6 @@ def detect_logical_array(
             except Exception:
                 pass
 
-        # C. Infer Date & Time formats
         if infer_dates:
             try:
                 has_date_separators = pc.any(pc.or_(pc.match_substring(array, "-"), pc.match_substring(array, "/"))).as_py()
@@ -297,12 +288,11 @@ def detect_logical_array(
                     except Exception:
                         return pc.cast(array, pa.timestamp('us'))
             except Exception:
-                pass
+                pass #TODO handle pass, maybe as string ?
 
-        # D. Infer Logical Categories (Dictionary Encoding)
         try:
             n_unique = pc.count_distinct(array).as_py()
-            avg_len = pc.mean(pc.string_length(array)).as_py()
+            avg_len = pc.mean(pc.utf8_length(array)).as_py()
         except Exception:
             return array
 
@@ -316,6 +306,7 @@ def detect_logical_array(
                 return pa.DictionaryArray.from_arrays(pc.cast(encoded.indices, index_type), encoded.dictionary)
 
     return array
+
 
 def detect_logical_table(
     table: pa.Table, 
@@ -332,7 +323,6 @@ def detect_logical_table(
         col_name = table.column_names[i]
         col_array = table.column(i).combine_chunks()
         
-        # Initiate the recursion passing the top-level column name
         optimized_array = detect_logical_array(
             col_array,
             field_name=col_name,
@@ -347,10 +337,6 @@ def detect_logical_table(
         optimized_fields.append(pa.field(col_name, optimized_array.type, nullable=table.schema.field(i).nullable))
     return pa.Table.from_arrays(optimized_columns, schema=pa.schema(optimized_fields))
 
-
-# =====================================================================
-# 2. FILE DETECTOR & SERIALIZED PARSER
-# =====================================================================
 def detect_json_columns(table: pa.Table, sample_size: int = 100, success_threshold: float = 0.9) -> list[str]:
     """
     Scans string columns and flags those containing serialized JSON/Python literal dicts or lists.
@@ -424,12 +410,11 @@ def parse_serialized_columns(table: pa.Table, json_columns: list[str]) -> pa.Tab
             new_fields.append(table.schema.field(i))
     return pa.Table.from_arrays(new_columns, schema=pa.schema(new_fields))
 
-
 # =====================================================================
-# 3. UNIFIED FILE RUNNER
+# RECURSIVE SCHEMA LOADER & PARSER
 # =====================================================================
 def optimize_file_table(
-    input: any,
+    input_source: any,
     format: str = None, 
     infer_dates: bool = True,
     infer_booleans: bool = True,
@@ -438,34 +423,24 @@ def optimize_file_table(
     category_max_unique: int = 5_000,
     max_category_string_len: int = 60,
     remove_duplicates: any = None,
-    save: str = None
+    save: any = None, # Can be string, Path, or a list of multiple paths
+    post_process: callable = None
 ) -> pa.Table:
     """
-    Accepts a filepath, an in-memory PyArrow Table, or a Pandas DataFrame,
-    automatically detects types, applies deduplication, and optionally saves the output.
+    Ingests and optimizes raw files (CSV, JSON Lines, Parquet) or in-memory arrays.
+    Optionally executes customized post-processing callables and saves results to multiple paths.
     """
-    
-    # -------------------------------------------------------------
-    # Ingestion Routing
-    # -------------------------------------------------------------
-    
-    # 1. Input is already a PyArrow Table
-    if isinstance(input, pa.Table):
-        table = input
-
-    # 2. Input is a Pandas DataFrame
-    elif isinstance(input, pd.DataFrame):
-        # Convert to PyArrow Table. 
-        table = pa.Table.from_pandas(input)
-
-    # 3. Input is a File Path (string or Path object)
+    if isinstance(input_source, pa.Table):
+        table = input_source
+    elif isinstance(input_source, pd.DataFrame):
+        table = pa.Table.from_pandas(input_source)
     else:
-        input = str(input)
-        if not os.path.exists(input):
-            raise FileNotFoundError(f"The file path '{input}' does not exist.")
+        input_source = str(input_source)
+        if not os.path.exists(input_source):
+            raise FileNotFoundError(f"Raw dataset file path not found: {input_source}")
 
         if format is None:
-            ext = os.path.splitext(input)[1].lower()
+            ext = os.path.splitext(input_source)[1].lower()
             if ext in ('.csv', '.txt'):
                 format = 'csv'
             elif ext in ('.json', '.jsonl', '.ndjson'):
@@ -473,25 +448,30 @@ def optimize_file_table(
             elif ext in ('.parquet', '.pq'):
                 format = 'parquet'
             else:
-                raise ValueError(f"Could not auto-detect format for: '{input}'. Please specify 'format' explicitly.")
+                raise ValueError(f"Could not auto-detect format for: '{input_source}'. Please specify 'format' explicitly.")
 
-        # Read file into PyArrow Table
         if format == 'csv':
-            table = pv.read_csv(input)
+            table = pv.read_csv(input_source)
         elif format == 'json':
-            table = pj.read_json(input)
+            try:
+                table = pj.read_json(input_source)
+            except:
+                with open(input_source, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    table = pa.Table.from_pandas(pd.DataFrame(data))
+                else:
+                    raise
         elif format == 'parquet':
-            table = pq.read_table(input)
+            table = pq.read_table(input_source)
         else:
             raise ValueError(f"Unsupported format '{format}'. Use 'csv', 'json', or 'parquet'.")
         
-    # B. Auto-detect serialized string columns containing dicts/lists
     json_cols = detect_json_columns(table, sample_size=100)
     if json_cols:
         print(f"[{format.upper()}] Auto-detected serialized nested columns: {json_cols}")
         table = parse_serialized_columns(table, json_cols)
 
-    # C. Run recursive logical/semantic type detection
     optimized_table = detect_logical_table(
         table,
         infer_dates=infer_dates,
@@ -503,7 +483,6 @@ def optimize_file_table(
     )
 
     if remove_duplicates not in (False, None) and len(optimized_table) > 0:
-        # Filter out nested columns (lists/structs) from the potential grouping keys
         flat_columns = [
             name for name, field in zip(optimized_table.column_names, optimized_table.schema)
             if not (pa.types.is_list(field.type) or 
@@ -513,90 +492,212 @@ def optimize_file_table(
         ]
 
         dedup_keys = []
-
-        # State 1: Deduplicate on ALL flat columns
         if remove_duplicates is True or remove_duplicates == "all":
             dedup_keys = flat_columns
             print(f"Deduplicating on all flat columns ({len(dedup_keys)} columns)...")
-
-        # State 2: Deduplicate on all flat columns EXCEPT specified ones
         elif isinstance(remove_duplicates, dict) and "exclude" in remove_duplicates:
             exclude_list = remove_duplicates["exclude"]
             if isinstance(exclude_list, str):
                 exclude_list = [exclude_list]
             dedup_keys = [col for col in flat_columns if col not in exclude_list]
             print(f"Deduplicating on all flat columns except {exclude_list} ({len(dedup_keys)} columns)...")
-
-        # State 3: Deduplicate on a specific subset of columns
         elif isinstance(remove_duplicates, (list, tuple, set)):
             for key in remove_duplicates:
                 if key not in optimized_table.column_names:
-                    raise KeyError(f"Column '{key}' specified for deduplication does not exist.")
+                    raise KeyError(f"Deduplication column '{key}' does not exist.")
                 if key not in flat_columns:
                     raise ValueError(
-                        f"Cannot deduplicate on column '{key}' because it contains a nested structure (list/struct). "
-                        "PyArrow hash-grouping only supports flat primitive columns."
+                        f"Cannot deduplicate on column '{key}' because it is nested."
                     )
             dedup_keys = list(remove_duplicates)
             print(f"Deduplicating on specified column subset: {dedup_keys}...")
-        else:
-            raise ValueError(
-                "Invalid 'remove_duplicates' value. Expected True, 'all', a list of columns, "
-                "or {'exclude': [...] }."
-            )
 
         if dedup_keys:
-            # Create monotonic row indices
             row_indices = pa.array(np.arange(len(optimized_table)), type=pa.int64())
             temp_table = optimized_table.append_column("__row_index__", row_indices)
-
-            # Group and select minimum row index (first occurrence)
             grouped = temp_table.group_by(dedup_keys).aggregate([("__row_index__", "min")])
             unique_indices = grouped.column("__row_index___min")
-
-            # Sort indices to preserve original table order
             sorted_positions = pc.sort_indices(unique_indices)
             ordered_unique_indices = pc.take(unique_indices, sorted_positions)
 
-            # Filter table
             pre_count = len(optimized_table)
             optimized_table = optimized_table.take(ordered_unique_indices)
             print(f"Deduplication finished. Retained {len(optimized_table)} of {pre_count} rows.")
 
+    # Call custom post-processing callbacks prior to saving
     if post_process is not None:
         if not callable(post_process):
-            raise TypeError("post_process must be a callable fuction")
+            raise TypeError("post_process argument must be a callable function.")
         optimized_table = post_process(optimized_table)
 
-    # D. Handle optional saving
+    # Handle multiple save targets (e.g. Parquet and CSV concurrently)
     if save is not None:
-        save_path = str(save)
-        save_ext = os.path.splitext(save_path)[1].lower()
+        save_paths = [save] if isinstance(save, (str, Path)) else list(save)
+        
+        for p in save_paths:
+            save_path = str(p)
+            save_ext = os.path.splitext(save_path)[1].lower()
 
-        # Create parent directories if they don't exist
-        parent_dir = os.path.dirname(save_path)
-        if parent_dir and not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
+            parent_dir = os.path.dirname(save_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
 
-        if save_ext in ('.parquet', '.pq'):
-            pq.write_table(optimized_table, save_path)
-            print(f"Successfully saved optimized table to Parquet: {save_path}")
-            
-        elif save_ext == '.csv':
-            df = optimized_table.to_pandas()
-            df.to_csv(save_path, index=False)
-            print(f"Successfully saved optimized table to CSV (via Pandas text-serialization): {save_path}")
-            
-        else:
-            raise ValueError(
-                f"Unsupported save format '{save_ext}'. Please specify a path ending with .csv, .parquet, or .pq."
-            )
+            if save_ext in ('.parquet', '.pq'):
+                pq.write_table(optimized_table, save_path)
+                print(f"Saved cleaned table to Parquet: {save_path}")
+            elif save_ext == '.csv':
+                df = optimized_table.to_pandas()
+                df.to_csv(save_path, index=False)
+                print(f"Saved cleaned table to CSV: {save_path}")
+            else:
+                raise ValueError(f"Unsupported save format '{save_ext}'. Must be .csv or .parquet")
 
     return optimized_table
 
-# -------------------------------
-#Post processing cleaning: merge cols, clean abstracts
-#post processing helpers
+
+# =====================================================================
+# SOURCE-SPECIFIC POST-PROCESSING FUNCTIONS
+# =====================================================================
+#NOT USED, NOT NEEDED
+def pp_ug(table: pa.Table, **kwargs) -> pa.Table:
+    """
+    UG (University of Ghent) Specific Cleans:
+    Converts academic sentinel placeholder values (99, 999, 9999) 
+    in volume and issue fields into true null values.
+    """
+    print("[UG] Applying UG-specific cleans (nullifying sentinel volume/issue values)...")
+    
+    protected_values = {
+        'volume': [99, '99', 999, '999', 9999, '9999'],
+        'issue': [99, '99', '999', 999, '9999', 9999]
+    }
+    
+    for col_name, sentinels in protected_values.items():
+        if col_name in table.column_names:
+            idx = table.schema.get_field_index(col_name)
+            col_array = table.column(idx).combine_chunks()
+            
+            typed_sentinels = []
+            for s in sentinels:
+                try:
+                    typed_sentinels.append(pa.scalar(s).cast(col_array.type))
+                except Exception:
+                    pass
+            
+            if typed_sentinels:
+                value_set = pa.array(typed_sentinels, type=col_array.type)
+                is_sentinel = pc.fill_null(pc.is_in(col_array, value_set=value_set), False)
+                
+                null_scalar = pa.scalar(None, type=col_array.type)
+                cleaned_array = pc.if_else(is_sentinel, null_scalar, col_array)
+                table = table.set_column(idx, col_name, cleaned_array)
+                
+    return table
+
+
+def pp_sb(table: pa.Table, **kwargs) -> pa.Table:
+    """
+    Scriptiebank (SB) Specific Cleans:
+    Safely converts floating-point or stringified float 'year' values 
+    to integer representations (e.g., "2023.0" -> 2023).
+    """
+    print("[SB] Casting 'year' column to Integer type...")
+    
+    if 'year' in table.column_names:
+        idx = table.schema.get_field_index('year')
+        col_array = table.column(idx).combine_chunks()
+        
+        if pa.types.is_floating(col_array.type):
+            try:
+                is_nan = pc.fill_null(pc.is_nan(col_array), False)
+                if pc.any(is_nan).as_py():
+                    null_scalar = pa.scalar(None, type=col_array.type)
+                    col_array = pc.if_else(is_nan, null_scalar, col_array)
+                
+                rounded = pc.round(col_array)
+                integer_years = pc.cast(rounded, pa.int64())
+                table = table.set_column(idx, 'year', integer_years)
+            except Exception as e:
+                print(f"[SB] Failed to cast float year to Integer: {e}")
+                
+        elif pa.types.is_string(col_array.type) or pa.types.is_large_string(col_array.type):
+            try:
+                floats = pc.cast(col_array, pa.float64())
+                rounded = pc.round(floats)
+                integer_years = pc.cast(rounded, pa.int64())
+                table = table.set_column(idx, 'year', integer_years)
+            except Exception as e:
+                print(f"[SB] Failed to cast string year to Integer: {e}")
+                
+    return table
+
+
+def pp_hbo(table: pa.Table, **kwargs) -> pa.Table:
+    """
+    HBO Specific Cleans:
+    1. Jaar -> Year: Merges 'jaar' into 'year' (via coalesce) and drops 'jaar'.
+    2. Partners -> Partner: Merges 'partners' into 'partner' and drops 'partners'.
+    3. Title & Subtitle merger: Combines "Title" and "Subtitle" element-wise.
+    """
+    # 1. Merge 'jaar' into 'year'
+    if 'jaar' in table.column_names:
+        print("[HBO] Merging 'jaar' -> 'year'...")
+        if 'year' in table.column_names:
+            year_col = table.column('year')
+            jaar_col = table.column('jaar')
+            if year_col.type != jaar_col.type:
+                try:
+                    jaar_col = pc.cast(jaar_col, year_col.type)
+                except Exception as e:
+                    print(f"[HBO] Warning: Failed to cast 'jaar' to {year_col.type}: {e}")
+            
+            # FIXED: Pass columns directly instead of inside a list
+            merged_year = pc.coalesce(year_col, jaar_col)
+            table = table.set_column(table.schema.get_field_index('year'), 'year', merged_year)
+        else:
+            table = table.append_column('year', table.column('jaar'))
+        table = table.remove_column(table.schema.get_field_index('jaar'))
+
+    # 2. Merge 'partners' into 'partner'
+    if 'partners' in table.column_names:
+        print("[HBO] Merging 'partners' -> 'partner'...")
+        if 'partner' in table.column_names:
+            partner_col = table.column('partner')
+            partners_col = table.column('partners')
+            if partner_col.type != partners_col.type:
+                try:
+                    partners_col = pc.cast(partners_col, partner_col.type)
+                except Exception as e:
+                    print(f"[HBO] Warning: Failed to cast 'partners' to {partner_col.type}: {e}")
+            
+            # FIXED: Pass columns directly instead of inside a list
+            merged_partner = pc.coalesce(partner_col, partners_col)
+            table = table.set_column(table.schema.get_field_index('partner'), 'partner', merged_partner)
+        else:
+            table = table.append_column('partner', table.column('partners'))
+        table = table.remove_column(table.schema.get_field_index('partners'))
+
+    # 3. Combine 'title' and 'subtitle' element-wise (C++ parallel string processing)
+    if 'title' in table.column_names and 'subtitle' in table.column_names:
+        print("[HBO] Merging 'title' and 'subtitle' columns...")
+        title_col = table.column('title')
+        sub_col = table.column('subtitle')
+        
+        # FIXED: Changed pc.string_length -> pc.utf8_length
+        sub_len = pc.fill_null(pc.utf8_length(sub_col), 0)
+        has_subtitle = pc.and_(pc.is_valid(sub_col), pc.greater(sub_len, 0))
+        
+        joined_title = pc.binary_join_element_wise(title_col, sub_col, ": ")
+        merged_title = pc.if_else(has_subtitle, joined_title, title_col)
+        
+        table = table.set_column(table.schema.get_field_index('title'), 'title', merged_title)
+        table = table.remove_column(table.schema.get_field_index('subtitle'))
+
+    return table
+
+# =====================================================================
+# SELECTION AND NLP CLEANING HELPERS
+# =====================================================================
 def extract_sb_homepage_text(val) -> Optional[str]:
     """
     Parses SB 'text_homepage' from either a JSON string, dictionary, or raw string,
@@ -605,7 +706,6 @@ def extract_sb_homepage_text(val) -> Optional[str]:
     if pd.isna(val) or not val:
         return None
         
-    # Attempt to decode string representation of dict
     if isinstance(val, str):
         val = val.strip()
         if val.startswith('{') and val.endswith('}'):
@@ -625,6 +725,7 @@ def extract_sb_homepage_text(val) -> Optional[str]:
         
     return str(val)
 
+
 def _generate_robust_id(source: str, row: pd.Series) -> str:
     """
     Generates a unique and deterministic ID using MD5 hashing of 
@@ -632,31 +733,28 @@ def _generate_robust_id(source: str, row: pd.Series) -> str:
     """
     content_parts = []
     
-    # Prioritize standardized abstract text
     for col in ['text_dut', 'abstract', 'abstract_full']:
         val = row.get(col)
         if val is not None and str(val).strip():
             content_parts.append(str(val))
             break
             
-    # Include title for further uniqueness
     title_val = row.get('title')
     if title_val is not None and str(title_val).strip():
         content_parts.append(str(title_val))
         
-    # Include year
     year_val = row.get('year')
     if year_val is not None:
         content_parts.append(str(year_val))
         
     combined_content = "|".join(content_parts)
     
-    # Fallback to random identifier if identifying content is entirely missing
     if not combined_content.strip():
         combined_content = str(uuid.uuid4())
         
     content_hash = hashlib.md5(combined_content.encode('utf-8', errors='ignore')).hexdigest()
     return f"{source}_{content_hash[:16]}"
+
 
 def _parse_semicolon_keywords(val) -> list:
     if hasattr(val, '__iter__') and not isinstance(val, (str, bytes)):
@@ -675,73 +773,28 @@ def _parse_list_keywords(val) -> list:
         return [val.strip()]
     return []
 
-#unified post processing functions
-#TODO adapt from pandas to pyarrow or do as seperate step
-def pp_ug():
-    pass
+#TODO check
+def safe_join_list(val, separator: str) -> str:
+    """
+    Safely converts lists, numpy arrays, or other iterables into a unified string.
+    Prevents corrupt brackets and layout formatting in CSV serialization.
+    """
+    if val is None:
+        return ""
+    # Check for iterable types first to avoid Pandas ambiguity checks
+    if isinstance(val, (list, np.ndarray, tuple, set)):
+        return separator.join([str(item).strip() for item in val if pd.notna(item)])
+    if pd.isna(val):
+        return ""
+    if isinstance(val, str):
+        return val
+    if hasattr(val, '__iter__') and not isinstance(val, (bytes, str)):
+        return separator.join([str(item).strip() for item in val if pd.notna(item)])
+    return str(val)
 
-def pp_hbo():
-    pass
-
-def pp_sb():
-    pass
-'''
-    if source_name == 'UG':
-        #subset for deduplicating
-        subset = []
-        excl = []
-
-        protected_values = {
-            'volume': [99, '99', 999, '999', 9999, '9999'],
-            'issue': [99, '99', '999', 999, '9999', 9999]
-        }
-
-    # 2. Source override: Scriptiebank specific cleans (Float year to Int)
-    if source_name == 'SB':
-        #subset for deduplicating
-        subset = []
-        excl = []
-
-        print("[SB] Casting float 'year' column to Integer type...")
-        if 'year' in df.columns:
-            df['year'] = pd.to_numeric(df['year'], errors='coerce').round().astype('Int64')
-
-    # 3. Source override: column harmonization & title merger (HBO only)
-    if source_name == 'HBO':   
-        #subset for deduplicating
-        subset = []
-        excl = []
-
-        print("[HBO] Harmonizing columns: merging 'jaar' -> 'year' and 'partners' -> 'partner'...")
-        # Merge 'jaar' into 'year'
-        if 'jaar' in df.columns:
-            if 'year' in df.columns:
-                df['year'] = df['year'].fillna(df['jaar'])
-            else:
-                df['year'] = df['jaar']
-            df = df.drop(columns=['jaar'])
-            
-        # Merge 'partners' into 'partner'
-        if 'partners' in df.columns:
-            if 'partner' in df.columns:
-                df['partner'] = df['partner'].fillna(df['partners'])
-            else:
-                df['partner'] = df['partners']
-            df = df.drop(columns=['partners'])
-            
-        # Combine 'title' and 'subtitle'
-        if 'title' in df.columns and 'subtitle' in df.columns:
-            print("[HBO] Merging 'title' and 'subtitle' columns...")
-            df['title'] = df.apply(
-                lambda r: f"{r['title']}: {r['subtitle']}" 
-                if pd.notna(r['title']) and pd.notna(r['subtitle']) and str(r['subtitle']).strip()
-                else r['title'], 
-                axis=1
-            )
-            df = df.drop(columns=['subtitle'])
-'''
-# -------------------------------
-#selection and adding cols: text_dut, sent_dut, _id, source #TODO check others
+# =====================================================================
+# ABSTRACT FILTERING AND NLP PARSING
+# =====================================================================
 def clean_abstract(
     abstract: str,
     min_char_length: int = 100,
@@ -751,8 +804,8 @@ def clean_abstract(
     logger = None
 ) -> Tuple[str, List[str]]:
     """
-    Cleans and filters abstract text. Returns a tuple containing:
-    (joined_clean_string, list_of_clean_sentences)
+    Cleans, tokenizes, and filters abstracts. Resolves formatting errors,
+    strips layout headers, and extracts Dutch sentences without dropping short text.
     """
     if heading_words is None:
         heading_words = [
@@ -769,12 +822,15 @@ def clean_abstract(
 
     def _strip_layout_headers(sent: str) -> tuple[str, Optional[str]]:
         orig = sent
+        # Strip bold/italic markdown characters
         sent_cleaned = re.sub(r'[*_]{1,2}', '', orig).strip()
         
+        # 1. Strip compressed OCR headers (e.g., "INLEIDINGDit is")
         sent_cleaned = re.sub(rf'^(?:{headings_pattern})([A-Z])', r'\1', sent_cleaned)
+        # 2. Strip standard headers followed by separators (e.g., "Inleiding: Dit is")
         sent_cleaned = re.sub(rf'^(?:{headings_pattern})[\s]*[:.-]+[\s]*', '', sent_cleaned)
-        sent_cleaned = re.sub(rf'^(?:{headings_pattern})\s+([A-Z])', r'\1', sent_cleaned)
         
+        # Clean up isolated matching heading sentences (e.g. a sentence that is just "Inleiding")
         if re.match(rf'^(?:{headings_pattern})$', sent_cleaned):
             sent_cleaned = ""
 
@@ -783,10 +839,7 @@ def clean_abstract(
                 removed = orig
             else:
                 idx = orig.find(sent_cleaned)
-                if idx != -1:
-                    removed = orig[:idx]
-                else:
-                    removed = f"'{orig}' -> '{sent_cleaned}'"
+                removed = orig[:idx] if idx != -1 else f"'{orig}' -> '{sent_cleaned}'"
             return sent_cleaned, removed
             
         return orig, None
@@ -795,6 +848,7 @@ def clean_abstract(
     dutch_sentences = []
     
     if isinstance(abstract, str) and len(abstract) >= min_char_length and abstract.strip():
+        # Fix missing spaces after punctuation to prevent sentence tokenization mergers
         abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', abstract)
         
         raw_sentences = nltk.sent_tokenize(abstract, language=tokenizer_lang)
@@ -817,33 +871,68 @@ def clean_abstract(
 
             should_merge = False
             if cleaned_sentences:
+                # Merge if the current fragment does not start with a capital letter (split abbreviation)
                 if not re.match(r'^[A-Z]', sent):
                     should_merge = True
+                # Merge if character index 1 is punctuation (like 's-Gravenhage) BUT NOT a list item (like "1." or "A.")
                 elif len(sent) >= 2 and sent[1] in string.punctuation:
-                    should_merge = True
+                    if not sent[0].isalnum(): # Only merge if the prefix is not a list indicator
+                        should_merge = True
             
             if should_merge:
                 cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
             else:
                 cleaned_sentences.append(sent)
         
+        # --- SEMANTIC RUN-LENGTH LANGUAGE FILTER ---
+        # 1. First, flag each sentence individually
+        sentence_flags = []
         for sent in cleaned_sentences:
             try:
-                if detect(sent) == detect_lang_tag:
-                    dutch_sentences.append(sent)
+                # Safe check: if it fails to detect, default to True (Dutch) to prevent accidental loss
+                is_dutch = (detect(sent) == detect_lang_tag)
             except LangDetectException:
-                continue
+                is_dutch = True
+            sentence_flags.append((sent, is_dutch))
+            
+        # 2. Reconstruct the abstract, keeping isolated non-Dutch sentences 
+        # but discarding longer sequences (runs of >= 3)
+        dutch_sentences = []
+        current_non_dutch_run = []
+        max_non_dutch_sequence = 3  # The threshold (allow up to 2, drop if >= 3)
+        
+        for sent, is_dutch in sentence_flags:
+            if is_dutch:
+                # If we hit a Dutch sentence, evaluate the accumulated non-Dutch run
+                if len(current_non_dutch_run) < max_non_dutch_sequence and len(dutch_sentences) > 0:                    # It was a short sequence (likely a false negative or citation) -> Keep it!
+                    dutch_sentences.extend(current_non_dutch_run)
+                else:
+                    if logger:
+                        logger.debug(
+                            f"Dropped non-Dutch abstract block of length {len(current_non_dutch_run)}"
+                        )
+                # Reset the accumulator and append the Dutch sentence
+                current_non_dutch_run = []
+                dutch_sentences.append(sent)
+            else:
+                # Accumulate consecutive non-Dutch sentences
+                current_non_dutch_run.append(sent)
                 
+        # 3. Handle any trailing non-Dutch sentences at the very end of the abstract
+        if len(current_non_dutch_run) < max_non_dutch_sequence:
+            dutch_sentences.extend(current_non_dutch_run)
+            
         if dutch_sentences:
             dutch_abstract = ' '.join(dutch_sentences)
             
     return dutch_abstract, dutch_sentences
 
-
+#TODO curr always works from pq file, maybe add csv option but could also always make parquet file
 def select_and_clean_abstracts(
     source_name: str,
     input_path: Path,
-    output_path: Path,
+    output_path_pq: Path,
+    output_path_csv: Path,
     min_year: int = 1980,
     max_year: int = 2022,
     min_char_length: int = 100,
@@ -857,8 +946,12 @@ def select_and_clean_abstracts(
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
     
-    #TODO maybe change to pa but rather not
-    df = pd.read_parquet(input_path)
+    if str(input_path).endswith('.csv'):
+        df = pd.read_csv(input_path)
+    elif str(input_path).endswith('.parquet'):
+        df = pd.read_parquet(input_path)
+    else:
+        raise TypeError('couldnt read filetype, use pq or csv')
     filtered_rows = []
 
     removed_stats = {
@@ -870,21 +963,17 @@ def select_and_clean_abstracts(
         "no_dutch_sentences_detected": 0
     }
 
-    # Convert the dataframe to records for fast row-by-row tqdm iteration
     records = df.to_dict(orient='records')
 
     for row in tqdm(records, desc=f"[{source_name}] Processing abstracts"):
-        #YEAR CHECK
+        # 1. Year Validation
         year = row.get('year')
-
-        # 1. Filter out missing years
         if pd.isna(year):
             removed_stats["missing_year"] += 1
             continue
 
-        # 2. Check year validity
         try:
-            year_int = int(year)
+            year_int = int(float(year))
             if not (min_year <= year_int <= max_year):
                 removed_stats["year_out_of_bounds"] += 1
                 continue
@@ -892,7 +981,7 @@ def select_and_clean_abstracts(
             removed_stats["invalid_year_format"] += 1
             continue
 
-        # ABSTRACT CHECK
+        # 2. Abstract Content Extraction
         text_content = None
         if source_name == 'UG':
             abstract_full = row.get('abstract_full')
@@ -901,50 +990,46 @@ def select_and_clean_abstracts(
                     if isinstance(item, dict) and item.get('lang') == source_lang_tag:
                         text_content = item.get('text')
                         break
-            # Fallback to general abstract if JSON list extraction is missing #TODO check this cuz its sus
-            if not text_content and isinstance(row.get('abstract'), str):
+            if not text_content and isinstance(row.get('abstract'), str): #TODO turbo sus fallback
                 text_content = row.get('abstract')
 
         elif source_name == 'SB':
-            # Check 'abstract' first, fallback to 'text_homepage' parsing
             if isinstance(row.get('abstract'), str) and row.get('abstract').strip():
                 text_content = row.get('abstract')
             elif row.get('text_homepage') is not None:
                 text_content = extract_sb_homepage_text(row.get('text_homepage'))
 
-        else: # HBO #TODO
+        else: # HBO
             if isinstance(row.get('abstract'), str):
                 text_content = row.get('abstract')
 
-        # 4. Filter out missing text
+        # 3. Content Filters
         if not text_content or not str(text_content).strip():
             removed_stats["missing_text_content"] += 1
             continue
 
-        # 5. Filter out short text
         if len(text_content) < min_char_length:
             removed_stats["text_too_short"] += 1
             continue
 
-        # 6 & 7. Clean and structure NLP sentences
-        text_dut, sent_dut = clean_abstract(text_content, min_char_length=min_char_length) #TODO check validityof clean abstract but lgtm
+        # 4. Clean and tokenise Dutch NLP components
+        text_dut, sent_dut = clean_abstract(text_content, min_char_length=min_char_length)
         
         if not sent_dut:
             removed_stats["no_dutch_sentences_detected"] += 1
             continue
 
-        # Append processing results
+        # Append calculated structures to row
         row['text_dut'] = text_dut
         row['sent_dut'] = sent_dut
         filtered_rows.append(row)
 
-    # Convert results back to DataFrame
+    # Rebuild DataFrame and apply deduplication on the standardized abstract content
     filtered_df = pd.DataFrame(filtered_rows)
 
-    # Apply duplicate dropping based on standardized abstract text (keep first) #THis is superfluous but a good check lol
     if not filtered_df.empty:
         initial_length = len(filtered_df)
-        filtered_df = filtered_df.drop_duplicates(subset=['text_dut'], keep='first')
+        filtered_df = filtered_df.drop_duplicates(subset=['text_dut'], keep='first') #should be superfluous but good check
         dropped_duplicates = initial_length - len(filtered_df)
     else:
         dropped_duplicates = 0
@@ -959,26 +1044,33 @@ def select_and_clean_abstracts(
         print(f"    - {formatted_cause}: {count}")
     print()
 
-    # Save selection to silver parquet
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not filtered_df.empty:
-        filtered_df.to_parquet(output_path, index=False)
-    else:
-        # Save empty table structure if no records passed
-        pd.DataFrame(columns=df.columns.tolist() + ['text_dut', 'sent_dut']).to_parquet(output_path, index=False)
+    # Save selection silver files to Parquet and CSV
+    if output_path_pq is not None:
+        output_path_pq.parent.mkdir(parents=True, exist_ok=True)
+        if not filtered_df.empty:
+            filtered_df.to_parquet(output_path_pq, index=False)
+        else:
+            empty_df = pd.DataFrame(columns=df.columns.tolist() + ['text_dut', 'sent_dut'])
+            empty_df.to_parquet(output_path_pq, index=False)
+            
+    if output_path_csv is not None:
+        output_path_csv.parent.mkdir(parents=True, exist_ok=True)
+        if not filtered_df.empty:
+            filtered_df.to_csv(output_path_csv, index=False)
+        else:
+            empty_df = pd.DataFrame(columns=df.columns.tolist() + ['text_dut', 'sent_dut'])
+            empty_df.to_csv(output_path_csv, index=False)
         
-    print(f"[{source_name}] Saved filtered table to: {output_path}")
+    print(f"[{source_name}] Saved filtered table to requested formats.")
 
 
-
-
-#--------------------------------
-#merging
-#TODO csv saving since it was corrupt somehow
+# =====================================================================
+# GOLD MERGE STEP
+# =====================================================================
 def merge(sources: list, output_format: str = 'csv', force: bool = False):
     """
     Merges the final {source}_selected files according to the source-specific 
-    mapping schema, generates robust IDs where missing, and normalizes columns.
+    mapping schema, generates robust deterministic IDs, and normalizes columns.
     """
     gold_dir = BASE_DIR / 'data' / 'gold'
     gold_dir.mkdir(parents=True, exist_ok=True)
@@ -1001,13 +1093,19 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         if not config:
             continue
         
-        selected_path = config['selected_file']
+        # DYNAMIC PATH RESOLVER: Falls back to CSV if Parquet Silver files are missing
+        selected_path = config['selected_file_pq'] if config['selected_file_pq'].exists() else config['selected_file_csv']
         if not selected_path.exists():
             print(f"[Merge] Selected file not found for {source} at: {selected_path}. Skipping.")
             continue
+        
+        # DYNAMIC LOADER: Read whichever format is available
+        if str(selected_path).endswith('.csv'):
+            df = pd.read_csv(selected_path)
+        else:
+            df = pd.read_parquet(selected_path)
 
         print(f"[Merge] Standardizing and processing {source}...")
-        df = pd.read_parquet(selected_path)
         
         if df.empty:
             print(f"[Merge] Selected data for {source} is empty. Skipping.")
@@ -1015,7 +1113,7 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
 
         processed_df = pd.DataFrame()
 
-        # --- Source-Specific Column Mapping Logic ---
+        # --- Source-Specific Column Mapping ---
         if source == 'UG':
             if '_id' in df.columns:
                 processed_df['id'] = df['_id'].astype(str)
@@ -1044,11 +1142,11 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         else:
             processed_df['year'] = pd.Series([None] * len(df), dtype='Int64')
 
-        # Simply grab processed NLP results directly from the Silver Selection files
+        # Map processed NLP results directly from the selection layer
         processed_df['abstract'] = df['text_dut'] if 'text_dut' in df.columns else None
         processed_df['abstract_sentence'] = df['sent_dut'] if 'sent_dut' in df.columns else None
 
-        # Enforce target gold schema order
+        # Enforce target Gold schema order
         target_cols = ['id', 'source', 'keywords', 'year', 'abstract', 'abstract_sentence']
         
         for col in target_cols:
@@ -1075,29 +1173,30 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
     if output_format in ['csv', 'both']:
         print(f"[Merge] Saving CSV merged data to: {csv_output}")
         csv_df = final_df.copy()
+        
+        # Safe string joining protects against NumPy structural cell overflows in CSV layout
         if 'keywords' in csv_df.columns:
-            csv_df['keywords'] = csv_df['keywords'].apply(lambda x: ';'.join(x) if isinstance(x, list) else x)
+            csv_df['keywords'] = csv_df['keywords'].apply(lambda x: safe_join_list(x, ';'))
         if 'abstract_sentence' in csv_df.columns:
-            csv_df['abstract_sentence'] = csv_df['abstract_sentence'].apply(lambda x: ' | '.join(x) if isinstance(x, list) else x)
+            csv_df['abstract_sentence'] = csv_df['abstract_sentence'].apply(lambda x: safe_join_list(x, ' | '))
             
         csv_df.to_csv(csv_output, index=False)
 
-    print("[Merge] Processing completed.")
+    print("[Merge] Processing completed successfully.")
 
 
-
-
-# -------------------------------
-#main
+# =====================================================================
+# PIPELINE ORCHESTRATOR
+# =====================================================================
 def main():
     parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
     parser.add_argument(
         '--sources', 
         type=str, 
         nargs='+', 
-        default=['UG', 'HBO', 'SB'], 
+        default=['UG', 'HBO'], 
         choices=['UG', 'HBO', 'SB'], 
-        help="Source dataset(s) to process. Default: all (UG, HBO, SB)"
+        help="Source dataset(s) to process. Default: only (UG, HBO)"
     )
     parser.add_argument(
         '--steps',
@@ -1115,7 +1214,7 @@ def main():
     parser.add_argument(
         '--output-format',
         type=str,
-        default='parquet',
+        default='both',
         choices=['parquet', 'csv', 'both'],
         help="Export file format for the merged step. Default: parquet. Options: parquet, csv, both"
     )
@@ -1131,48 +1230,77 @@ def main():
 
         # 1. Download Step
         if 'download' in steps:
+            print(f'Starting download: {source}')
             raw_exists = config['raw_file'].exists()
             if not raw_exists or args.force or args.force_download:
                 download_raw_data(source, config['raw_file'])
             else:
                 print(f"[{source}] Raw dataset already exists. Skipping download.")
 
-        #TODO add option for both csv and pq for cleaned and selected files
-        # 2. Clean Step
+        # 2. Clean Step (Silver Cleaned)
         if 'clean' in steps:
+            print(f'Starting cleaning: {source}')
             if not config['raw_file'].exists():
                 print(f"[{source}] Missing raw file {config['raw_file']}. Skipping cleaning step.")
                 continue
 
-            clean_exists = config['clean_file'].exists()
-            if not clean_exists or args.force or args.force_clean:
-                if source == 'UG':
-                    cleaned_table = optimize_file_table(config['raw_file'], post_process=pp_ug, save=config['clean_file'])
-                elif source == 'SB':
-                    cleaned_table = optimize_file_table(config['raw_file'], post_process=pp_sb, save=config['clean_file'])
-                elif source == 'HBO':
-                    cleaned_table = optimize_file_table(config['raw_file'], post_process=pp_hbo, save=config['clean_file'])
-            
-            else:
-                print(f"[{source}] Cleaned dataset already exists. Skipping cleaning.")
+            # Determine which targets to check and generate based on the --output-format option
+            saves = []
+            checks = []
+            if args.output_format in ['parquet', 'both']:
+                saves.append(config['clean_file_pq'])
+                checks.append(config['clean_file_pq'].exists())
+            if args.output_format in ['csv', 'both']:
+                saves.append(config['clean_file_csv'])
+                checks.append(config['clean_file_csv'].exists())
 
-        # 3. Select Step
+            # Build only if any requested format is missing, or if forced
+            clean_exists = all(checks) if checks else False
+            if not clean_exists or args.force or args.force_clean:
+            #TODO check post processing functions
+            #TODO check deduplication cols
+                if source == 'UG':
+                    opt_table = optimize_file_table(config['raw_file'], save=saves) #doesnt need pp
+                elif source == 'SB':
+                    opt_table = optimize_file_table(config['raw_file'], post_process=pp_sb, save=saves)
+                elif source == 'HBO':
+                    opt_table = optimize_file_table(config['raw_file'], post_process=pp_hbo, save=saves, remove_duplicates=['abstract'])
+                print(opt_table.schema)
+            else:
+                print(f"[{source}] Cleaned dataset already exists for target format(s). Skipping cleaning.")
+
+        # 3. Select Step (Silver Selected)
         if 'select' in steps:
-            if not config['clean_file'].exists():
-                print(f"[{source}] Missing cleaned file {config['clean_file']}. Skipping selection step.")
+            print(f'Starting row selection: {source}')
+            # Safely fallback to reading CSV as the input source for NLP if PQ doesn't exist
+            input_file = config['clean_file_pq'] if config['clean_file_pq'].exists() else config['clean_file_csv']
+            if not input_file.exists():
+                print(f"[{source}] Missing cleaned file. Skipping selection step.")
                 continue
 
-            selected_exists = config['selected_file'].exists()
+            checks = []
+            output_pq = None
+            output_csv = None
+
+            if args.output_format in ['parquet', 'both']:
+                output_pq = config['selected_file_pq']
+                checks.append(config['selected_file_pq'].exists())
+            if args.output_format in ['csv', 'both']:
+                output_csv = config['selected_file_csv']
+                checks.append(config['selected_file_csv'].exists())
+
+            selected_exists = all(checks) if checks else False
             if not selected_exists or args.force or args.force_select:
                 select_and_clean_abstracts(
                     source_name=source,
-                    input_path=config['clean_file'],
-                    output_path=config['selected_file']
+                    input_path=input_file,
+                    output_path_pq=output_pq,
+                    output_path_csv=output_csv
                 )
             else:
-                print(f"[{source}] Selected dataset already exists. Skipping selection.")
+                print(f"[{source}] Selected dataset already exists for target format(s). Skipping selection.")
 
-    # 4. Merge Step
+    # 4. Merge Step (Gold Merged)
     if 'merge' in steps:
         print("\n--- Running final merge step ---")
         merge(
@@ -1181,38 +1309,6 @@ def main():
             force=args.force or args.force_merge
         )
 
-#-------------------------------
 
-
-# =====================================================================
-# 4. USER CONFIGURATION BLOCK
-# =====================================================================
 if __name__ == "__main__":
     main()
-
-
-
-
-#TODO save cleaned as both csv and pq
-#TODO change location of adding cols text_dut and sent_dut to before cleaning.
-
-
-'''
-logical structure
-
-- download and scrape
-
-- clean -> csv and pq
-    - fix scraper mistakes
-
-- select
-    - select
-    - make extra cols text_dut and sent_dut (temp?)
-
-- clean again
-
-- merge
-
-
-
-'''

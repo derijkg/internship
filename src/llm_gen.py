@@ -7,16 +7,14 @@
 #TODO set argparse options to prio one source? 
 #TODO
 
-import hashlib
-import logging
+#TODO integreer beststaande cp_rwr_ug -> als de exacte zin er al in staat skip (verwijderen van task)
+
 import re
 import time
-import zipfile
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 import pandas as pd
-import requests
 from tqdm import tqdm
 from bs4 import BeautifulSoup
 import nltk
@@ -26,13 +24,7 @@ from langdetect import detect, LangDetectException
 import string
 import random
 import argparse
-from scrape import ScriptiebankScraper, HBOScraper
-import mu
-import io
-import ast
 import json
-import numpy as np
-from mu import DataFrameCleaner
 import pyarrow as pa
 import pyarrow.json as pj
 import pyarrow.parquet as pq
@@ -44,9 +36,11 @@ import atexit
 import socket
 import binascii
 from ollama import Client
-import torch
 #from pydantic import BaseModel, Field
 #import itertools
+
+#TODO add different methods for generating the uuhhhh percentage task thru argparse
+#TODO 
 
 
 # GLOBAL VARS
@@ -560,7 +554,6 @@ def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42, res
     return rewritten
 
 
-
 def run_generation(
     tasks: list[dict],
     rows: list[dict],
@@ -698,7 +691,7 @@ def run_generation(
         unload_model(current_model)
     return rows
 
-
+#TODO '\n \r? 
 def normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -741,7 +734,8 @@ def generation_main(
     debug_mode: bool = False,
     debug_pct_only: bool = False,
     debug_count: int = 5,
-    exclude_percentage: bool = False
+    exclude_percentage: bool = False,
+    task_steps: List = None
 ):
     if selected_path is None:
         selected_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_selected.parquet"
@@ -789,6 +783,7 @@ def generation_main(
             
     tasks, rows = prepare_tasks(ug_table, checkpoint_path, models_list, percentages_to_run)
 
+    #TODO make subset based on args.tasks
     if debug_pct_only:
         print("\n[DEBUG PCT ONLY ACTIVE] Filtering out non-percentage tasks.")
         tasks = [t for t in tasks if t['type'] == 'percentage']
@@ -831,6 +826,7 @@ def generation_main(
 
 
 #CONSTRUCTION OF FINAL DATASET
+#TODO remove but keep logic for loading checkpoint (also from func above), and uhh adding cp to df, modify for source and shit
 def consolidate_checkpoints(silver_dir: Union[str, Path] = BASE_DIR / 'data' / 'silver') -> pd.DataFrame:
     """
     Traverses the silver directory, parses all source checkpoint JSONL files,
@@ -974,35 +970,37 @@ def main():
     parser.add_argument(
         '--source', 
         type=str, 
-        default='UG', 
+        default=['UG', 'HBO'], 
         choices=['UG', 'HBO', 'SB'], 
-        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank)"
+        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). Default: UG and HBO"
     )
-    parser.add_argument('--force-download', action='store_true', help="Force download the raw files")
-    parser.add_argument('--force-clean', action='store_true', help="Force run the cleaning pipeline")
-    parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
     
-
+    #TODO integrate into main
     parser.add_argument(
-        '--debug-pct-only', 
-        action='store_true', 
-        help="Run the LLM generation in debug mode with exactly 5 percentage-type tasks for all active models"
+        '--tasks', 
+        type=str, 
+        nargs='+', 
+        default=['sentence','full'], 
+        choices=['sentence', 'percentage', 'full'], 
+        help="Type of tasks to perform. Default: no percentage (sent, full)"
     )
+
+    parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
+
     args = parser.parse_args()
 
-    source_name = args.source.upper()
-
-    # Ensure necessary pipeline folder outputs are generated
-    (BASE_DIR / 'data' / 'bronze' / source_name).mkdir(parents=True, exist_ok=True)
-    (BASE_DIR / 'data' / 'silver' / source_name).mkdir(parents=True, exist_ok=True)
 
 
     # 4. Generation Section
-    checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl"
+    #TODO question do we keep the ug cp and add to it or do we handle it seperately
+    #checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl" #TODO make generic
+    #checkpoint_path = BASE_DIR / 'data' / 'gold' / 'checkpoint_rewrites.jsonl'
+    
     percentages = [25, 50, 75]
     
 
-    if args.debug or args.debug_pct_only:
+
+    if args.debug:
         print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
         active_models_list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
     else:
@@ -1011,21 +1009,21 @@ def main():
     print(f'Starting LLM generation pipeline for source: {source_name}')
     generation_main(
         source_name=source_name,
-        table=table,
-        selected_path=selected_path,
-        checkpoint_path=checkpoint_path,
+        table=table, #TODO empty keyword lists will not be recognized as null but thats fine for now
+        selected_path=selected_path, #TODO should always be gold merged
+        checkpoint_path=checkpoint_path, #TODO create new generic non source included cp file and add seperate check list of paths of older cp
         models_list=active_models_list,
         percentages_to_run=percentages,
         debug_mode=args.debug,
-        debug_pct_only=args.debug_pct_only,
-        exclude_percentage=False
+        task_steps = args.tasks,
+        exclude_percentage=False #TODO unuse
     )
 
     # GOLD DATAFRAME
-    if not (args.debug_pct_only or args.debug):
+    if not args.debug:
         gold_df_path = BASE_DIR / 'data' / 'gold' / 'gold.csv'
-        df = consolidate_checkpoints()
-        df.to_csv(gold_df_path)
+        pass
+        #TODO save new gen data added csv and or pq to gold
 
 if __name__ == "__main__":
     main()
