@@ -8,6 +8,7 @@
 #TODO
 
 #TODO integreer beststaande cp_rwr_ug -> als de exacte zin er al in staat skip (verwijderen van task)
+#TODO read from csv abstract sentences '|' or ' | ' 
 
 import re
 import time
@@ -44,9 +45,13 @@ from ollama import Client
 
 
 # GLOBAL VARS
-# - Path(__file__).resolve() points to 'internship/src/run.py'
-# - .parent.parent resolves to the root folder 'internship/'
-BASE_DIR = Path(__file__).resolve().parent.parent
+
+BASE_DIR = Path(__file__).resolve().parent.parent #this script is in /home/gderijck/internship/src/llm_gen.py
+INPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "merged_publications.csv"
+INPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "merged_publications.parquet"
+OUTPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "llm_added.csv"
+OUTPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "llm_added.parquet"
+CHECKPOINT_PATH = BASE_DIR / "data" / "gold" / "checkpoint_rewrites.jsonl"
 
 # generation
 # ollama server functions
@@ -182,19 +187,6 @@ def unload_model(model_name: str):
 
 
 # GENERATION proper
-#not used
-def save_parquet_on_exit(rows: list[dict], output_path: Path):
-    if rows:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"\n[Exit Handler] Auto-saving active progress to Parquet: {output_path}...")
-        try:
-            table = pa.Table.from_pylist(rows)
-            pq.write_table(table, output_path)
-            print("[Exit Handler] Progress saved successfully.")
-        except Exception as e:
-            print(f"[Exit Handler] Error during auto-save: {e}")
-
 #after generation add to checkpoint.jsonl
 def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
     checkpoint_path = Path(checkpoint_path)
@@ -368,15 +360,16 @@ def prepare_tasks(
                         continue
 
                     if t_type == "sentence":
-                        sent_dut = row.get("sent_dut")
-                        if not isinstance(sent_dut, list):
+                        # ADDED: Changed 'sent_dut' to 'abstract_sentence' to align with the new schema
+                        abstract_sentence = row.get("abstract_sentence")
+                        if not isinstance(abstract_sentence, list):
                             mismatched_discard_count += 1
                             continue
 
                         matched_idx = -1
                         if orig_text:
                             clean_orig = orig_text.strip()
-                            for idx, sent in enumerate(sent_dut):
+                            for idx, sent in enumerate(abstract_sentence):
                                 if sent.strip() == clean_orig:
                                     matched_idx = idx
                                     text_match_count += 1
@@ -385,7 +378,7 @@ def prepare_tasks(
                         if matched_idx == -1 and sent_idx is not None:
                             try:
                                 sent_idx_int = int(sent_idx)
-                                if 0 <= sent_idx_int < len(sent_dut):
+                                if 0 <= sent_idx_int < len(abstract_sentence):
                                     matched_idx = sent_idx_int
                                     idx_fallback_count += 1
                             except (ValueError, TypeError):
@@ -420,20 +413,21 @@ def prepare_tasks(
     tasks = []
     for row in rows:
         row_id = row.get(id_key)
-        text_dut = row.get('text_dut')
-        sent_dut = row.get('sent_dut')
+        # ADDED: Changed 'text_dut' -> 'abstract' and 'sent_dut' -> 'abstract_sentence'
+        abstract = row.get('abstract')
+        abstract_sentence = row.get('abstract_sentence')
 
-        if not isinstance(text_dut, str) or not text_dut.strip() or not isinstance(sent_dut, list) or not sent_dut:
+        if not isinstance(abstract, str) or not abstract.strip() or not isinstance(abstract_sentence, list) or not abstract_sentence:
             continue
 
-        num_sentences = len(sent_dut)
+        num_sentences = len(abstract_sentence)
 
         for model in models_list:
             col_name = f'{model}_single'
             if col_name not in row or not isinstance(row[col_name], list) or len(row[col_name]) != num_sentences:
                 row[col_name] = [None] * num_sentences
 
-            for sent_idx, sentence in enumerate(sent_dut):
+            for sent_idx, sentence in enumerate(abstract_sentence):
                 if row[col_name][sent_idx] is None:
                     tasks.append({
                         "id": row_id,
@@ -441,7 +435,7 @@ def prepare_tasks(
                         "model": model,
                         "sent_idx": sent_idx,
                         "text": sentence,
-                        "context": text_dut
+                        "context": abstract # ADDED: Changed context references to new abstract column
                     })
 
             for pct in percentages:
@@ -475,11 +469,11 @@ def prepare_tasks(
                         if i in group_starts:
                             group = group_starts[i]
                             t_id = group_to_id[i]
-                            block_text = " ".join([sent_dut[idx] for idx in group])
+                            block_text = " ".join([abstract_sentence[idx] for idx in group]) # ADDED: Changed from sent_dut
                             annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
                             i += len(group)
                         else:
-                            annotated_parts.append(sent_dut[i])
+                            annotated_parts.append(abstract_sentence[i]) # ADDED: Changed from sent_dut
                             i += 1
                     
                     annotated_abstract = " ".join(annotated_parts)
@@ -500,11 +494,10 @@ def prepare_tasks(
                     "id": row_id,
                     "type": "full_abstract",
                     "model": model,
-                    "text": text_dut
+                    "text": abstract # ADDED: Changed from text_dut
                 })
 
     return tasks, rows
-
 
 
 
@@ -516,7 +509,7 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
     
     if t_type == "sentence":
         sent_idx = task["sent_idx"]
-        num_sentences = len(row['sent_dut'])
+        num_sentences = len(row['abstract_sentence'])
         if f'{model}_single' not in row or not isinstance(row[f'{model}_single'], list) or len(row[f'{model}_single']) != num_sentences:
             row[f'{model}_single'] = [None] * num_sentences
             
@@ -619,7 +612,7 @@ def run_generation(
                     break
             
             if t_type == 'percentage':
-                original_sentences = row['sent_dut']
+                original_sentences = row['abstract_sentence']
                 tagged_groups = task['tagged_groups']
                 
                 try:
@@ -699,13 +692,23 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+#useful?
+def normalize_text_NFKC(text: str) -> str:
+    """Normalizes text by applying Unicode NFKC normalization and collapsing whitespace."""
+    if not text:
+        return ""
+    # Strip unicode control characters / unusual spaces
+    text = unicodedata.normalize("NFKC", text)
+    # Replace all whitespace runs (tabs, newlines, non-breaking spaces) with a single space
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 #select models for differnet calcs
 def get_models_list():
     CALC_MODEL_MAPPING = {
-        'calc12': ['gemma4:26b'],
-        'calc11': ['qwen3.6:27b'],
+        'calc12': ['gemma4:26b','gemma4:e4b'],
+        'calc11': ['qwen3.6:27b','qwen3.5:4b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -723,10 +726,7 @@ def get_models_list():
 
 
 def generation_main(
-    source_name: str,
-    table: pa.Table = None,
-    selected_path: Path = None,
-    checkpoint_path: Path = None,
+    table: pa.Table,
     models_list: list[str] = None,
     percentages_to_run: list[int] = [25, 50, 75],
     port: int = 11435,
@@ -736,21 +736,7 @@ def generation_main(
     debug_count: int = 5,
     exclude_percentage: bool = False,
     task_steps: List = None
-):
-    if selected_path is None:
-        selected_path = BASE_DIR / 'data' / 'silver' / source_name / f"{source_name.lower()}_selected.parquet"
-    else:
-        selected_path = Path(selected_path)
-        
-    if checkpoint_path is None:
-        checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl"
-    else:
-        checkpoint_path = Path(checkpoint_path)
-
-    # Ensure parent directories exist before processing
-    selected_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
+) -> list[dict]: # ADDED: Returns updated rows list
     system_prompts = {
         "sentence": (
             "You are a professional Dutch editor.\n"
@@ -772,18 +758,9 @@ def generation_main(
     global ollama
     import ollama
     
-    if table is not None:
-        ug_table = table
-    else:
-        print(f"Loading Parquet data from: {selected_path}")
-        if not selected_path.exists():
-            print(f"Error: Parquet file not found at {selected_path}")
-            sys.exit(1)
-        ug_table = pq.read_table(selected_path)
-            
-    tasks, rows = prepare_tasks(ug_table, checkpoint_path, models_list, percentages_to_run)
+    # ADDED: Removed directory search and explicitly parse using the global CHECKPOINT_PATH
+    tasks, rows = prepare_tasks(table, CHECKPOINT_PATH, models_list, percentages_to_run)
 
-    #TODO make subset based on args.tasks
     if debug_pct_only:
         print("\n[DEBUG PCT ONLY ACTIVE] Filtering out non-percentage tasks.")
         tasks = [t for t in tasks if t['type'] == 'percentage']
@@ -819,148 +796,12 @@ def generation_main(
     print(f"Total pending tasks to generate: {len(tasks)}")
     
     if len(tasks) == 0:
-        print("All specified tasks are already completed in the dataset. Exiting.")
-        return
+        print("All specified tasks are already completed in the dataset.")
+        return rows
         
-    run_generation(tasks, rows, system_prompts, checkpoint_path, debug_mode=debug_mode)
-
-
-#CONSTRUCTION OF FINAL DATASET
-#TODO remove but keep logic for loading checkpoint (also from func above), and uhh adding cp to df, modify for source and shit
-def consolidate_checkpoints(silver_dir: Union[str, Path] = BASE_DIR / 'data' / 'silver') -> pd.DataFrame:
-    """
-    Traverses the silver directory, parses all source checkpoint JSONL files,
-    and aggregates them into a single, structured Pandas DataFrame.
-    """
-    silver_path = Path(silver_dir)
-    
-    # 1. Discover all checkpoint files matching the pattern
-    # Looks in the silver directory and any subfolders (e.g., silver/UG/)
-    checkpoint_files = list(silver_path.glob("**/checkpoint_rewrites_*.jsonl"))
-    
-    if not checkpoint_files:
-        print(f"No checkpoint files found in {silver_path}")
-        return pd.DataFrame()
-
-    # We use a nested dictionary to aggregate tasks by (source, doc_id)
-    # Key: (source, doc_id) -> Value: aggregated document record
-    aggregated_data = {}
-    
-    # Keep track of all models and percentages discovered dynamically
-    discovered_models = set()
-    discovered_percentages = set()
-
-    # 2. Parse checkpoint files
-    for file_path in checkpoint_files:
-        match = re.search(r"checkpoint_rewrites_([a-zA-Z0-9_-]+)\.jsonl$", file_path.name)
-        if not match:
-            continue
-        source = match.group(1).upper()
-        
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                
-                doc_id = str(record.get("id"))
-                t_type = record.get("type")
-                model = record.get("model")
-                rewritten = record.get("rewritten")
-                orig_text = record.get("text")
-                
-                if not doc_id:
-                    continue
-                
-                key = (source, doc_id)
-                if key not in aggregated_data:
-                    aggregated_data[key] = {
-                        "id": doc_id,
-                        "source": source,
-                        "abstract": None,
-                        "abstract_sent_dict": {},  # temp storage to order by index
-                        "models_single_dict": {},  # {model: {sent_idx: rewritten}}
-                        "models_pct": {},          # {(model, pct): rewritten}
-                        "models_full": {}          # {model: rewritten}
-                    }
-                
-                entry = aggregated_data[key]
-                
-                if model:
-                    discovered_models.add(model)
-                
-                # --- Task parsing ---
-                if t_type == "full_abstract":
-                    if orig_text:
-                        entry["abstract"] = orig_text
-                    if model and rewritten:
-                        entry["models_full"][model] = rewritten
-                        
-                elif t_type == "percentage":
-                    pct = record.get("percentage")
-                    if pct is not None:
-                        discovered_percentages.add(pct)
-                        if model and rewritten:
-                            entry["models_pct"][(model, pct)] = rewritten
-                            
-                elif t_type == "sentence":
-                    sent_idx = record.get("sent_idx")
-                    if sent_idx is not None:
-                        try:
-                            idx = int(sent_idx)
-                            if orig_text:
-                                entry["abstract_sent_dict"][idx] = orig_text
-                            if model and rewritten:
-                                if model not in entry["models_single_dict"]:
-                                    entry["models_single_dict"][model] = {}
-                                entry["models_single_dict"][model][idx] = rewritten
-                        except (ValueError, TypeError):
-                            pass
-
-    # 3. Reconstruct into flat rows for the final DataFrame
-    flat_rows = []
-    for (source, doc_id), entry in aggregated_data.items():
-        row = {
-            "id": entry["id"],
-            "source": entry["source"],
-            "abstract": entry["abstract"]
-        }
-        
-        # Sort and construct the original sentence list
-        sent_dict = entry["abstract_sent_dict"]
-        if sent_dict:
-            max_idx = max(sent_dict.keys())
-            abstract_sent = [sent_dict.get(i) for i in range(max_idx + 1)]
-        else:
-            abstract_sent = []
-        row["abstract_sent"] = abstract_sent
-        
-        # Build dynamic model columns
-        for model in discovered_models:
-            # {model}_single: Reconstruct list of rewritten sentences aligned with indices
-            single_dict = entry["models_single_dict"].get(model, {})
-            if single_dict or sent_dict:
-                max_single_idx = max(list(single_dict.keys()) + list(sent_dict.keys()))
-                model_single_list = [single_dict.get(i) for i in range(max_single_idx + 1)]
-            else:
-                model_single_list = []
-            row[f"{model}_single"] = model_single_list
-            
-            # {model}_{pct}
-            for pct in discovered_percentages:
-                row[f"{model}_{pct}"] = entry["models_pct"].get((model, pct))
-                
-            # {model}_full
-            row[f"{model}_full"] = entry["models_full"].get(model)
-            
-        flat_rows.append(row)
-        
-    return pd.DataFrame(flat_rows)
-
+    # ADDED: Passes global CHECKPOINT_PATH and returns the updated rows structure
+    updated_rows = run_generation(tasks, rows, system_prompts, CHECKPOINT_PATH, debug_mode=debug_mode)
+    return updated_rows
 
 
 # script execution
@@ -970,35 +811,77 @@ def main():
     parser.add_argument(
         '--source', 
         type=str, 
-        default=['UG', 'HBO'], 
+        default=None, 
         choices=['UG', 'HBO', 'SB'], 
-        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). Default: UG and HBO"
+        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). If not specified, processes all available."
     )
-    
-    #TODO integrate into main
     parser.add_argument(
         '--tasks', 
         type=str, 
         nargs='+', 
         default=['sentence','full'], 
         choices=['sentence', 'percentage', 'full'], 
-        help="Type of tasks to perform. Default: no percentage (sent, full)"
+        help="Type of tasks to perform. Default: sentence and full"
     )
-
     parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
+    parser.add_argument(
+        '--format', 
+        type=str, 
+        default='both', 
+        choices=['csv', 'parquet', 'both'], 
+        help="Output save format. Default: both"
+    )
 
     args = parser.parse_args()
 
+    # ADDED: Load previous output if it exists to preserve current progress across runs, otherwise fallback to base dataset
+    if OUTPUT_DATA_PARQUET.exists():
+        print(f"Loading existing output parquet: {OUTPUT_DATA_PARQUET}")
+        table = pq.read_table(OUTPUT_DATA_PARQUET)
+    elif OUTPUT_DATA_CSV.exists():
+        print(f"Loading existing output csv: {OUTPUT_DATA_CSV}")
+        table = pa.Table.from_pandas(pd.read_csv(OUTPUT_DATA_CSV))
+    elif INPUT_DATA_PARQUET.exists():
+        print(f"Loading base publications parquet: {INPUT_DATA_PARQUET}")
+        table = pq.read_table(INPUT_DATA_PARQUET)
+    elif INPUT_DATA_CSV.exists():
+        print(f"Loading base publications csv: {INPUT_DATA_CSV}")
+        table = pa.Table.from_pandas(pd.read_csv(INPUT_DATA_CSV))
+    else:
+        print("Error: No input or output data datasets located in the gold directory.")
+        sys.exit(1)
 
+    # ADDED: Convert Table to DataFrame and safely deserialize list-type columns (like abstract_sentence) if parsed from CSV string formats
+    df = table.to_pandas()
+    for col in df.columns:
+        if df[col].dtype == object:
+            first_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+            if isinstance(first_val, str) and first_val.strip().startswith('['):
+                try:
+                    df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
+                except Exception:
+                    pass
 
-    # 4. Generation Section
-    #TODO question do we keep the ug cp and add to it or do we handle it seperately
-    #checkpoint_path = selected_path.parent / f"checkpoint_rewrites_{source_name.lower()}.jsonl" #TODO make generic
-    #checkpoint_path = BASE_DIR / 'data' / 'gold' / 'checkpoint_rewrites.jsonl'
-    
-    percentages = [25, 50, 75]
-    
+    # ADDED: Filter active target rows to process while keeping the unselected sources safe for final merge-back
+    if args.source:
+        print(f"Filtering dataset for source: {args.source}")
+        source_mask = df['source'] == args.source
+        active_df = df[source_mask].copy()
+        inactive_df = df[~source_mask].copy()
+    else:
+        print("Processing all sources found within the dataset.")
+        active_df = df.copy()
+        inactive_df = pd.DataFrame()
 
+    if active_df.empty:
+        print(f"No records available to process matching source: {args.source}")
+        sys.exit(0)
+
+    active_table = pa.Table.from_pandas(active_df)
+
+    percentages = []
+    if 'percentage' in args.tasks:
+        percentages = [25, 50, 75]
 
     if args.debug:
         print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
@@ -1006,24 +889,66 @@ def main():
     else:
         active_models_list = get_models_list()
 
-    print(f'Starting LLM generation pipeline for source: {source_name}')
-    generation_main(
-        source_name=source_name,
-        table=table, #TODO empty keyword lists will not be recognized as null but thats fine for now
-        selected_path=selected_path, #TODO should always be gold merged
-        checkpoint_path=checkpoint_path, #TODO create new generic non source included cp file and add seperate check list of paths of older cp
+    print("Starting LLM generation pipeline...")
+    updated_rows = generation_main(
+        table=active_table,
         models_list=active_models_list,
         percentages_to_run=percentages,
         debug_mode=args.debug,
-        task_steps = args.tasks,
-        exclude_percentage=False #TODO unuse
+        task_steps=args.tasks,
+        exclude_percentage=('percentage' not in args.tasks)
     )
 
-    # GOLD DATAFRAME
+    # ADDED: Write output files only when processing tasks are completed
     if not args.debug:
-        gold_df_path = BASE_DIR / 'data' / 'gold' / 'gold.csv'
-        pass
-        #TODO save new gen data added csv and or pq to gold
+        updated_active_df = pd.DataFrame(updated_rows)
+        
+        # Combine modifications back with unprocessed entries
+        if not inactive_df.empty:
+            final_df = pd.concat([updated_active_df, inactive_df], ignore_index=True)
+        else:
+            final_df = updated_active_df
+
+        print("\nAll tasks completed. Saving final aggregated dataset...")
+        OUTPUT_DATA_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+        
+        # ADDED: Export to CSV and/or Parquet according to selection (default: both)
+        if args.format in ('parquet', 'both'):
+            final_table = pa.Table.from_pandas(final_df)
+            pq.write_table(final_table, OUTPUT_DATA_PARQUET)
+            print(f"Successfully saved Parquet: {OUTPUT_DATA_PARQUET}")
+            
+        if args.format in ('csv', 'both'):
+            final_df.to_csv(OUTPUT_DATA_CSV, index=False)
+            print(f"Successfully saved CSV: {OUTPUT_DATA_CSV}")
+    else:
+        print("\n[DEBUG] Pipeline completed execution. File system changes skipped in debug mode.")
 
 if __name__ == "__main__":
     main()
+
+
+'''
+import unicodedata
+
+def preprocess_text(text):
+    if not isinstance(text, str):
+        return text
+    
+    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 2. Standardize common quotation marks and dashes (optional but recommended)
+    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+    text = text.replace('—', '-').replace('–', '-') # Standardize em/en dashes to hyphens
+    
+    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
+    text = " ".join(text.split())
+    
+    return text
+
+# Apply this function to both datasets
+human_abstracts_cleaned = [preprocess_text(t) for t in human_abstracts]
+llm_abstracts_cleaned = [preprocess_text(t) for t in existing_llm_abstracts]
+
+'''

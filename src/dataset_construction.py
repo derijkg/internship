@@ -20,6 +20,7 @@ import string
 from tqdm import tqdm
 import numpy as np
 import nltk
+import unicodedata
 
 # Self-healing NLTK tokenizer download safeguards
 try:
@@ -795,6 +796,26 @@ def safe_join_list(val, separator: str) -> str:
 # =====================================================================
 # ABSTRACT FILTERING AND NLP PARSING
 # =====================================================================
+def normalize_text(text: str) -> str:
+    """
+    Applies NFKC normalization, standardizes smart punctuation (quotes/dashes),
+    and collapses duplicate whitespaces or hidden layout breaks.
+    """
+    if not isinstance(text, str):
+        return ""
+    
+    # 1. NFKC normalization (standardizes ligatures, accents, and symbol variants)
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 2. Convert curly/smart punctuation and non-standard dashes to standard ASCII
+    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+    text = text.replace('—', '-').replace('–', '-')
+    
+    # 3. Collapse multiple whitespaces and convert carriage returns/tabs into standard spaces
+    text = " ".join(text.split())
+    
+    return text
+
 def clean_abstract(
     abstract: str,
     min_char_length: int = 100,
@@ -807,6 +828,9 @@ def clean_abstract(
     Cleans, tokenizes, and filters abstracts. Resolves formatting errors,
     strips layout headers, and extracts Dutch sentences without dropping short text.
     """
+    # 1. Normalize unicode and clean whitespace variants before running any NLP matches
+    abstract = normalize_text(abstract)
+
     if heading_words is None:
         heading_words = [
             "achtergrond", "inleiding", "doelstelling", "methode", "methoden", 
@@ -1174,6 +1198,7 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         print(f"[Merge] Saving CSV merged data to: {csv_output}")
         csv_df = final_df.copy()
         
+        #TODO why joined "|"
         # Safe string joining protects against NumPy structural cell overflows in CSV layout
         if 'keywords' in csv_df.columns:
             csv_df['keywords'] = csv_df['keywords'].apply(lambda x: safe_join_list(x, ';'))
