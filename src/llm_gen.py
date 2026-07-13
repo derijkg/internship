@@ -37,11 +37,12 @@ import atexit
 import socket
 import binascii
 from ollama import Client
+import unicodedata
 #from pydantic import BaseModel, Field
 #import itertools
 
 #TODO add different methods for generating the uuhhhh percentage task thru argparse
-#TODO 
+#TODO read from csv: abs_sent =  ' | ' joined sentences
 
 
 # GLOBAL VARS
@@ -295,7 +296,7 @@ def prepare_tasks(
     # Dynamic key fallback resolution if the dataset has unconventional naming schemas
     if '_id' in table.column_names:
         id_key = '_id'
-    elif 'id' in table.column_names:
+    elif 'id' in table.column_names: #This one
         id_key = 'id'
     elif 'page_link' in table.column_names:
         id_key = 'page_link'
@@ -306,9 +307,12 @@ def prepare_tasks(
 
     rows_map = {str(row[id_key]): row for row in rows}
 
+    # Initialize counters (including full_abstract and percentage tracking)
     total_loaded = 0
     text_match_count = 0
     idx_fallback_count = 0
+    full_abstract_match_count = 0
+    percentage_match_count = 0
     mismatched_discard_count = 0
     missing_row_discard_count = 0
     corrupted_count = 0
@@ -360,7 +364,7 @@ def prepare_tasks(
                         continue
 
                     if t_type == "sentence":
-                        # ADDED: Changed 'sent_dut' to 'abstract_sentence' to align with the new schema
+                        # Changed 'sent_dut' to 'abstract_sentence' to align with the new schema
                         abstract_sentence = row.get("abstract_sentence")
                         if not isinstance(abstract_sentence, list):
                             mismatched_discard_count += 1
@@ -393,23 +397,38 @@ def prepare_tasks(
                     else:
                         task_meta = {"type": t_type, "model": model, "sent_idx": sent_idx, "percentage": pct}
                         apply_rewrite_to_row(row, task_meta, rewritten_text)
+                        
+                        # Increment correct tracker based on task type
+                        if t_type == "full_abstract":
+                            full_abstract_match_count += 1
+                        elif t_type == "percentage":
+                            percentage_match_count += 1
 
                 except (json.JSONDecodeError, ValueError, TypeError):
                     corrupted_count += 1
                     continue
 
+    # Improved alignment report printing
     if total_loaded > 0:
+        total_aligned = text_match_count + idx_fallback_count + full_abstract_match_count + percentage_match_count
         print("\n====================================================")
         print("          CHECKPOINT MERGING & ALIGNMENT REPORT")
         print("====================================================")
         print(f" Total records loaded from checkpoint: {total_loaded}")
-        print(f" Successfully aligned (Exact Text Matches) : {text_match_count}")
-        print(f" Successfully aligned (Index Fallbacks)    : {idx_fallback_count}")
+        print("----------------------------------------------------")
+        print(f" Successfully aligned (Total)              : {total_aligned}")
+        print(f"   - Sentence (Exact Text Matches)         : {text_match_count}")
+        print(f"   - Sentence (Index Fallbacks)            : {idx_fallback_count}")
+        print(f"   - Full Abstract Rewrites                : {full_abstract_match_count}")
+        print(f"   - Percentage-based Rewrites             : {percentage_match_count}")
+        print("----------------------------------------------------")
         print(f" Discarded (Unmatched sentence text/index) : {mismatched_discard_count}")
         print(f" Discarded (Missing row IDs)               : {missing_row_discard_count}")
         print(f" Discarded (Corrupted/Malformed lines)     : {corrupted_count}")
         print("====================================================\n")
 
+
+    #CREATE TASKS FOR REMAINING
     tasks = []
     for row in rows:
         row_id = row.get(id_key)
@@ -685,22 +704,20 @@ def run_generation(
     return rows
 
 #TODO '\n \r? 
-def normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("`", "'")
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-#useful?
-def normalize_text_NFKC(text: str) -> str:
-    """Normalizes text by applying Unicode NFKC normalization and collapsing whitespace."""
-    if not text:
-        return ""
-    # Strip unicode control characters / unusual spaces
-    text = unicodedata.normalize("NFKC", text)
-    # Replace all whitespace runs (tabs, newlines, non-breaking spaces) with a single space
-    text = re.sub(r"\s+", " ", text).strip()
+def normalize_text(text):
+    if not isinstance(text, str):
+        return text
+    
+    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 2. Standardize common quotation marks and dashes (optional but recommended)
+    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+    text = text.replace('—', '-').replace('–', '-') # Standardize em/en dashes to hyphens
+    
+    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
+    text = " ".join(text.split())
+    
     return text
 
 
@@ -761,6 +778,16 @@ def generation_main(
     # ADDED: Removed directory search and explicitly parse using the global CHECKPOINT_PATH
     tasks, rows = prepare_tasks(table, CHECKPOINT_PATH, models_list, percentages_to_run)
 
+    if task_steps:
+        # Map cli choices to internal task type identifiers
+        type_mapping = {
+            'sentence': 'sentence',
+            'full': 'full_abstract',
+            'percentage': 'percentage'
+        }
+        allowed_types = [type_mapping[t] for t in task_steps if t in type_mapping]
+        tasks = [t for t in tasks if t['type'] in allowed_types]
+        
     if debug_pct_only:
         print("\n[DEBUG PCT ONLY ACTIVE] Filtering out non-percentage tasks.")
         tasks = [t for t in tasks if t['type'] == 'percentage']
@@ -810,8 +837,9 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
     parser.add_argument(
         '--source', 
-        type=str, 
-        default=None, 
+        type=str,
+        nargs='+', 
+        default=['UG', 'HBO'], 
         choices=['UG', 'HBO', 'SB'], 
         help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). If not specified, processes all available."
     )
@@ -865,7 +893,7 @@ def main():
     # ADDED: Filter active target rows to process while keeping the unselected sources safe for final merge-back
     if args.source:
         print(f"Filtering dataset for source: {args.source}")
-        source_mask = df['source'] == args.source
+        source_mask = df['source'].isin(args.source)
         active_df = df[source_mask].copy()
         inactive_df = df[~source_mask].copy()
     else:

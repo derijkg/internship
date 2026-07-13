@@ -819,6 +819,7 @@ def normalize_text(text: str) -> str:
 def clean_abstract(
     abstract: str,
     min_char_length: int = 100,
+    min_sentences: int = 4,
     tokenizer_lang: str = 'dutch',
     detect_lang_tag: str = 'nl',
     heading_words: Optional[List[str]] = None,
@@ -826,10 +827,29 @@ def clean_abstract(
 ) -> Tuple[str, List[str]]:
     """
     Cleans, tokenizes, and filters abstracts. Resolves formatting errors,
-    strips layout headers, and extracts Dutch sentences without dropping short text.
+    strips layout headers, protects emails/URLs from splitting, and extracts Dutch sentences.
+    Filters out non-Dutch abstracts entirely and applies minimum sentence cutoffs.
     """
     # 1. Normalize unicode and clean whitespace variants before running any NLP matches
     abstract = normalize_text(abstract)
+
+    # Reject early if abstract doesn't meet minimum length requirements
+    if not isinstance(abstract, str) or len(abstract) < min_char_length or not abstract.strip():
+        return "", []
+
+    # --- 2. FULL ABSTRACT LANGUAGE CHECK ---
+    try:
+        detected_lang = detect(abstract)
+        if detected_lang != detect_lang_tag:
+            if logger:
+                logger.info(
+                    f"Skipping abstract: Detected language '{detected_lang}' "
+                    f"does not match target '{detect_lang_tag}'."
+                )
+            return "", []
+    except LangDetectException:
+        # Fall back to proceeding with execution if language detection fails on raw text
+        pass
 
     if heading_words is None:
         heading_words = [
@@ -868,88 +888,119 @@ def clean_abstract(
             
         return orig, None
 
-    dutch_abstract = ""
-    dutch_sentences = []
+    # --- 3. EMAIL & URL PROTECTION MASKING ---
+    email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+    url_pattern = r'\b(?:https?://|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?'
     
-    if isinstance(abstract, str) and len(abstract) >= min_char_length and abstract.strip():
-        # Fix missing spaces after punctuation to prevent sentence tokenization mergers
-        abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', abstract)
-        
-        raw_sentences = nltk.sent_tokenize(abstract, language=tokenizer_lang)
-        cleaned_sentences = []
-        
-        for sent in raw_sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            
-            cleaned_sent, removed = _strip_layout_headers(sent)
-            
-            if removed and logger:
-                logger.debug(f"Stripped layout header: {repr(removed)}")
-            
-            if not cleaned_sent:
-                continue
-            
-            sent = cleaned_sent
+    raw_emails = re.findall(email_pattern, abstract)
+    raw_urls = re.findall(url_pattern, abstract)
+    
+    # Post-process: Strip trailing sentence-ending punctuation from URLs
+    cleaned_urls = [url.rstrip('.,!?")];*_') for url in raw_urls]
+    
+    # Deduplicate and sort by length descending to prevent substring-replacement issues
+    emails = sorted(list(set(raw_emails)), key=len, reverse=True)
+    urls = sorted(list(set(cleaned_urls)), key=len, reverse=True)
+    
+    # Temporarily replace emails/URLs with safe placeholders
+    protected_abstract = abstract
+    for idx, email in enumerate(emails):
+        protected_abstract = protected_abstract.replace(email, f"__EMAIL_PLACEHOLDER_{idx}__")
+    for idx, url in enumerate(urls):
+        protected_abstract = protected_abstract.replace(url, f"__URL_PLACEHOLDER_{idx}__")
 
-            should_merge = False
-            if cleaned_sentences:
-                # Merge if the current fragment does not start with a capital letter (split abbreviation)
-                if not re.match(r'^[A-Z]', sent):
+    # Fix missing spaces after punctuation (safe from breaking masked emails/URLs)
+    protected_abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', protected_abstract)
+    
+    raw_sentences = nltk.sent_tokenize(protected_abstract, language=tokenizer_lang)
+    cleaned_sentences = []
+    
+    for sent in raw_sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        
+        cleaned_sent, removed = _strip_layout_headers(sent)
+        
+        if removed and logger:
+            logger.debug(f"Stripped layout header: {repr(removed)}")
+        
+        if not cleaned_sent:
+            continue
+        
+        sent = cleaned_sent
+
+        should_merge = False
+        if cleaned_sentences:
+            # Merge if the current fragment does not start with a capital letter (split abbreviation)
+            if not re.match(r'^[A-Z]', sent):
+                should_merge = True
+            # Merge if character index 1 is punctuation (like 's-Gravenhage) BUT NOT a list item (like "1." or "A.")
+            elif len(sent) >= 2 and sent[1] in string.punctuation:
+                if not sent[0].isalnum(): # Only merge if the prefix is not a list indicator
                     should_merge = True
-                # Merge if character index 1 is punctuation (like 's-Gravenhage) BUT NOT a list item (like "1." or "A.")
-                elif len(sent) >= 2 and sent[1] in string.punctuation:
-                    if not sent[0].isalnum(): # Only merge if the prefix is not a list indicator
-                        should_merge = True
-            
-            if should_merge:
-                cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
-            else:
-                cleaned_sentences.append(sent)
         
-        # --- SEMANTIC RUN-LENGTH LANGUAGE FILTER ---
-        # 1. First, flag each sentence individually
-        sentence_flags = []
-        for sent in cleaned_sentences:
-            try:
-                # Safe check: if it fails to detect, default to True (Dutch) to prevent accidental loss
-                is_dutch = (detect(sent) == detect_lang_tag)
-            except LangDetectException:
-                is_dutch = True
-            sentence_flags.append((sent, is_dutch))
-            
-        # 2. Reconstruct the abstract, keeping isolated non-Dutch sentences 
-        # but discarding longer sequences (runs of >= 3)
-        dutch_sentences = []
-        current_non_dutch_run = []
-        max_non_dutch_sequence = 3  # The threshold (allow up to 2, drop if >= 3)
+        if should_merge:
+            cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
+        else:
+            cleaned_sentences.append(sent)
+    
+    # Helper to restore masked values
+    def restore_placeholders(text: str) -> str:
+        for idx, email in enumerate(emails):
+            text = text.replace(f"__EMAIL_PLACEHOLDER_{idx}__", email)
+        for idx, url in enumerate(urls):
+            text = text.replace(f"__URL_PLACEHOLDER_{idx}__", url)
+        return text
+
+    # Restore placeholders before running sentence language detection
+    restored_sentences = [restore_placeholders(s) for s in cleaned_sentences]
+
+    # --- 4. SEMANTIC RUN-LENGTH LANGUAGE FILTER ---
+    sentence_flags = []
+    for sent in restored_sentences:
+        try:
+            is_dutch = (detect(sent) == detect_lang_tag)
+        except LangDetectException:
+            is_dutch = True
+        sentence_flags.append((sent, is_dutch))
         
-        for sent, is_dutch in sentence_flags:
-            if is_dutch:
-                # If we hit a Dutch sentence, evaluate the accumulated non-Dutch run
-                if len(current_non_dutch_run) < max_non_dutch_sequence and len(dutch_sentences) > 0:                    # It was a short sequence (likely a false negative or citation) -> Keep it!
-                    dutch_sentences.extend(current_non_dutch_run)
-                else:
-                    if logger:
-                        logger.debug(
-                            f"Dropped non-Dutch abstract block of length {len(current_non_dutch_run)}"
-                        )
-                # Reset the accumulator and append the Dutch sentence
-                current_non_dutch_run = []
-                dutch_sentences.append(sent)
+    dutch_sentences = []
+    current_non_dutch_run = []
+    max_non_dutch_sequence = 3  # Drop run of non-Dutch text if length >= 3
+    
+    for sent, is_dutch in sentence_flags:
+        if is_dutch:
+            if len(current_non_dutch_run) < max_non_dutch_sequence and len(dutch_sentences) > 0:
+                dutch_sentences.extend(current_non_dutch_run)
             else:
-                # Accumulate consecutive non-Dutch sentences
-                current_non_dutch_run.append(sent)
-                
-        # 3. Handle any trailing non-Dutch sentences at the very end of the abstract
-        if len(current_non_dutch_run) < max_non_dutch_sequence:
-            dutch_sentences.extend(current_non_dutch_run)
+                if logger:
+                    logger.debug(
+                        f"Dropped non-Dutch abstract block of length {len(current_non_dutch_run)}"
+                    )
+            current_non_dutch_run = []
+            dutch_sentences.append(sent)
+        else:
+            current_non_dutch_run.append(sent)
             
-        if dutch_sentences:
-            dutch_abstract = ' '.join(dutch_sentences)
-            
+    if len(current_non_dutch_run) < max_non_dutch_sequence:
+        dutch_sentences.extend(current_non_dutch_run)
+        
+    # --- 5. MINIMUM SENTENCE CUTOFF FILTER ---
+    if len(dutch_sentences) < min_sentences:
+        if logger:
+            logger.info(
+                f"Skipping abstract: Number of remaining valid sentences ({len(dutch_sentences)}) "
+                f"is fewer than the minimum cutoff ({min_sentences})."
+            )
+        return "", []
+
+    dutch_abstract = ""
+    if dutch_sentences:
+        dutch_abstract = ' '.join(dutch_sentences)
+        
     return dutch_abstract, dutch_sentences
+
 
 #TODO curr always works from pq file, maybe add csv option but could also always make parquet file
 def select_and_clean_abstracts(
@@ -1053,7 +1104,7 @@ def select_and_clean_abstracts(
 
     if not filtered_df.empty:
         initial_length = len(filtered_df)
-        filtered_df = filtered_df.drop_duplicates(subset=['text_dut'], keep='first') #should be superfluous but good check
+        filtered_df = filtered_df.drop_duplicates(subset=['text_dut'], keep='first') #should be superfluous but good check #TODO keep most populated entry
         dropped_duplicates = initial_length - len(filtered_df)
     else:
         dropped_duplicates = 0
@@ -1140,9 +1191,9 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         # --- Source-Specific Column Mapping ---
         if source == 'UG':
             if '_id' in df.columns:
-                processed_df['id'] = df['_id'].astype(str)
+                processed_df['_id'] = df['_id'].astype(str)  # Changed from 'id' to '_id'
             else:
-                processed_df['id'] = df.apply(lambda r: _generate_robust_id(source, r), axis=1)
+                processed_df['_id'] = df.apply(lambda r: _generate_robust_id(source, r), axis=1)  # Changed from 'id' to '_id'
 
             processed_df['source'] = 'UG'
 
@@ -1152,7 +1203,7 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
                 processed_df['keywords'] = [[] for _ in range(len(df))]
 
         elif source in ['HBO', 'SB']:
-            processed_df['id'] = df.apply(lambda r: _generate_robust_id(source, r), axis=1)
+            processed_df['_id'] = df.apply(lambda r: _generate_robust_id(source, r), axis=1)  # Changed from 'id' to '_id'
             processed_df['source'] = source
 
             if 'keywords' in df.columns:
@@ -1171,7 +1222,7 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         processed_df['abstract_sentence'] = df['sent_dut'] if 'sent_dut' in df.columns else None
 
         # Enforce target Gold schema order
-        target_cols = ['id', 'source', 'keywords', 'year', 'abstract', 'abstract_sentence']
+        target_cols = ['_id', 'source', 'keywords', 'year', 'abstract', 'abstract_sentence']  # Changed 'id' to '_id'
         
         for col in target_cols:
             if col not in processed_df.columns:
@@ -1198,7 +1249,6 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         print(f"[Merge] Saving CSV merged data to: {csv_output}")
         csv_df = final_df.copy()
         
-        #TODO why joined "|"
         # Safe string joining protects against NumPy structural cell overflows in CSV layout
         if 'keywords' in csv_df.columns:
             csv_df['keywords'] = csv_df['keywords'].apply(lambda x: safe_join_list(x, ';'))
@@ -1208,7 +1258,6 @@ def merge(sources: list, output_format: str = 'csv', force: bool = False):
         csv_df.to_csv(csv_output, index=False)
 
     print("[Merge] Processing completed successfully.")
-
 
 # =====================================================================
 # PIPELINE ORCHESTRATOR

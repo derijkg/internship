@@ -289,6 +289,6 @@ def generate_alignment_report(
 if __name__ == "__main__":
     generate_alignment_report(
         dataset_path=Path('/home/gderijck/internship/data/gold/merged_publications.parquet'), 
-        checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites_ug.jsonl'),
+        checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites.jsonl'),
         fuzzy_threshold=0.85
     )
