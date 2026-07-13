@@ -816,6 +816,7 @@ def normalize_text(text: str) -> str:
     
     return text
 
+
 def clean_abstract(
     abstract: str,
     min_char_length: int = 100,
@@ -830,7 +831,7 @@ def clean_abstract(
     strips layout headers, protects emails/URLs from splitting, and extracts Dutch sentences.
     Filters out non-Dutch abstracts entirely and applies minimum sentence cutoffs.
     """
-    # 1. Normalize unicode and clean whitespace variants before running any NLP matches
+    # 1. Normalize unicode and clean whitespace variants before running NLP matches
     abstract = normalize_text(abstract)
 
     # Reject early if abstract doesn't meet minimum length requirements
@@ -848,7 +849,7 @@ def clean_abstract(
                 )
             return "", []
     except LangDetectException:
-        # Fall back to proceeding with execution if language detection fails on raw text
+        # Proceed with execution if initial language detection fails on raw text
         pass
 
     if heading_words is None:
@@ -861,8 +862,12 @@ def clean_abstract(
         
     headings_list = []
     for h in heading_words:
-        headings_list.extend([h.lower(), h.capitalize(), h.upper()])
-    headings_pattern = '|'.join(set(headings_list))
+        escaped_h = re.escape(h)
+        headings_list.extend([escaped_h.lower(), escaped_h.capitalize(), escaped_h.upper()])
+        
+    # FIX 1: Sort by length in descending order to prevent the regex engine from matching
+    # shorter prefixes (like "conclusie") before longer variants (like "conclusies")
+    headings_pattern = '|'.join(sorted(list(set(headings_list)), key=len, reverse=True))
 
     def _strip_layout_headers(sent: str) -> tuple[str, Optional[str]]:
         orig = sent
@@ -888,29 +893,33 @@ def clean_abstract(
             
         return orig, None
 
-    # --- 3. EMAIL & URL PROTECTION MASKING ---
-    email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+    # --- 3. EMAIL & URL PROTECTION MASKING ---    
+    # A. URL Extraction & Replacement (Processed first as URLs are typically longer)
     url_pattern = r'\b(?:https?://|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?'
-    
-    raw_emails = re.findall(email_pattern, abstract)
     raw_urls = re.findall(url_pattern, abstract)
-    
-    # Post-process: Strip trailing sentence-ending punctuation from URLs
     cleaned_urls = [url.rstrip('.,!?")];*_') for url in raw_urls]
-    
-    # Deduplicate and sort by length descending to prevent substring-replacement issues
-    emails = sorted(list(set(raw_emails)), key=len, reverse=True)
     urls = sorted(list(set(cleaned_urls)), key=len, reverse=True)
     
-    # Temporarily replace emails/URLs with safe placeholders
     protected_abstract = abstract
-    for idx, email in enumerate(emails):
-        protected_abstract = protected_abstract.replace(email, f"__EMAIL_PLACEHOLDER_{idx}__")
     for idx, url in enumerate(urls):
-        protected_abstract = protected_abstract.replace(url, f"__URL_PLACEHOLDER_{idx}__")
+        protected_abstract = protected_abstract.replace(url, f"URLPLACEHOLDER{idx}")
+        
+    # B. Email Extraction & Replacement (Processed second on the URL-masked string)
+    email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+    raw_emails = re.findall(email_pattern, protected_abstract)
+    emails = sorted(list(set(raw_emails)), key=len, reverse=True)
+    
+    for idx, email in enumerate(emails):
+        protected_abstract = protected_abstract.replace(email, f"EMAILPLACEHOLDER{idx}")
 
-    # Fix missing spaces after punctuation (safe from breaking masked emails/URLs)
-    protected_abstract = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', protected_abstract)
+    # FIX 2: Restrict the space insertion regex to uppercase/accented capital letters to 
+    # protect Dutch abbreviations (e.g., 'o.a.', 'm.b.t.') and use a negative lookbehind 
+    # to avoid splitting initialisms (e.g., 'A.B.').
+    protected_abstract = re.sub(
+        r'(?<!\b[A-Za-z])([.!?])([A-ZÀ-ÖØ-Þ])', 
+        r'\1 \2', 
+        protected_abstract
+    )
     
     raw_sentences = nltk.sent_tokenize(protected_abstract, language=tokenizer_lang)
     cleaned_sentences = []
@@ -932,13 +941,13 @@ def clean_abstract(
 
         should_merge = False
         if cleaned_sentences:
-            # Merge if the current fragment does not start with a capital letter (split abbreviation)
-            if not re.match(r'^[A-Z]', sent):
+            # Merge if the current sentence explicitly starts with a lowercase letter
+            if sent and sent[0].islower():
                 should_merge = True
-            # Merge if character index 1 is punctuation (like 's-Gravenhage) BUT NOT a list item (like "1." or "A.")
-            elif len(sent) >= 2 and sent[1] in string.punctuation:
-                if not sent[0].isalnum(): # Only merge if the prefix is not a list indicator
-                    should_merge = True
+            # FIX 3: Correctly detect standard Dutch genitives like "'s-Gravenhage"
+            # where the first character is a quote and the second is a lowercase letter
+            elif len(sent) >= 2 and sent[0] in string.punctuation and sent[1].islower():
+                should_merge = True
         
         if should_merge:
             cleaned_sentences[-1] = cleaned_sentences[-1] + ' ' + sent
@@ -948,9 +957,9 @@ def clean_abstract(
     # Helper to restore masked values
     def restore_placeholders(text: str) -> str:
         for idx, email in enumerate(emails):
-            text = text.replace(f"__EMAIL_PLACEHOLDER_{idx}__", email)
+            text = text.replace(f"EMAILPLACEHOLDER{idx}", email)
         for idx, url in enumerate(urls):
-            text = text.replace(f"__URL_PLACEHOLDER_{idx}__", url)
+            text = text.replace(f"URLPLACEHOLDER{idx}", url)
         return text
 
     # Restore placeholders before running sentence language detection
@@ -959,10 +968,9 @@ def clean_abstract(
     # --- 4. SEMANTIC RUN-LENGTH LANGUAGE FILTER ---
     sentence_flags = []
     for sent in restored_sentences:
-        try:
-            is_dutch = (detect(sent) == detect_lang_tag)
-        except LangDetectException:
-            is_dutch = True
+        # FIX 5: Uses a hybrid checker to avoid falsely dropping sentences with statistics,
+        # formulas, or short phrases while still capturing blocks of foreign languages.
+        is_dutch = is_sentence_dutch(sent, target_lang=detect_lang_tag)
         sentence_flags.append((sent, is_dutch))
         
     dutch_sentences = []
@@ -971,7 +979,7 @@ def clean_abstract(
     
     for sent, is_dutch in sentence_flags:
         if is_dutch:
-            if len(current_non_dutch_run) < max_non_dutch_sequence and len(dutch_sentences) > 0:
+            if len(current_non_dutch_run) < max_non_dutch_sequence:
                 dutch_sentences.extend(current_non_dutch_run)
             else:
                 if logger:
@@ -1001,6 +1009,40 @@ def clean_abstract(
         
     return dutch_abstract, dutch_sentences
 
+# Ultra-common stopwords to quickly distinguish Dutch and English without running full NLP models
+
+def is_sentence_dutch(sent: str, target_lang: str = 'nl') -> bool:
+    """
+    Determines if a sentence is Dutch using a fast heuristic check
+    before falling back to character-based language detection.
+    """
+    # Tokenize words roughly to analyze stopwords
+    DUTCH_SIGNATURES = {'de', 'het', 'een', 'en', 'van', 'in', 'is', 'op', 'met', 'voor', 'te', 'zijn', 'er', 'dat', 'die'}
+    ENGLISH_SIGNATURES = {'the', 'of', 'and', 'to', 'in', 'is', 'for', 'with', 'on', 'by', 'at', 'this', 'that'}
+
+    words = set(re.findall(r'\b\w+\b', sent.lower()))
+    
+    # 1. Skip short sentences, equations, or headers. If the abstract is Dutch,
+    # these are highly likely to be valid Dutch context blocks.
+    if len(words) < 4:
+        return True
+        
+    # 2. Check stopword overlaps
+    dutch_count = len(words.intersection(DUTCH_SIGNATURES))
+    english_count = len(words.intersection(ENGLISH_SIGNATURES))
+    
+    if dutch_count > 0 and dutch_count >= english_count:
+        return True
+    if english_count > 0 and english_count > dutch_count:
+        # If English stopwords are prominent and Dutch is absent, flag it as foreign
+        return False
+        
+    # 3. Fallback to langdetect only for longer, ambiguous blocks
+    try:
+        return detect(sent) == target_lang
+    except Exception:
+        # Default to True on failure to prevent accidental deletion of valid text
+        return True
 
 #TODO curr always works from pq file, maybe add csv option but could also always make parquet file
 def select_and_clean_abstracts(

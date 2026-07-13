@@ -220,6 +220,6 @@ def migrate_checkpoint(
 if __name__ == "__main__":
     migrate_checkpoint(
         dataset_path=Path('/home/gderijck/internship/data/gold/merged_publications.parquet'), # or .csv
-        old_checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites.jsonl'),
-        new_checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites_NEW.jsonl')
+        old_checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites_ug.jsonl'),
+        new_checkpoint_path=Path('/home/gderijck/internship/data/gold/checkpoint_rewrites.jsonl')
     )
