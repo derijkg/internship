@@ -840,7 +840,7 @@ def clean_abstract(
 
     # --- 2. FULL ABSTRACT LANGUAGE CHECK ---
     try:
-        detected_lang = detect(abstract)
+        detected_lang = detect(abstract) #TODO incorporate confidence score!
         if detected_lang != detect_lang_tag:
             if logger:
                 logger.info(

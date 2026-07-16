@@ -35,3 +35,6 @@ dataset_construction/
 src/detectors/
 
 .env
+
+monitor*
+cp_*

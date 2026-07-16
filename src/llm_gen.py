@@ -563,7 +563,7 @@ def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42, res
         if rewritten.startswith('"') and rewritten.endswith('"'):
             rewritten = rewritten[1:-1]
         
-    return rewritten
+    return normalize_text(rewritten)
 
 
 def run_generation(
@@ -722,10 +722,10 @@ def normalize_text(text):
 
 
 #select models for differnet calcs
-def get_models_list():
+def get_models_list(): #TODO change calc11 models
     CALC_MODEL_MAPPING = {
-        'calc12': ['gemma4:26b','gemma4:e4b'],
-        'calc11': ['qwen3.6:27b','qwen3.5:4b'],
+        'calc12': ['gemma4:e4b', 'qwen3.5:4b'],
+        'calc11': ['qwen3.6:27b','gemma4:26b'], #['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -752,7 +752,8 @@ def generation_main(
     debug_pct_only: bool = False,
     debug_count: int = 5,
     exclude_percentage: bool = False,
-    task_steps: List = None
+    task_steps: List = None,
+    priority: bool = False
 ) -> list[dict]: # ADDED: Returns updated rows list
     system_prompts = {
         "sentence": (
@@ -796,6 +797,66 @@ def generation_main(
     if exclude_percentage:
         print('EXCLUDING PERCENTAGE TASKS')
         tasks = [t for t in tasks if t['type'] != 'percentage']
+
+
+    if priority:
+        print("\n[PRIORITY MODE ACTIVE] Filtering tasks to exactly 1 random model 'full_abstract' rewrite per abstract.")
+        print("Using deterministic hashing to split the workload across calc11 and calc12 models.")
+        import binascii
+        import random
+        
+        # Define the complete pool of models across both systems
+        all_possible_models = ['gemma4:26b', 'gemma4:e4b', 'qwen3.6:27b', 'qwen3.5:4b']
+        
+        # Create a mapping of row IDs to their row data to inspect columns
+        id_key = next((k for k in ['_id', 'id', 'page_link', 'synthetic_id'] if rows and k in rows[0]), None)
+        rows_map = {str(row[id_key]): row for row in rows} if id_key else {}
+        
+        prioritized_tasks = []
+        processed_row_ids = set()
+        
+        for t in tasks:
+            if t["type"] == "full_abstract":
+                row_id_str = str(t["id"])
+                if row_id_str in processed_row_ids:
+                    continue
+                
+                row = rows_map.get(row_id_str)
+                
+                # Check if this row already has a completed full rewrite for ANY model
+                already_has_rewrite = False
+                if row:
+                    for col_name, col_val in row.items():
+                        if col_name.endswith("_full") and col_val:
+                            already_has_rewrite = True
+                            break
+                
+                if already_has_rewrite:
+                    processed_row_ids.add(row_id_str)
+                    continue
+                
+                # Deterministically choose the assigned model for this row ID
+                seed_str = f"priority_split_{row_id_str}".encode("utf-8")
+                row_seed = binascii.crc32(seed_str)
+                row_rng = random.Random(row_seed)
+                selected_model = row_rng.choice(all_possible_models)
+                
+                # Search through the pending tasks prepared for the current host's models
+                matching_task = None
+                for candidate_t in tasks:
+                    if (candidate_t["type"] == "full_abstract" and 
+                        str(candidate_t["id"]) == row_id_str and 
+                        candidate_t["model"] == selected_model):
+                        matching_task = candidate_t
+                        break
+                
+                # If this host is responsible for the selected model, queue it
+                if matching_task:
+                    prioritized_tasks.append(matching_task)
+                
+                processed_row_ids.add(row_id_str)
+                
+        tasks = prioritized_tasks
 
     if not models_list:
         models_list = list(dict.fromkeys([t["model"] for t in tasks]))
@@ -842,6 +903,11 @@ def main():
         default=['UG', 'HBO'], 
         choices=['UG', 'HBO', 'SB'], 
         help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). If not specified, processes all available."
+    )
+    parser.add_argument(
+        '--priority',
+        action='store_true',
+        help='Prioritize 1 full abstract rewrite per row with random model, grouped by model.'
     )
     parser.add_argument(
         '--tasks', 
@@ -917,6 +983,7 @@ def main():
     else:
         active_models_list = get_models_list()
 
+
     print("Starting LLM generation pipeline...")
     updated_rows = generation_main(
         table=active_table,
@@ -924,10 +991,12 @@ def main():
         percentages_to_run=percentages,
         debug_mode=args.debug,
         task_steps=args.tasks,
-        exclude_percentage=('percentage' not in args.tasks)
+        exclude_percentage=('percentage' not in args.tasks),
+        priority=args.priority
     )
 
-    # ADDED: Write output files only when processing tasks are completed
+    #TODO dont overwrite, only add
+    #TODO also check completed tasks in llm_added? maybe not needed since its also in cp
     if not args.debug:
         updated_active_df = pd.DataFrame(updated_rows)
         
