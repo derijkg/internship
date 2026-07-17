@@ -5,7 +5,7 @@ import numpy as np
 from collections import Counter
 from joblib import Parallel, delayed
 from sklearn.base import BaseEstimator, TransformerMixin
-
+#TODO merge with utils (maybe also train.)
 DUTCH_TRANSITIONS = {"echter", "bovendien", "daarnaast", "desalniettemin", "kortom", "tevens", "daardoor", "derhalve", "bijgevolg", "namelijk"}
 
 def calculate_ttr(words):

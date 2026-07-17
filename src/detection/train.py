@@ -20,6 +20,7 @@ def main():
     # Dataset Filtering Parameters
     parser.add_argument('--models', nargs='+', default=DEFAULT_MODELS, help="LLM models to include in classification task")
     parser.add_argument('--source', nargs='+', default=['UG', 'SB', 'HBO'], help="Sources to isolate (default all: UG, SB, HBO)")
+    parser.add_argument('--sample_one_llm', action='store_true', help="Sample exactly one LLM rewrite per abstract to keep labels 1:1 balanced")
     
     # Model Architecture Selection
     parser.add_argument('--transformer_name', type=str, default='pdelobelle/robbert-2023-dutch-base', help="HuggingFace model string")
@@ -57,13 +58,13 @@ def main():
     
     # --- 2. Shape splits independently ---
     train_df = prepare_classification_dataset(
-        train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source
+        train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
     )
     val_df = prepare_classification_dataset(
-        val_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source
+        val_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
     )
     test_df = prepare_classification_dataset(
-        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source
+        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
     )
     
     print(f"\nDataset compiled successfully:")

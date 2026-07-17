@@ -8,7 +8,7 @@ from sklearn.pipeline import Pipeline
 from utils import get_or_create_cached_features, get_feature_extraction_pipeline
 
 def optimize_svm_with_optuna(train_df, val_df, test_df, granularity):
-    print("Pre-building static TF-IDF and stylometric feature matrix...")
+    print("Pre-building static TF-IDF and stylometric feature matrix...") #TODO why again here, just pass from train.py
     X_train_scaled, X_val_scaled, _ = get_or_create_cached_features(
         train_df, val_df, test_df, granularity=granularity
     )

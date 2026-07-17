@@ -703,7 +703,7 @@ def run_generation(
         unload_model(current_model)
     return rows
 
-#TODO '\n \r? 
+
 def normalize_text(text):
     if not isinstance(text, str):
         return text
@@ -722,7 +722,7 @@ def normalize_text(text):
 
 
 #select models for differnet calcs
-def get_models_list(): #TODO change calc11 models
+def get_models_list():
     CALC_MODEL_MAPPING = {
         'calc12': ['gemma4:e4b', 'qwen3.5:4b'],
         'calc11': ['qwen3.6:27b','gemma4:26b'], #['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
@@ -893,7 +893,6 @@ def generation_main(
 
 
 # script execution
-#TODO clean up after remove download etc
 def main():
     parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
     parser.add_argument(
@@ -945,7 +944,6 @@ def main():
         print("Error: No input or output data datasets located in the gold directory.")
         sys.exit(1)
 
-    # ADDED: Convert Table to DataFrame and safely deserialize list-type columns (like abstract_sentence) if parsed from CSV string formats
     df = table.to_pandas()
     for col in df.columns:
         if df[col].dtype == object:
@@ -956,7 +954,6 @@ def main():
                 except Exception:
                     pass
 
-    # ADDED: Filter active target rows to process while keeping the unselected sources safe for final merge-back
     if args.source:
         print(f"Filtering dataset for source: {args.source}")
         source_mask = df['source'].isin(args.source)
@@ -995,8 +992,7 @@ def main():
         priority=args.priority
     )
 
-    #TODO dont overwrite, only add
-    #TODO also check completed tasks in llm_added? maybe not needed since its also in cp
+    #TODO remove this and run seperate script for creating or adding to llm_added.parquet / .csv
     if not args.debug:
         updated_active_df = pd.DataFrame(updated_rows)
         

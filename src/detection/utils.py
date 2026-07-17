@@ -1,8 +1,10 @@
 # utils.py
 import os
 import ast
+import json
 import joblib
 import pandas as pd
+import numpy as np
 from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -20,10 +22,17 @@ def safe_parse_list(val):
             try:
                 return ast.literal_eval(val)
             except (ValueError, SyntaxError):
-                pass
+                try:
+                    return json.loads(val)
+                except Exception:
+                    pass
     return val
 
-def prepare_classification_dataset(df, selected_models, granularity='full', source_filter=None):
+def prepare_classification_dataset(df, selected_models, granularity='full', source_filter=None, sample_one_llm=False, random_state=42):
+    import random
+    if random_state is not None:
+        random.seed(random_state)
+
     if source_filter:
         df = df[df['source'].isin(source_filter)].copy()
         
@@ -32,30 +41,60 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
     for _, row in df.iterrows():
         source = row.get('source', 'unknown')
         raw_human_sents = safe_parse_list(row.get('abstract_sentence', []))
-        human_sents = raw_human_sents if isinstance(raw_human_sents, list) else []
+        human_sents = raw_human_sents if isinstance(raw_human_sents, list) else [] #TODO why empty list of not a list???
         
+        # 1. Add Human Data (Label 0)
         if granularity == 'full':
             human_text = row.get('abstract', '')
+            if pd.isna(human_text) or human_text == "":
+                continue
             records.append({'text': human_text, 'sentences': human_sents, 'label': 0, 'source': source})
         else:
             for sent in human_sents:
-                records.append({'text': sent, 'sentences': [sent], 'label': 0, 'source': source})
-                
+                if sent is not None and sent != "":
+                    records.append({'text': sent, 'sentences': [sent], 'label': 0, 'source': source})
+                    
+        # 2. Add LLM Data (Label 1)
+        valid_models = []
         for model in selected_models:
             if granularity == 'full':
                 col_name = f"{model}_full"
-                if col_name in row and pd.notna(row[col_name]):
-                    ai_text = row[col_name]
-                    raw_ai_sents = safe_parse_list(row.get(f"{model}_sentence", []))
-                    ai_sents = raw_ai_sents if isinstance(raw_ai_sents, list) else []
-                    records.append({'text': ai_text, 'sentences': ai_sents, 'label': 1, 'source': source})
+                if col_name in row and pd.notna(row[col_name]) and row[col_name] != "":
+                    valid_models.append(model)
             else:
-                sent_col = f"{model}_sentence"
+                sent_col = f"{model}_single" if f"{model}_single" in row else f"{model}_sentence"
+                if sent_col in row:
+                    raw_sent_list = safe_parse_list(row[sent_col])
+                    if isinstance(raw_sent_list, list) and any(s is not None and s != "" for s in raw_sent_list):
+                        valid_models.append(model)
+                        
+        if not valid_models:
+            continue
+            
+        # Select models to process (Either exactly 1 representative rewrite per row, or all of them)
+        if sample_one_llm:
+            models_to_process = [random.choice(valid_models)]
+        else:
+            models_to_process = valid_models
+            
+        for model in models_to_process:
+            if granularity == 'full':
+                col_name = f"{model}_full"
+                ai_text = row[col_name]
+                
+                sent_col = f"{model}_single" if f"{model}_single" in row else f"{model}_sentence"
+                raw_ai_sents = safe_parse_list(row.get(sent_col, []))
+                ai_sents = raw_ai_sents if isinstance(raw_ai_sents, list) else []
+                
+                records.append({'text': ai_text, 'sentences': ai_sents, 'label': 1, 'source': source})
+            else:
+                sent_col = f"{model}_single" if f"{model}_single" in row else f"{model}_sentence"
                 raw_sent_list = safe_parse_list(row.get(sent_col, []))
                 if isinstance(raw_sent_list, list):
                     for sent in raw_sent_list:
-                        records.append({'text': sent, 'sentences': [sent], 'label': 1, 'source': source})
-                        
+                        if sent is not None and sent != "":
+                            records.append({'text': sent, 'sentences': [sent], 'label': 1, 'source': source})
+                            
     return pd.DataFrame(records)
 
 def get_feature_extraction_pipeline():

@@ -15,8 +15,10 @@ OUTPUT_CSV = BASE_DIR / 'data' / 'gold' / 'llm_added.csv'
 
 def safe_literal_eval(val):
     """Safely converts string representations of lists/dicts back to Python objects."""
-    if pd.isna(val) or not isinstance(val, str):
+    # Check type first. If it's not a string (e.g. numpy array, list, None), return as-is.
+    if not isinstance(val, str):
         return val
+    
     val_stripped = val.strip()
     if (val_stripped.startswith('[') and val_stripped.endswith(']')) or \
        (val_stripped.startswith('{') and val_stripped.endswith('}')):
@@ -28,6 +30,17 @@ def safe_literal_eval(val):
             except json.JSONDecodeError:
                 return val
     return val
+
+
+def is_null_or_empty(val) -> bool:
+    """Helper to check if a value is null/empty, safe for numpy arrays, lists, and scalars."""
+    if val is None:
+        return True
+    if isinstance(val, (float, np.floating)) and np.isnan(val):
+        return True
+    if isinstance(val, (list, np.ndarray, pd.Series, dict)):
+        return len(val) == 0
+    return pd.isna(val) or val == ""
 
 
 def is_already_applied(row: dict, task: dict) -> bool:
@@ -45,11 +58,14 @@ def is_already_applied(row: dict, task: dict) -> bool:
         if isinstance(val_list, str):
             val_list = safe_literal_eval(val_list)
             
-        if not isinstance(val_list, list) or sent_idx >= len(val_list):
+        if not isinstance(val_list, (list, np.ndarray, pd.Series)):
+            return False
+            
+        if sent_idx >= len(val_list):
             return False
             
         val = val_list[sent_idx]
-        return not pd.isna(val) and val is not None and val != ""
+        return not is_null_or_empty(val)
         
     elif t_type == "percentage":
         pct = task["percentage"]
@@ -57,14 +73,14 @@ def is_already_applied(row: dict, task: dict) -> bool:
         if col_name not in row:
             return False
         val = row[col_name]
-        return not pd.isna(val) and val is not None and val != ""
+        return not is_null_or_empty(val)
         
     elif t_type == "full_abstract":
         col_name = f"{model}_full"
         if col_name not in row:
             return False
         val = row[col_name]
-        return not pd.isna(val) and val is not None and val != ""
+        return not is_null_or_empty(val)
         
     return False
 
@@ -83,7 +99,7 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         abstract_sentence = row.get('abstract_sentence')
         if isinstance(abstract_sentence, str):
             abstract_sentence = safe_literal_eval(abstract_sentence)
-        if not isinstance(abstract_sentence, list):
+        if not isinstance(abstract_sentence, (list, np.ndarray, pd.Series)):
             abstract_sentence = []
             
         num_sentences = len(abstract_sentence)
@@ -94,11 +110,14 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         if isinstance(val, str):
             val = safe_literal_eval(val)
             
-        if not isinstance(val, list):
+        if not isinstance(val, (list, np.ndarray, pd.Series)):
             if hasattr(val, 'tolist'):
                 val = val.tolist()
             else:
                 val = [None] * num_sentences
+        else:
+            # Convert NumPy arrays or pandas Series to mutable Python lists
+            val = list(val)
         
         # Align list length with num_sentences
         if len(val) < num_sentences:
@@ -180,7 +199,7 @@ def main():
             models.add(col[:-7])
         elif col.endswith('_full'):
             models.add(col[:-5])
-        elif any(col.endswith(f'_{p}') for p in [25, 50, 75]):
+        elif any(col.endswith(f'_{p}') for p in [25, 50, 70]):
             parts = col.split('_')
             models.add('_'.join(parts[:-1]))
 
@@ -222,7 +241,7 @@ def main():
         col_single = f"{model}_single"
         if col_single not in df_updated.columns:
             df_updated[col_single] = df_updated.apply(
-                lambda r: [None] * len(r['abstract_sentence']) if isinstance(r.get('abstract_sentence'), list) else [], 
+                lambda r: [None] * len(r['abstract_sentence']) if isinstance(r.get('abstract_sentence'), (list, np.ndarray, pd.Series)) else [], 
                 axis=1
             )
             
@@ -230,7 +249,7 @@ def main():
         if col_full not in df_updated.columns:
             df_updated[col_full] = None
             
-        for pct in [25, 50, 75]:
+        for pct in [25, 50, 70]:
             col_pct = f"{model}_{pct}"
             if col_pct not in df_updated.columns:
                 df_updated[col_pct] = None
