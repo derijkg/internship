@@ -2,12 +2,18 @@
 import argparse
 import pandas as pd
 from sklearn.model_selection import train_test_split
-
-from utils import prepare_classification_dataset
+from features import prepare_classification_dataset
 from models.svm import train_svm
 from models.robbert import train_transformer
 
 DEFAULT_MODELS = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
+
+#TODO add test only with passing model save
+#TODO organize model saves
+#TODO integrate normalize and md + html cleanup in preprocessing pipeline
+#TODO set metric argparse (prio reduce false positive)
+#TODO set path for feature precompute
+#TODO set probability=True in svm instance to enable .predict_proba() and draw ROC-AUC curves
 
 def main():
     parser = argparse.ArgumentParser(description="LLM Detection Training Orchestrator (Auto-Tuned)")
@@ -15,12 +21,15 @@ def main():
     # Core Controls
     parser.add_argument('--data_path', type=str, required=True, help="Path to raw parquet or csv file")
     parser.add_argument('--classifier', type=str, choices=['svm', 'bert', 'both'], default='both', help="Model type to train")
-    parser.add_argument('--granularity', type=str, choices=['full', 'sentence'], default='full', help="Train on full abstracts or split sentences")
+    # #MODIFIED: Added 'both' to choices
+    parser.add_argument('--granularity', type=str, choices=['full', 'sentence', 'both'], default='full', help="Train on full abstracts, split sentences, or both")
     
     # Dataset Filtering Parameters
     parser.add_argument('--models', nargs='+', default=DEFAULT_MODELS, help="LLM models to include in classification task")
     parser.add_argument('--source', nargs='+', default=['UG', 'SB', 'HBO'], help="Sources to isolate (default all: UG, SB, HBO)")
-    parser.add_argument('--sample_one_llm', action='store_true', help="Sample exactly one LLM rewrite per abstract to keep labels 1:1 balanced")
+    # #ADDED: Replaced --sample_one_llm with a flexible --llm_ratio
+    parser.add_argument('--llm_ratio', type=int, default=1, help="Number of LLM rewrites to sample per human record (e.g., 4 for a 1:4 ratio, 1 for 1:1 balance. Use -1 for all available)")
+    parser.add_argument('--reset_study', action='store_true', help="Clear and restart the Optuna hyperparameter study database")
     
     # Model Architecture Selection
     parser.add_argument('--transformer_name', type=str, default='pdelobelle/robbert-2023-dutch-base', help="HuggingFace model string")
@@ -36,7 +45,14 @@ def main():
     else:
         raise ValueError("Unsupported data format (Must be CSV or Parquet)")
         
-    # --- 1. Clean 3-Way Split on Raw Data ---
+    # --- 1. Filter Sources Early ---
+    if args.source:
+        if 'source' in raw_df.columns:
+            raw_df = raw_df[raw_df['source'].isin(args.source)].copy()
+            print(f"Early filtered raw dataset to sources: {args.source} ({len(raw_df)} rows remaining)")
+        else:
+            print("Warning: 'source' column not found in dataset. Skipping early filtering.")
+
     stratify_col = raw_df['source'] if 'source' in raw_df.columns else None
     
     # Split out the 20% test set
@@ -58,13 +74,13 @@ def main():
     
     # --- 2. Shape splits independently ---
     train_df = prepare_classification_dataset(
-        train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
+        train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
     )
     val_df = prepare_classification_dataset(
-        val_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
+        val_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
     )
     test_df = prepare_classification_dataset(
-        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=args.source, sample_one_llm=args.sample_one_llm
+        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
     )
     
     print(f"\nDataset compiled successfully:")
@@ -82,7 +98,8 @@ def main():
             kernel='rbf',            
             save_path=f"svm_{args.granularity}.pkl",
             granularity=args.granularity,
-            run_optuna=True          
+            run_optuna=True,
+            reset_study=args.reset_study          
         )
         
     if args.classifier in ['bert', 'both']:
