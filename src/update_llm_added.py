@@ -3,6 +3,7 @@ import ast
 import json
 from pathlib import Path
 import re
+from collections import Counter
 import numpy as np
 import pandas as pd
 import unicodedata
@@ -229,7 +230,9 @@ def clean_id(val) -> str:
     if pd.isna(val) or val is None:
         return ""
     if isinstance(val, float):
-        return str(int(val))
+        if val.is_integer():
+            return str(int(val))
+        return str(val).strip()
     return str(val).strip()
 
 
@@ -242,15 +245,20 @@ def main():
     args = parser.parse_args()
 
     # 1. Load the most current version of the dataset
+    already_in_output = False
     if args.output_parquet.exists():
         print(f"Loading existing Parquet dataset: {args.output_parquet}")
         df = pd.read_parquet(args.output_parquet)
+        already_in_output = True
     elif args.output_csv.exists():
         print(f"Loading existing CSV dataset: {args.output_csv}")
         df = pd.read_csv(args.output_csv)
+        already_in_output = True
     else:
         print(f"No existing output found. Initializing from base table: {args.input}")
         df = pd.read_parquet(args.input)
+
+    initial_row_count = len(df)
 
     # 2. Parse any serialized list structures in existing columns
     list_cols = ['abstract_sentence', 'keywords']
@@ -307,15 +315,18 @@ def main():
         if 'model' in task:
             models.add(task['model'])
 
-    # 5. Perform updates
-    updates_count = 0
-    skipped_count = 0
-    not_found_count = 0
+    # 5. Perform updates and track metrics
+    applied_stats = Counter()         # Key: (task_type, model)
+    already_applied_stats = Counter() # Key: (task_type, model)
+    not_found_stats = Counter()       # Key: (task_type, model)
 
     for task in tasks:
         task_id = clean_id(task.get("id"))
+        t_type = task.get("type", "unknown")
+        model = task.get("model", "unknown")
+        
         if not task_id or task_id not in record_map:
-            not_found_count += 1
+            not_found_stats[(t_type, model)] += 1
             continue
             
         row = record_map[task_id]
@@ -328,26 +339,69 @@ def main():
         
         # Skip if the rewrite target cell is already populated
         if is_already_applied(row, task):
-            skipped_count += 1
+            already_applied_stats[(t_type, model)] += 1
             continue
             
         apply_rewrite_to_row(row, task, rewritten)
-        updates_count += 1
+        applied_stats[(t_type, model)] += 1
 
-    print(f"Processed checkpoint file: {updates_count} updates applied, "
-          f"{skipped_count} skipped (already applied), {not_found_count} skipped (IDs not in dataset).")
+    # Print compilation analysis report
+    total_applied = sum(applied_stats.values())
+    total_already_applied = sum(already_applied_stats.values())
+    total_not_found = sum(not_found_stats.values())
+
+    print("\n" + "=" * 75)
+    print("                      DATASET COMPILED UPDATE REPORT                      ")
+    print("=" * 75)
+    print(f"Base Configuration Status:")
+    print(f"  - Source file loaded:          {'llm_added (checkpoint)' if already_in_output else 'base merged_publications'}")
+    print(f"  - Record rows already present: {initial_row_count:,}")
+    print(f"  - Unique row ID mappings:      {len(record_map):,}")
+    print(f"  - Checkpoint tasks evaluated:  {len(tasks):,}")
+    print("-" * 75)
+    print(f"Processing Execution Stats:")
+    print(f"  - New updates applied:         {total_applied:,}")
+    print(f"  - Already applied (skipped):   {total_already_applied:,}")
+    print(f"  - IDs not matched (skipped):   {total_not_found:,}")
+    print("-" * 75)
+
+    if total_applied > 0:
+        print("New Updates Applied (by Task Type & Model Config):")
+        
+        by_type = Counter()
+        by_model = Counter()
+        for (t_type, model), count in applied_stats.items():
+            by_type[t_type] += count
+            by_model[model] += count
+            
+        print("  By Task Type:")
+        for t_type, count in sorted(by_type.items()):
+            print(f"    * {t_type:<15}: {count:,} updates")
+            
+        print("\n  By Model Engine:")
+        for model, count in sorted(by_model.items()):
+            print(f"    * {model:<25}: {count:,} updates")
+            
+        print("\n  Detailed Grouping Matrix (Type | Model):")
+        for (t_type, model), count in sorted(applied_stats.items()):
+            print(f"    * {t_type:<15} | {model:<25} -> {count:,} edits")
+    else:
+        print("No new updates were processed or written during this execution.")
+    print("=" * 75 + "\n")
 
     # 6. Convert records back to DataFrame
     df_updated = pd.DataFrame(records)
 
     # 7. Initialize missing model columns explicitly (single, full, percentages)
+    # Corrected layout: Always map list columns to verify every single record 
+    # gets initialized as a clean list of correct length.
     for model in sorted(models):
         col_single = f"{model}_single"
-        if col_single not in df_updated.columns:
-            df_updated[col_single] = df_updated.apply(
-                lambda r: [None] * len(r['abstract_sentence']) if isinstance(r.get('abstract_sentence'), (list, np.ndarray, pd.Series)) else [], 
-                axis=1
-            )
+        df_updated[col_single] = df_updated.apply(
+            lambda r: r.get(col_single) if isinstance(r.get(col_single), (list, np.ndarray, pd.Series))
+            else ([None] * len(r['abstract_sentence']) if isinstance(r.get('abstract_sentence'), (list, np.ndarray, pd.Series)) else []),
+            axis=1
+        )
             
         col_full = f"{model}_full"
         if col_full not in df_updated.columns:

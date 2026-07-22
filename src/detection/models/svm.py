@@ -3,24 +3,138 @@ import sys
 import optuna
 import numpy as np
 import joblib
-from sklearn.svm import SVC
-from sklearn.metrics import classification_report, f1_score
+from sklearn.svm import SVC, LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, f1_score, roc_auc_score, precision_score, fbeta_score, roc_curve
 from sklearn.pipeline import Pipeline
-from features import get_or_create_cached_features, get_feature_extraction_pipeline, generate_df_hash
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
-def optimize_svm_with_optuna(train_df, val_df, test_df, granularity, sample_size=3000, reset_study=False):
-    """
-    Finds the best SVM parameters using a stratified random subset 
-    of the training/validation data to speed up execution.
-    """
-    print(f"\n--- Optuna Subsampling Enabled ---")
-    
-    # 1. Stratified subsample of training data
-    # #ADDED: Robust stratification fallback check if subset selection fails due to limited classes
+from features import get_feature_extraction_pipeline, generate_df_hash, get_cached_split_features, clear_optuna_cache
+
+optuna.logging.set_verbosity(optuna.logging.INFO)
+
+
+def get_classifier(kernel, c_val, gamma='scale', calibrate=False):
+    """Instantiates appropriate classifier (LinearSVC for linear, SVC for non-linear)."""
+    if kernel == 'linear':
+        base_clf = LinearSVC(C=c_val, random_state=42, class_weight='balanced', dual='auto', max_iter=2000)
+    else:
+        base_clf = SVC(C=c_val, kernel=kernel, gamma=gamma, random_state=42, class_weight='balanced', cache_size=500)
+
+    if calibrate:
+        return CalibratedClassifierCV(estimator=base_clf, cv=3, method='sigmoid')
+    return base_clf
+
+
+def safe_create_or_reset_study(study_name, storage, direction='maximize', reset_study=False, pruner=None):
+    """Safely handles study creation or resetting in SQLite storage with pruning support."""
+    if reset_study:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+            print(f"-> Cleared existing Optuna study: '{study_name}'")
+        except Exception:
+            pass
+
+    if pruner is None:
+        pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
+
+    return optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction=direction,
+        pruner=pruner,
+        load_if_exists=True
+    )
+
+
+def find_threshold_for_max_fpr(y_true, y_score, target_fpr=0.01):
+    """Finds decision threshold corresponding to target maximum FPR."""
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    valid_indices = np.where(fpr <= target_fpr)[0]
+    if len(valid_indices) > 0:
+        best_index = valid_indices[-1]
+        return thresholds[best_index]
+    return 0.5
+
+
+def evaluate_metric(y_true, y_pred, y_score, metric_name):
+    """Calculates target metric score based on argparse configuration."""
+    if metric_name == 'precision':
+        return precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+    elif metric_name == 'f0.5':
+        return fbeta_score(y_true, y_pred, beta=0.5, pos_label=1, zero_division=0)
+    elif metric_name == 'f1':
+        return f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+    elif metric_name in ['roc-auc', 'roc_auc']:
+        return roc_auc_score(y_true, y_score)
+    elif metric_name == 'set_fp':
+        if y_score is None:
+            return 0.0
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        valid_indices = np.where(fpr <= 0.01)[0]
+        return tpr[valid_indices[-1]] if len(valid_indices) > 0 else 0.0
+    else:
+        return f1_score(y_true, y_pred, average='macro')
+
+
+def compute_oof_scores(X_train_raw, y_train, word_params, char_params, c_val, kernel, gamma, calibrate=True, n_splits=3):
+    """Computes unbiased Out-of-Fold (OOF) scores across training set."""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    oof_scores = np.zeros(len(y_train))
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw, y_train)):
+        X_tr_raw = [X_train_raw[i] for i in train_idx]
+        X_va_raw = [X_train_raw[i] for i in val_idx]
+        y_tr_fold = y_train[train_idx]
+
+        X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
+        clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=calibrate)
+        clf.fit(X_tr, y_tr_fold)
+
+        if calibrate or not hasattr(clf, 'decision_function'):
+            oof_scores[val_idx] = clf.predict_proba(X_va)[:, 1]
+        else:
+            oof_scores[val_idx] = clf.decision_function(X_va)
+
+    return oof_scores
+
+
+def optimize_svm_with_optuna(
+        train_df,
+        granularity, kernel_choice='rbf',
+        tuning_strategy='2stage',
+        tuning_sample_size=3000,
+        trials=15,
+        trials_stage1=10,
+        trials_stage2=10,
+        reset_study=False,
+        score_metric='f1',
+        study_name=None,
+        n_jobs_optuna=1
+):
+    """Finds best SVM and TF-IDF parameters using 3-Fold Stratified CV with Trial Pruning."""
+    print(f"\n--- Optuna Optimization Initialized (3-Fold Stratified CV with Pruning) ---")
+
+    if n_jobs_optuna <= 0:
+        n_jobs_optuna = 1
+
+    db_path = "sqlite:///optuna_svm.db?timeout=60"
+
+    # #explained Uses passed study_name or builds standard default if None.
+    if study_name is None:
+        clean_metric = score_metric.replace('-', '_').replace('.', '')
+        study_name = f"svm_{kernel_choice}_{granularity}_{clean_metric}_{tuning_strategy}"
+
+    study_s1_name = f"{study_name}_stage1"
+
+    if isinstance(tuning_sample_size, float):
+        sample_size = max(1, int(len(train_df) * tuning_sample_size))
+    else:
+        sample_size = min(tuning_sample_size, len(train_df))
+
     stratify_train = train_df['label'] if ('label' in train_df.columns and train_df['label'].value_counts().min() > 1) else None
     if len(train_df) > sample_size:
-        print(f"Subsampling training set from {len(train_df)} down to {sample_size} for tuning...")
+        print(f"Subsampling training set from {len(train_df)} down to {sample_size} for 3-fold tuning...")
         train_sub, _ = train_test_split(
             train_df,
             train_size=sample_size,
@@ -30,153 +144,308 @@ def optimize_svm_with_optuna(train_df, val_df, test_df, granularity, sample_size
     else:
         train_sub = train_df
 
-    # 2. Stratified subsample of validation data (tuning evaluate step should also be fast)
-    val_sample_size = min(len(val_df), 1000)
-    stratify_val = val_df['label'] if ('label' in val_df.columns and val_df['label'].value_counts().min() > 1) else None
-    if len(val_df) > val_sample_size:
-        print(f"Subsampling validation set from {len(val_df)} down to {val_sample_size}...")
-        val_sub, _ = train_test_split(
-            val_df,
-            train_size=val_sample_size,
-            random_state=42,
-            stratify=stratify_val
-        )
-    else:
-        val_sub = val_df
+    X_train_raw_all = train_sub[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
+    y_train_all = train_sub['label'].values
 
-    # 3. Extract features ONLY for the subsets (creates unique, independent cache files)
-    X_train_scaled, X_val_scaled, _ = get_or_create_cached_features(
-        train_sub, val_sub, test_df=None, granularity=granularity
-    )
-    
-    y_train = train_sub['label'].values
-    y_val = val_sub['label'].values
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    best_tfidf_params = {}
 
-    # 4. Define the objective function inside using the subset variables
-    def objective(trial):
-        c_val = trial.suggest_float('C', 1e-3, 1e2, log=True)
-        kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'sigmoid'])
+    # ==========================================
+    # STAGE 1: Preprocessing & TF-IDF Parameter Optimization
+    # ==========================================
+    if tuning_strategy == '2stage':
+        print(f"\n>>> [Stage 1] Tuning Preprocessing and TF-IDF Parameters via 3-Fold CV ({trials_stage1} trials)...")
+
+        def objective_stage1(trial):
+            word_min = trial.suggest_int('word_min_ngram', 1, 2)
+            word_max = trial.suggest_int('word_max_ngram', max(word_min, 2), 3)
+            word_ngram = (word_min, word_max)
+            word_max_feat = trial.suggest_int('word_max_features', 1000, 10000, step=1000)
+            word_min_df = trial.suggest_int('word_min_df', 1, 5)
+
+            char_min = trial.suggest_int('char_min_ngram', 1, 3)
+            char_max = trial.suggest_int('char_max_ngram', max(char_min, 3), 5)
+            char_ngram = (char_min, char_max)
+            char_max_feat = trial.suggest_int('char_max_features', 1000, 10000, step=1000)
+            char_min_df = trial.suggest_int('char_min_df', 1, 5)
+
+            word_params = {
+                'ngram_range': word_ngram,
+                'max_features': word_max_feat,
+                'min_df': word_min_df,
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+            char_params = {
+                'ngram_range': char_ngram,
+                'max_features': char_max_feat,
+                'min_df': char_min_df,
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+
+            print(f"\n[Trial {trial.number}] Stage 1 - Evaluating Extraction Parameters (3 Folds):")
+            print(f"  -> Word NGrams: {word_ngram} | Max Feat: {word_max_feat} | Min DF: {word_min_df}")
+            print(f"  -> Char NGrams: {char_ngram} | Max Feat: {char_max_feat} | Min DF: {char_min_df}")
+
+            fold_scores = []
+            for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw_all, y_train_all)):
+                X_tr_raw = [X_train_raw_all[i] for i in train_idx]
+                X_va_raw = [X_train_raw_all[i] for i in val_idx]
+                y_tr_fold = y_train_all[train_idx]
+                y_va_fold = y_train_all[val_idx]
+
+                X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
+
+                eval_kernel = kernel_choice if kernel_choice != 'all' else 'linear'
+                clf = get_classifier(kernel=eval_kernel, c_val=1.0, calibrate=False)
+                clf.fit(X_tr, y_tr_fold)
+                preds = clf.predict(X_va)
+                decision_scores = clf.decision_function(X_va)
+
+                fold_score = evaluate_metric(y_va_fold, preds, decision_scores, score_metric)
+                fold_scores.append(fold_score)
+
+                intermediate_mean = float(np.mean(fold_scores))
+                trial.report(intermediate_mean, step=fold)
+                if trial.should_prune():
+                    print(f"-> [Trial {trial.number}] Stage 1 PRUNED at Fold {fold + 1} (Score: {intermediate_mean:.4f})")
+                    raise optuna.TrialPruned()
+
+            mean_score = float(np.mean(fold_scores))
+            print(f"-> [Trial {trial.number}] Stage 1 Mean 3-Fold Score: {mean_score:.4f}")
+            return mean_score
+
+        study_s1 = safe_create_or_reset_study(study_s1_name, db_path, 'maximize', reset_study)
+        study_s1.optimize(objective_stage1, n_trials=trials_stage1, n_jobs=n_jobs_optuna)
+        best_tfidf_params = study_s1.best_params
+        print(f"-> Best Preprocessing parameters found: {best_tfidf_params}")
+
+    # ==========================================
+    # STAGE 2: SVM Classifier Parameter Optimization
+    # ==========================================
+    stage2_trials = trials_stage2 if tuning_strategy in ['2stage', 'model'] else trials
+    print(f"\n>>> [Stage 2] Tuning SVM Parameters via 3-Fold CV ({stage2_trials} trials)...")
+
+    def objective_stage2(trial):
+        if tuning_strategy == '2stage':
+            word_params = {
+                'ngram_range': (best_tfidf_params['word_min_ngram'], best_tfidf_params['word_max_ngram']),
+                'max_features': best_tfidf_params['word_max_features'],
+                'min_df': best_tfidf_params.get('word_min_df', 1),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+            char_params = {
+                'ngram_range': (best_tfidf_params['char_min_ngram'], best_tfidf_params['char_max_ngram']),
+                'max_features': best_tfidf_params['char_max_features'],
+                'min_df': best_tfidf_params.get('char_min_df', 1),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+        elif tuning_strategy == 'model':
+            word_params = None
+            char_params = None
+        else:  # 'merged'
+            word_min = trial.suggest_int('word_min_ngram', 1, 2)
+            word_max = trial.suggest_int('word_max_ngram', max(word_min, 2), 3)
+            word_params = {
+                'ngram_range': (word_min, word_max),
+                'max_features': trial.suggest_int('word_max_features', 1000, 10000, step=1000),
+                'min_df': trial.suggest_int('word_min_df', 1, 5),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+            char_min = trial.suggest_int('char_min_ngram', 1, 3)
+            char_max = trial.suggest_int('char_max_ngram', max(char_min, 3), 5)
+            char_params = {
+                'ngram_range': (char_min, char_max),
+                'max_features': trial.suggest_int('char_max_features', 1000, 10000, step=1000),
+                'min_df': trial.suggest_int('char_min_df', 1, 5),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+
+        c_val = trial.suggest_float('C', 1e-2, 1e2, log=True)
+        kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'sigmoid']) if kernel_choice == 'all' else kernel_choice
         gamma = trial.suggest_categorical('gamma', ['scale', 'auto']) if kernel != 'linear' else 'scale'
-        
-        print(f"\n>>> [Trial {trial.number}] Training on {X_train_scaled.shape[0]} rows: C={c_val:.4f}, gamma={gamma}, kernel={kernel}...")
 
-        # cache_size=2000 is safe since the subset matrix is even smaller
-        clf = SVC(C=c_val, kernel=kernel, gamma=gamma, random_state=42, class_weight='balanced', cache_size=2000)
-        clf.fit(X_train_scaled, y_train)
-        
-        preds = clf.predict(X_val_scaled)
-        score = f1_score(y_val, preds, average='macro')
-        print(f"<<< [Trial {trial.number}] Score: {score:.4f}")
-        return score
+        print(f"\n[Trial {trial.number}] Stage 2 - Evaluating SVM Parameters (3 Folds):")
+        print(f"  -> SVM: C: {c_val:.4f} | Kernel: {kernel} | Gamma: {gamma}")
 
-    # 5. Run the study with saving best and optional reset with --reset_study
-    db_path = "sqlite:///optuna_svm.db"
-    study_name = f"svm_optimization_{granularity}"
+        fold_scores = []
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw_all, y_train_all)):
+            X_tr_raw = [X_train_raw_all[i] for i in train_idx]
+            X_va_raw = [X_train_raw_all[i] for i in val_idx]
+            y_tr_fold = y_train_all[train_idx]
+            y_va_fold = y_train_all[val_idx]
 
-    # Calculate the hash of the current full training dataset
+            X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
+
+            clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=False)
+            clf.fit(X_tr, y_tr_fold)
+
+            preds = clf.predict(X_va)
+            decision_scores = clf.decision_function(X_va)
+
+            fold_score = evaluate_metric(y_va_fold, preds, decision_scores, score_metric)
+            fold_scores.append(fold_score)
+
+            intermediate_mean = float(np.mean(fold_scores))
+            trial.report(intermediate_mean, step=fold)
+            if trial.should_prune():
+                print(f"-> [Trial {trial.number}] Stage 2 PRUNED at Fold {fold + 1} (Score: {intermediate_mean:.4f})")
+                raise optuna.TrialPruned()
+
+        mean_score = float(np.mean(fold_scores))
+        print(f"-> [Trial {trial.number}] Stage 2 Mean 3-Fold Score: {mean_score:.4f}")
+        return mean_score
+
     current_hash = generate_df_hash(train_df)
+    study_s2 = safe_create_or_reset_study(study_name, db_path, 'maximize', reset_study)
 
-    # Temporarily create/load study to check for changes
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=db_path,
-        direction='maximize',
-        load_if_exists=True
-    )
-
-    # Check if dataset has changed
-    stored_hash = study.user_attrs.get("dataset_hash")
+    stored_hash = study_s2.user_attrs.get("dataset_hash")
     if stored_hash is not None and stored_hash != current_hash:
-        print("\n⚠️  WARNING: The training dataset has changed since the last Optuna run!")
-        
-        if not reset_study:
-            if sys.stdin.isatty():
-                try:
-                    response = input("Would you like to reset the Optuna database to start fresh? [y/N]: ").strip().lower()
-                    if response in ['y', 'yes']:
-                        reset_study = True
-                except Exception:
-                    print("Interactive prompt failed. Proceeding with existing study.")
-            else:
-                print("Non-interactive environment detected. Proceeding with existing study.")
+        print("\n⚠️ WARNING: Training dataset changed since last Optuna run!")
+        if not reset_study and sys.stdin.isatty():
+            try:
+                response = input("Would you like to reset the database? [y/N]: ").strip().lower()
+                if response in ['y', 'yes']:
+                    optuna.delete_study(study_name=study_name, storage=db_path)
+                    if tuning_strategy == '2stage':
+                        try:
+                            optuna.delete_study(study_name=study_s1_name, storage=db_path)
+                        except Exception:
+                            pass
+                    study_s2 = optuna.create_study(study_name=study_name, storage=db_path, direction='maximize')
+            except Exception:
+                pass
 
-    # Handle the reset flag (requested via prompt or CLI argument)
-    if reset_study:
-        print(f"\n[Resetting Study] Deleting existing study '{study_name}' from {db_path}...")
-        try:
-            optuna.delete_study(study_name=study_name, storage=db_path)
-        except (KeyError, Exception):
-            print("No existing study found to delete. Starting fresh.")
-        
-        # Recreate fresh study
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=db_path,
-            direction='maximize'
-        )
+    study_s2.set_user_attr("dataset_hash", current_hash)
+    study_s2.optimize(objective_stage2, n_trials=stage2_trials, n_jobs=n_jobs_optuna)
 
-    # Update or save the current hash in study attributes
-    study.set_user_attr("dataset_hash", current_hash)
+    completed_trials = [t for t in study_s2.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(completed_trials) > 0:
+        best_value = study_s2.best_value
+        tolerance = 5e-3
+        top_trials = [t for t in completed_trials if abs(t.value - best_value) < tolerance]
+        best_trial = min(top_trials, key=lambda t: t.params.get('C', float('inf')))
+        best_s2_params = best_trial.params
 
-    # Check if we already have trials in this database
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    if len(completed_trials) > 0 and not reset_study:
-        print(f"\n---> Resuming existing study '{study_name}' with {len(completed_trials)} completed trials found in database.")
-    
-    # Run the optimization loop (if resume, it will run *additional* trials up to 15)
-    study.optimize(objective, n_trials=15)
-    
-    # --- Custom Tie-Breaker (Occam's Razor) ---
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    best_value = study.best_value
-    
-    # Filter trials that are within a tiny floating-point tolerance of the best score
-    tolerance = 1e-6
-    top_trials = [t for t in completed_trials if abs(t.value - best_value) < tolerance]
-    
-    # From those top trials, select the one with the lowest C value to maximize regularization
-    best_trial = min(top_trials, key=lambda t: t.params.get('C', float('inf')))
-    best_params = best_trial.params
+        print(f"\n[Tie-Breaker Applied] Best trial chosen (lowest C within tolerance of {best_value:.4f}):")
+        for key, value in best_s2_params.items():
+            print(f"  {key}: {value}")
+    else:
+        best_s2_params = study_s2.best_params
 
-    print("\nBest trial (with custom tie-breaker for lowest C):")
-    print(f"  Value (F1): {best_trial.value:.4f}")
-    print("  Params: ")
-    for key, value in best_params.items():
-        print(f"    {key}: {value}")
-        
-    return best_params
+    best_overall_params = {}
+    if tuning_strategy == '2stage':
+        best_overall_params.update(best_tfidf_params)
 
-def train_svm(train_df, val_df, test_df, c_val, kernel, save_path, granularity, run_optuna=False, reset_study=False):
+    best_overall_params.update(best_s2_params)
+    if kernel_choice != 'all':
+        best_overall_params['kernel'] = kernel_choice
+
+    return best_overall_params
+
+
+def train_svm(train_df,
+              test_df, c_val,
+              kernel,
+              save_path,
+              granularity,
+              val_df=None,
+              run_optuna=False,
+              reset_study=False,
+              trials=15,
+              trials_stage1=10,
+              trials_stage2=10,
+              tuning_strategy='2stage',
+              tuning_sample_size=3000,
+              score_metric='f1',
+              study_name=None,
+              n_jobs_optuna=1
+              ):
+    word_params, char_params = None, None
+    gamma = 'scale'
+
     if run_optuna:
         print("Running Hyperparameter Optimization via Optuna...")
-        best_params = optimize_svm_with_optuna(train_df, val_df, test_df, granularity, reset_study=reset_study)
-        c_val = best_params['C']
-        kernel = best_params['kernel']
+        best_params = optimize_svm_with_optuna(
+            train_df=train_df,
+            granularity=granularity,
+            kernel_choice=kernel,
+            tuning_strategy=tuning_strategy,
+            tuning_sample_size=tuning_sample_size,
+            trials=trials,
+            trials_stage1=trials_stage1,
+            trials_stage2=trials_stage2,
+            reset_study=reset_study,
+            score_metric=score_metric,
+            study_name=study_name,
+            n_jobs_optuna=n_jobs_optuna
+        )
+        c_val = best_params.get('C', c_val)
+        kernel = best_params.get('kernel', kernel)
         gamma = best_params.get('gamma', 'scale')
-    else:
-        gamma = 'scale'
-        
-    # Prepare raw pipeline records
-    X_train_raw = train_df[['text', 'sentences']].to_dict(orient='records')
-    X_test_raw = test_df[['text', 'sentences']].to_dict(orient='records')
+
+        if 'word_min_ngram' in best_params:
+            word_params = {
+                'ngram_range': (best_params['word_min_ngram'], best_params['word_max_ngram']),
+                'max_features': best_params['word_max_features'],
+                'min_df': best_params.get('word_min_df', 1),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+        if 'char_min_ngram' in best_params:
+            char_params = {
+                'ngram_range': (best_params['char_min_ngram'], best_params['char_max_ngram']),
+                'max_features': best_params['char_max_features'],
+                'min_df': best_params.get('char_min_df', 1),
+                'max_df': 0.95,
+                'sublinear_tf': True
+            }
+
+    X_train_raw = train_df[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
+    X_test_raw = test_df[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
     y_train = train_df['label'].values
     y_test = test_df['label'].values
-    
-    feature_pipeline = get_feature_extraction_pipeline()
-    clf = SVC(C=c_val, kernel=kernel, gamma=gamma, random_state=42, class_weight='balanced')
-    
+
+    feature_pipeline = get_feature_extraction_pipeline(word_params, char_params, stylometrics_n_jobs=1, use_pre_lemmatized=True)
+    calibrated_clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=True)
+
     full_pipeline = Pipeline([
         ('features', feature_pipeline),
-        ('classifier', clf)
+        ('classifier', calibrated_clf)
     ])
-    
-    print(f"Training final unified SVM pipeline...")
+
+    optimal_threshold = 0.5
+    if score_metric == 'set_fp':
+        print("\nCalculating Out-of-Fold (OOF) probability scores across training set for threshold calibration...")
+        oof_scores = compute_oof_scores(X_train_raw, y_train, word_params, char_params, c_val, kernel, gamma, calibrate=True)
+        optimal_threshold = find_threshold_for_max_fpr(y_train, oof_scores, target_fpr=0.01)
+        print(f"-> Calibrated Threshold (OOF 1% Max FPR Probability): {optimal_threshold:.6f}")
+
+    full_pipeline.optimal_threshold = optimal_threshold
+
+    print(f"Training final probability-calibrated SVM pipeline on 100% of training data...")
     full_pipeline.fit(X_train_raw, y_train)
-    
-    # Evaluate on the held-out test split
-    preds = full_pipeline.predict(X_test_raw)
+
+    # Evaluate on Test Set
+    test_scores = full_pipeline.predict_proba(X_test_raw)[:, 1]
+    preds = (test_scores >= optimal_threshold).astype(int) if score_metric == 'set_fp' else full_pipeline.predict(X_test_raw)
+
     print("\nSVM Test Performance Evaluation:")
     print(classification_report(y_test, preds))
-    
+
+    try:
+        auc_val = roc_auc_score(y_test, test_scores)
+        print(f"SVM Test ROC-AUC Score: {auc_val:.4f}\n")
+    except Exception as e:
+        print(f"Could not calculate ROC-AUC: {e}")
+
+    # #explained Saves calibrated pipeline directly to save_path derived from study_name.
     joblib.dump(full_pipeline, save_path)
-    print(f"Deployable pipeline saved successfully to {save_path}")
+    print(f"Deployable probability-calibrated pipeline saved successfully to {save_path}")
+
+    clear_optuna_cache()

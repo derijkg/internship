@@ -1,15 +1,3 @@
-#TODO remove download libs
-#TODO change to use final df from datasetcontrstuction, 
-    #  change #GOLD.. 
-    #change inputs for gen_main (and others?)
-    # change or remove consolidate checkpoints move to using only 1 in gold
-    #
-#TODO set argparse options to prio one source? 
-#TODO
-
-#TODO integreer beststaande cp_rwr_ug -> als de exacte zin er al in staat skip (verwijderen van task)
-#TODO read from csv abstract sentences '|' or ' | ' 
-
 import re
 import time
 import sys
@@ -38,36 +26,43 @@ import socket
 import binascii
 from ollama import Client
 import unicodedata
-#from pydantic import BaseModel, Field
-#import itertools
-
-#TODO add different methods for generating the uuhhhh percentage task thru argparse
-#TODO read from csv: abs_sent =  ' | ' joined sentences
-
 
 # GLOBAL VARS
-
-BASE_DIR = Path(__file__).resolve().parent.parent #this script is in /home/gderijck/internship/src/llm_gen.py
+BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "merged_publications.csv"
 INPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "merged_publications.parquet"
 OUTPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "llm_added.csv"
 OUTPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "llm_added.parquet"
 CHECKPOINT_PATH = BASE_DIR / "data" / "gold" / "checkpoint_rewrites.jsonl"
 
-# generation
-# ollama server functions
-def kill_process_on_port(port: int):
-    """
-    Attempts to find and terminate any process listening on the specified port.
-    Safely targets only your specific port to avoid affecting other shared processes.
-    """
-    import subprocess
-    import os
-    import signal
-    import time
+
+# ==========================================
+# Text Normalization & Basic Cleaners
+# ==========================================
+
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
     
+    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 2. Standardize common quotation marks and dashes
+    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+    text = text.replace('—', '-').replace('–', '-')  # Standardize em/en dashes to hyphens
+    
+    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
+    text = " ".join(text.split())
+    return text
+
+
+# ==========================================
+# Ollama Server Management
+# ==========================================
+
+def kill_process_on_port(port: int):
+    """Attempts to find and terminate any process listening on the specified port."""
     try:
-        # 'lsof -t' returns only the raw PID(s) bound to the port
         result = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, check=False)
         pids = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
         
@@ -75,12 +70,12 @@ def kill_process_on_port(port: int):
             pid = int(pid_str)
             print(f"Found active process (PID {pid}) on port {port}. Force-terminating...")
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, subprocess.signal.SIGKILL)
             except OSError as e:
                 print(f"Could not kill PID {pid}: {e}")
         
         if pids:
-            time.sleep(1.5)  # Give the operating system a brief moment to release the port socket
+            time.sleep(1.5)
     except Exception as e:
         print(f"Warning: Port cleanup helper failed: {e}")
 
@@ -116,8 +111,7 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
         ollama_executable = str(system_bin_alt)
     else:
         ollama_executable = "ollama"
-        print("Warning: GPU-enabled native Ollama binary not found in standard locations.")
-        print("Falling back to PATH.")
+        print("Warning: GPU-enabled native Ollama binary not found in standard locations. Falling back to PATH.")
 
     cuda_libs = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
     user_libs = str(Path.home() / ".local" / "lib" / "ollama")
@@ -186,9 +180,10 @@ def unload_model(model_name: str):
         print(f"Warning: Could not explicitly unload '{model_name}': {e}")
 
 
+# ==========================================
+# Checkpoint Utilities
+# ==========================================
 
-# GENERATION proper
-#after generation add to checkpoint.jsonl
 def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,39 +207,21 @@ def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str)
             pass
 
 
-#pydantic 
-#class TargetRewrite(BaseModel):
-#    target_id: int = Field(
-#        description="The matching numeric ID of the target block (e.g., 1 for target_1, 2 for target_2)."
-#    )
-#    #thought_process: str = Field(
-#    #    description="A brief planning note analyzing how to rewrite this block to improve flow and grammar while matching the rest of the abstract's context."
-#    #)
-#    rewritten_text: str = Field(
-#        description="The edited Dutch text for this target block." # Do NOT include any XML or target tags in this output."
-#    )#
-#
-#class PercentageRewrites(BaseModel):
-#    rewrites: list[TargetRewrite] = Field(
-#        description="The list of edits for each numbered target block in sequential order."
-#    )
+# ==========================================
+# Percentage Task Verification & Strategies
+# ==========================================
 
-
-
-#check if % rewrite task was succesfully completed
-#TODO % task robust validate or change task
 def validate_percentage_rewrite(
     original_sents: list[str], 
     raw_output_text: str, 
     tagged_groups: list[list[int]]
 ) -> tuple[bool, str, str | None]:
+    """Fallback standard validator for baseline XML strategy."""
     if not raw_output_text:
         return False, "Empty response from the model", None
 
-    # #AD: Parser updated to extract numbered target blocks using backreferences from raw output instead of loading JSON schemas
     matches = re.findall(r'<target_(\d+)>(.*?)</target_\1>', raw_output_text, re.DOTALL | re.IGNORECASE)
     
-    # #AD: Defensive map lookup dictionary handles string-to-int conversion securely to prevent ValueError execution crashes
     rewrites_map = {}
     for t_id_str, text in matches:
         text_clean = text.strip()
@@ -262,25 +239,311 @@ def validate_percentage_rewrite(
         if not rewrite_text:
             return False, f"Missing target rewrite for target ID {idx} (Verify tag syntax in LLM output)", None
 
-        # Reconstruct the original contiguous block of sentences
         original_block = " ".join([original_sents[s_idx].strip() for s_idx in group])
         original_clean = original_block.strip()
         
-        # Verify changes were made compared to the normalized original text
         if normalize_text(rewrite_text) == normalize_text(original_clean):
             return False, f"Target block {idx} was not modified by the model.", None
             
-        # Place the rewrite in the first index, and clear out subsequent indices in the group
         stitched_sentences[group[0]] = rewrite_text
         for subsequent_idx in group[1:]:
             stitched_sentences[subsequent_idx] = ""
 
-    #AD: Stitch the original untagged sentences and new edits into a single abstract
     final_abstract = " ".join([sent for sent in stitched_sentences if sent])
     return True, "Success", final_abstract
 
 
-#TODO maybe change %task
+def validate_json_method(
+    original_sents: list[str], 
+    raw_output_text: str, 
+    tagged_groups: list[list[int]]
+) -> tuple[bool, str, str | None]:
+    """Validates and parses JSON structured map output strategy."""
+    try:
+        clean_output = raw_output_text.strip()
+        # Clean markdown wrappers if present
+        if clean_output.startswith("```"):
+            clean_output = re.sub(r'^```(?:json)?\s*', '', clean_output)
+            clean_output = re.sub(r'\s*```$', '', clean_output)
+        
+        data = json.loads(clean_output)
+    except Exception as e:
+        return False, f"JSON parsing failed: {e}", None
+
+    rewrites_map = {}
+    for k, v in data.items():
+        try:
+            rewrites_map[int(k)] = str(v).strip()
+        except (ValueError, TypeError):
+            continue
+
+    stitched_sentences = list(original_sents)
+    for idx, group in enumerate(tagged_groups, 1):
+        rewrite_text = rewrites_map.get(idx)
+        if not rewrite_text:
+            return False, f"Missing target ID {idx} in JSON mapping.", None
+            
+        original_block = " ".join([original_sents[s_idx].strip() for s_idx in group])
+        if normalize_text(rewrite_text) == normalize_text(original_block):
+            return False, f"Target block {idx} was not modified.", None
+            
+        stitched_sentences[group[0]] = rewrite_text
+        for sub_idx in group[1:]:
+            stitched_sentences[sub_idx] = ""
+
+    final_abstract = " ".join([s for s in stitched_sentences if s])
+    return True, "Success", final_abstract
+
+
+def run_isolated_blocks_method(
+    client, 
+    model: str, 
+    original_sents: list[str], 
+    tagged_groups: list[list[int]], 
+    context: str, 
+    seed: int = 42
+) -> tuple[bool, str, str | None]:
+    """Processes each segment individually in context to enforce precise edits."""
+    stitched_sentences = list(original_sents)
+    
+    for idx, group in enumerate(tagged_groups, 1):
+        target_text = " ".join([original_sents[s_idx].strip() for s_idx in group])
+        
+        prompt = (
+            f"You are a professional Dutch editor.\n"
+            f"We are editing a Dutch scientific abstract. Below is the full abstract context:\n"
+            f"\"\"\"\n{context}\n\"\"\"\n\n"
+            f"Please rewrite the following specific segment from this abstract to improve style, flow, or grammar, while maintaining its original meaning and context:\n"
+            f"\"\"\"\n{target_text}\n\"\"\"\n\n"
+            f"Provide ONLY the rewritten segment. Do not include any tags, conversational intros, or explanations."
+        )
+        
+        try:
+            response = client.generate(
+                model=model,
+                prompt=prompt,
+                think=False,
+                options={"seed": seed}
+            )
+            rewrite_text = response['response'].strip()
+            rewrite_text = rewrite_text.replace('\x00','').replace('\u0000','')
+            if rewrite_text.startswith('"') and rewrite_text.endswith('"'):
+                rewrite_text = rewrite_text[1:-1]
+            rewrite_text = normalize_text(rewrite_text)
+            
+            if not rewrite_text or rewrite_text == normalize_text(target_text):
+                return False, f"Isolated target block {idx} was not modified or was empty", None
+            
+            stitched_sentences[group[0]] = rewrite_text
+            for sub_idx in group[1:]:
+                stitched_sentences[sub_idx] = ""
+        except Exception as e:
+            return False, f"Error generating block {idx}: {e}", None
+            
+    final_abstract = " ".join([s for s in stitched_sentences if s])
+    return True, "Success", final_abstract
+
+
+# ==========================================
+# Debug & Validation Comparison Suite
+# ==========================================
+
+def run_percentage_comparison_suite(
+    table: pa.Table, 
+    models_list: list[str], 
+    debug_count: int, 
+    port: int = 11435, 
+    gpu_id: str = None
+):
+    """Executes different strategies on raw lines side-by-side and prints/saves a compared report."""
+    start_ollama_server(port=port, gpu_id=gpu_id)
+    host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
+    if not host_env.startswith("http://"):
+        host_env = f"http://{host_env}"
+        
+    client = Client(host=host_env, timeout=300)
+    df = table.to_pandas()
+    
+    # Filter rows with at least 3 sentences so percentage tagging is meaningful
+    valid_rows = []
+    for _, row in df.iterrows():
+        sents = row.get('abstract_sentence')
+        if isinstance(sents, list) and len(sents) >= 3:
+            valid_rows.append(row)
+            if len(valid_rows) >= debug_count:
+                break
+                
+    if not valid_rows:
+        print("Error: No valid rows containing at least 3 sentences were located for comparisons.")
+        return
+
+    print(f"\nEvaluating {len(valid_rows)} row samples using: {models_list}")
+    comparison_records = []
+    pct = 50  # Fix comparative percentage bounds at 50%
+    
+    for row in valid_rows:
+        row_id = row.get('_id') or row.get('id') or "N/A"
+        abstract_sentence = row['abstract_sentence']
+        abstract = row.get('abstract', '')
+        num_sentences = len(abstract_sentence)
+        
+        # Setup targets indices
+        seed_str = f"{row_id}_{pct}".encode("utf-8")
+        seed = binascii.crc32(seed_str)
+        rng = random.Random(seed)
+        num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
+        tagged_indices = set(rng.sample(range(num_sentences), num_to_tag))
+
+        groups = []
+        sorted_indices = sorted(list(tagged_indices))
+        if sorted_indices:
+            current_group = [sorted_indices[0]]
+            for idx in sorted_indices[1:]:
+                if idx == current_group[-1] + 1:
+                    current_group.append(idx)
+                else:
+                    groups.append(current_group)
+                    current_group = [idx]
+            groups.append(current_group)
+            
+        # Strategy A preparation: Tagged inline segments
+        annotated_parts = []
+        group_starts = {g[0]: g for g in groups}
+        group_to_id = {g[0]: idx + 1 for idx, g in enumerate(groups)}
+        i = 0
+        while i < num_sentences:
+            if i in group_starts:
+                group = group_starts[i]
+                t_id = group_to_id[i]
+                block_text = " ".join([abstract_sentence[idx] for idx in group])
+                annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
+                i += len(group)
+            else:
+                annotated_parts.append(abstract_sentence[i])
+                i += 1
+        annotated_abstract = " ".join(annotated_parts)
+
+        # Strategy B preparation: Raw mapping targets
+        targets_desc = []
+        for idx, g in enumerate(groups, 1):
+            block_text = " ".join([abstract_sentence[pi] for pi in g])
+            targets_desc.append(f"Target {idx}: \"{block_text}\"")
+        targets_list_str = "\n".join(targets_desc)
+
+        for model in models_list:
+            # --- Method 1: Inline XML ---
+            xml_prompt = (
+                "You are a professional Dutch editor.\n"
+                "Your task is to rewrite only the text segments enclosed in numbered target tags (e.g., <target_1>...</target_1>) to improve them.\n"
+                "Ensure you retain the XML target tags in your final response precisely where the modifications were placed."
+            )
+            print(f"Evaluating row ID {row_id} with model {model} (Method: Inline XML)...")
+            t0 = time.time()
+            try:
+                xml_response = client.generate(
+                    model=model,
+                    system=xml_prompt,
+                    prompt=annotated_abstract,
+                    think=False,
+                    options={"seed": 42}
+                )
+                raw_xml = xml_response['response'].strip()
+                duration = time.time() - t0
+                is_valid, reason, final_text = validate_percentage_rewrite(abstract_sentence, raw_xml, groups)
+            except Exception as e:
+                raw_xml, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
+                duration = time.time() - t0
+
+            comparison_records.append({
+                "row_id": row_id,
+                "model": model,
+                "method": "inline_xml",
+                "duration_sec": duration,
+                "raw_response": raw_xml,
+                "stitched_output": final_text,
+                "is_valid": is_valid,
+                "error_reason": reason
+            })
+
+            # --- Method 2: Structured JSON ---
+            json_prompt = (
+                "You are a professional Dutch editor.\n"
+                "Your task is to rewrite the text segments corresponding to the following target IDs to improve grammar, vocabulary, and flow:\n"
+                f"{targets_list_str}\n\n"
+                "Provide your edits strictly in a raw JSON dictionary format where keys are the target IDs as strings (e.g., \"1\", \"2\") and values are the edited text. Do not output anything else."
+            )
+            print(f"Evaluating row ID {row_id} with model {model} (Method: Structured JSON)...")
+            t0 = time.time()
+            try:
+                json_response = client.generate(
+                    model=model,
+                    prompt=json_prompt,
+                    think=False,
+                    options={"seed": 42}
+                )
+                raw_json = json_response['response'].strip()
+                duration = time.time() - t0
+                is_valid, reason, final_text = validate_json_method(abstract_sentence, raw_json, groups)
+            except Exception as e:
+                raw_json, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
+                duration = time.time() - t0
+
+            comparison_records.append({
+                "row_id": row_id,
+                "model": model,
+                "method": "structured_json",
+                "duration_sec": duration,
+                "raw_response": raw_json,
+                "stitched_output": final_text,
+                "is_valid": is_valid,
+                "error_reason": reason
+            })
+
+            # --- Method 3: Isolated Blocks (Query-per-block) ---
+            print(f"Evaluating row ID {row_id} with model {model} (Method: Isolated Blocks)...")
+            t0 = time.time()
+            try:
+                is_valid, reason, final_text = run_isolated_blocks_method(
+                    client, model, abstract_sentence, groups, abstract, seed=42
+                )
+                duration = time.time() - t0
+                raw_isolated = "[MULTIPLE SEGMENT QUERIES RUN]"
+            except Exception as e:
+                raw_isolated, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
+                duration = time.time() - t0
+
+            comparison_records.append({
+                "row_id": row_id,
+                "model": model,
+                "method": "isolated_blocks",
+                "duration_sec": duration,
+                "raw_response": raw_isolated,
+                "stitched_output": final_text,
+                "is_valid": is_valid,
+                "error_reason": reason
+            })
+            
+    comp_df = pd.DataFrame(comparison_records)
+    comparison_out_csv = BASE_DIR / "data" / "gold" / "pct_method_comparison.csv"
+    comparison_out_csv.parent.mkdir(parents=True, exist_ok=True)
+    comp_df.to_csv(comparison_out_csv, index=False)
+    
+    print("\n====================================================")
+    print("          PERCENTAGE TASK METHOD COMPARISON")
+    print("====================================================")
+    summary_cols = ["row_id", "model", "method", "duration_sec", "is_valid", "error_reason"]
+    print(comp_df[summary_cols].to_string(index=False))
+    print("====================================================")
+    print(f"Full evaluation details saved to: {comparison_out_csv}")
+    
+    for model in models_list:
+        unload_model(model)
+
+
+# ==========================================
+# Task Alignment & Queue Utilities
+# ==========================================
+
 def prepare_tasks(
     table: pa.Table, 
     checkpoint_path: Path,
@@ -293,10 +556,9 @@ def prepare_tasks(
 
     rows = table.to_pylist()
     
-    # Dynamic key fallback resolution if the dataset has unconventional naming schemas
     if '_id' in table.column_names:
         id_key = '_id'
-    elif 'id' in table.column_names: #This one
+    elif 'id' in table.column_names:
         id_key = 'id'
     elif 'page_link' in table.column_names:
         id_key = 'page_link'
@@ -307,7 +569,6 @@ def prepare_tasks(
 
     rows_map = {str(row[id_key]): row for row in rows}
 
-    # Initialize counters (including full_abstract and percentage tracking)
     total_loaded = 0
     text_match_count = 0
     idx_fallback_count = 0
@@ -364,7 +625,6 @@ def prepare_tasks(
                         continue
 
                     if t_type == "sentence":
-                        # Changed 'sent_dut' to 'abstract_sentence' to align with the new schema
                         abstract_sentence = row.get("abstract_sentence")
                         if not isinstance(abstract_sentence, list):
                             mismatched_discard_count += 1
@@ -398,7 +658,6 @@ def prepare_tasks(
                         task_meta = {"type": t_type, "model": model, "sent_idx": sent_idx, "percentage": pct}
                         apply_rewrite_to_row(row, task_meta, rewritten_text)
                         
-                        # Increment correct tracker based on task type
                         if t_type == "full_abstract":
                             full_abstract_match_count += 1
                         elif t_type == "percentage":
@@ -408,7 +667,6 @@ def prepare_tasks(
                     corrupted_count += 1
                     continue
 
-    # Improved alignment report printing
     if total_loaded > 0:
         total_aligned = text_match_count + idx_fallback_count + full_abstract_match_count + percentage_match_count
         print("\n====================================================")
@@ -427,12 +685,9 @@ def prepare_tasks(
         print(f" Discarded (Corrupted/Malformed lines)     : {corrupted_count}")
         print("====================================================\n")
 
-
-    #CREATE TASKS FOR REMAINING
     tasks = []
     for row in rows:
         row_id = row.get(id_key)
-        # ADDED: Changed 'text_dut' -> 'abstract' and 'sent_dut' -> 'abstract_sentence'
         abstract = row.get('abstract')
         abstract_sentence = row.get('abstract_sentence')
 
@@ -454,7 +709,7 @@ def prepare_tasks(
                         "model": model,
                         "sent_idx": sent_idx,
                         "text": sentence,
-                        "context": abstract # ADDED: Changed context references to new abstract column
+                        "context": abstract
                     })
 
             for pct in percentages:
@@ -488,11 +743,11 @@ def prepare_tasks(
                         if i in group_starts:
                             group = group_starts[i]
                             t_id = group_to_id[i]
-                            block_text = " ".join([abstract_sentence[idx] for idx in group]) # ADDED: Changed from sent_dut
+                            block_text = " ".join([abstract_sentence[idx] for idx in group])
                             annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
                             i += len(group)
                         else:
-                            annotated_parts.append(abstract_sentence[i]) # ADDED: Changed from sent_dut
+                            annotated_parts.append(abstract_sentence[i])
                             i += 1
                     
                     annotated_abstract = " ".join(annotated_parts)
@@ -503,7 +758,7 @@ def prepare_tasks(
                         "model": model,
                         "percentage": pct,
                         "text": annotated_abstract,
-                        'tagged_groups': groups  # List of index groups
+                        'tagged_groups': groups
                     })
 
             col_name = f"{model}_full"
@@ -513,11 +768,10 @@ def prepare_tasks(
                     "id": row_id,
                     "type": "full_abstract",
                     "model": model,
-                    "text": abstract # ADDED: Changed from text_dut
+                    "text": abstract
                 })
 
     return tasks, rows
-
 
 
 def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
@@ -541,8 +795,12 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         row[f"{model}_full"] = rewritten
 
 
-def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42, response_format=None):
-    """Sends text to Ollama for rewriting with optional JSON schema constraints."""
+# ==========================================
+# Core Engine Runners
+# ==========================================
+
+def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
+    """Sends text to Ollama for rewriting."""
     response = client.generate(
         model=model_to_run,
         system=system_prompt,
@@ -704,28 +962,10 @@ def run_generation(
     return rows
 
 
-def normalize_text(text):
-    if not isinstance(text, str):
-        return text
-    
-    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
-    text = unicodedata.normalize('NFKC', text)
-    
-    # 2. Standardize common quotation marks and dashes (optional but recommended)
-    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
-    text = text.replace('—', '-').replace('–', '-') # Standardize em/en dashes to hyphens
-    
-    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
-    text = " ".join(text.split())
-    
-    return text
-
-
-#select models for differnet calcs
 def get_models_list():
     CALC_MODEL_MAPPING = {
         'calc12': ['gemma4:e4b', 'qwen3.5:4b'],
-        'calc11': ['qwen3.6:27b','gemma4:26b'], #['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
+        'calc11': ['qwen3.6:27b','gemma4:26b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -754,7 +994,7 @@ def generation_main(
     exclude_percentage: bool = False,
     task_steps: List = None,
     priority: bool = False
-) -> list[dict]: # ADDED: Returns updated rows list
+) -> list[dict]:
     system_prompts = {
         "sentence": (
             "You are a professional Dutch editor.\n"
@@ -776,11 +1016,9 @@ def generation_main(
     global ollama
     import ollama
     
-    # ADDED: Removed directory search and explicitly parse using the global CHECKPOINT_PATH
     tasks, rows = prepare_tasks(table, CHECKPOINT_PATH, models_list, percentages_to_run)
 
     if task_steps:
-        # Map cli choices to internal task type identifiers
         type_mapping = {
             'sentence': 'sentence',
             'full': 'full_abstract',
@@ -792,23 +1030,18 @@ def generation_main(
     if debug_pct_only:
         print("\n[DEBUG PCT ONLY ACTIVE] Filtering out non-percentage tasks.")
         tasks = [t for t in tasks if t['type'] == 'percentage']
-        debug_mode = True  # Force debug count verification below
+        debug_mode = True
 
     if exclude_percentage:
         print('EXCLUDING PERCENTAGE TASKS')
         tasks = [t for t in tasks if t['type'] != 'percentage']
 
-
     if priority:
         print("\n[PRIORITY MODE ACTIVE] Filtering tasks to exactly 1 random model 'full_abstract' rewrite per abstract.")
-        print("Using deterministic hashing to split the workload across calc11 and calc12 models.")
         import binascii
         import random
         
-        # Define the complete pool of models across both systems
         all_possible_models = ['gemma4:26b', 'gemma4:e4b', 'qwen3.6:27b', 'qwen3.5:4b']
-        
-        # Create a mapping of row IDs to their row data to inspect columns
         id_key = next((k for k in ['_id', 'id', 'page_link', 'synthetic_id'] if rows and k in rows[0]), None)
         rows_map = {str(row[id_key]): row for row in rows} if id_key else {}
         
@@ -823,7 +1056,6 @@ def generation_main(
                 
                 row = rows_map.get(row_id_str)
                 
-                # Check if this row already has a completed full rewrite for ANY model
                 already_has_rewrite = False
                 if row:
                     for col_name, col_val in row.items():
@@ -835,13 +1067,11 @@ def generation_main(
                     processed_row_ids.add(row_id_str)
                     continue
                 
-                # Deterministically choose the assigned model for this row ID
                 seed_str = f"priority_split_{row_id_str}".encode("utf-8")
                 row_seed = binascii.crc32(seed_str)
                 row_rng = random.Random(row_seed)
                 selected_model = row_rng.choice(all_possible_models)
                 
-                # Search through the pending tasks prepared for the current host's models
                 matching_task = None
                 for candidate_t in tasks:
                     if (candidate_t["type"] == "full_abstract" and 
@@ -850,7 +1080,6 @@ def generation_main(
                         matching_task = candidate_t
                         break
                 
-                # If this host is responsible for the selected model, queue it
                 if matching_task:
                     prioritized_tasks.append(matching_task)
                 
@@ -887,12 +1116,14 @@ def generation_main(
         print("All specified tasks are already completed in the dataset.")
         return rows
         
-    # ADDED: Passes global CHECKPOINT_PATH and returns the updated rows structure
     updated_rows = run_generation(tasks, rows, system_prompts, CHECKPOINT_PATH, debug_mode=debug_mode)
     return updated_rows
 
 
-# script execution
+# ==========================================
+# Orchestrator Entrypoint
+# ==========================================
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
     parser.add_argument(
@@ -901,12 +1132,12 @@ def main():
         nargs='+', 
         default=['UG', 'HBO'], 
         choices=['UG', 'HBO', 'SB'], 
-        help="Source dataset to process (UG: UGent, HBO: HBO Kennisbank, SB: Scriptiebank). If not specified, processes all available."
+        help="Source dataset to process."
     )
     parser.add_argument(
         '--priority',
         action='store_true',
-        help='Prioritize 1 full abstract rewrite per row with random model, grouped by model.'
+        help='Prioritize 1 full abstract rewrite per row with random model.'
     )
     parser.add_argument(
         '--tasks', 
@@ -914,20 +1145,30 @@ def main():
         nargs='+', 
         default=['sentence','full'], 
         choices=['sentence', 'percentage', 'full'], 
-        help="Type of tasks to perform. Default: sentence and full"
+        help="Type of tasks to perform."
     )
-    parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
+    parser.add_argument('--debug', action='store_true', help="Run in standard debug mode (fewer tasks)")
+    parser.add_argument(
+        '--debug-pct-compare', 
+        action='store_true', 
+        help="Run structural percentage task strategies comparison suite."
+    )
+    parser.add_argument(
+        '--debug-count', 
+        type=int, 
+        default=3, 
+        help="Number of samples to run during debug comparisons. Default: 3"
+    )
     parser.add_argument(
         '--format', 
         type=str, 
         default='both', 
         choices=['csv', 'parquet', 'both'], 
-        help="Output save format. Default: both"
+        help="Output save format."
     )
 
     args = parser.parse_args()
 
-    # ADDED: Load previous output if it exists to preserve current progress across runs, otherwise fallback to base dataset
     if OUTPUT_DATA_PARQUET.exists():
         print(f"Loading existing output parquet: {OUTPUT_DATA_PARQUET}")
         table = pq.read_table(OUTPUT_DATA_PARQUET)
@@ -945,14 +1186,28 @@ def main():
         sys.exit(1)
 
     df = table.to_pandas()
+    
+    # -------------------------------------------------------------
+    # Parsing List Elements (JSON Lists or ' | ' pipe-separated)
+    # -------------------------------------------------------------
     for col in df.columns:
         if df[col].dtype == object:
-            first_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
-            if isinstance(first_val, str) and first_val.strip().startswith('['):
-                try:
-                    df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
-                except Exception:
-                    pass
+            non_nulls = df[col].dropna()
+            first_val = non_nulls.iloc[0] if not non_nulls.empty else None
+            
+            if isinstance(first_val, str):
+                first_val_stripped = first_val.strip()
+                if first_val_stripped.startswith('['):
+                    try:
+                        df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
+                    except Exception:
+                        pass
+                # #AD: Safely parses lists that were written to CSV formatted with the ' | ' pipe delimiter
+                elif col in ['abstract_sentence', 'keywords'] or col.endswith('_single'):
+                    df[col] = df[col].apply(
+                        lambda x: [s.strip() for s in x.split('|')] if isinstance(x, str) and '|' in x
+                        else (x if isinstance(x, list) else ([x] if pd.notna(x) and x != "" else []))
+                    )
 
     if args.source:
         print(f"Filtering dataset for source: {args.source}")
@@ -974,12 +1229,21 @@ def main():
     if 'percentage' in args.tasks:
         percentages = [25, 50, 75]
 
-    if args.debug:
+    if args.debug or args.debug_pct_compare:
         print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
         active_models_list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
     else:
         active_models_list = get_models_list()
 
+    # #AD: Activates comparative validation execution path if debug comparative suite is specified
+    if args.debug_pct_compare:
+        print(f"Running comparative percentage rewrite suite on {args.debug_count} abstracts.")
+        run_percentage_comparison_suite(
+            table=active_table,
+            models_list=active_models_list,
+            debug_count=args.debug_count
+        )
+        sys.exit(0)
 
     print("Starting LLM generation pipeline...")
     updated_rows = generation_main(
@@ -992,56 +1256,6 @@ def main():
         priority=args.priority
     )
 
-    #TODO remove this and run seperate script for creating or adding to llm_added.parquet / .csv
-    if not args.debug:
-        updated_active_df = pd.DataFrame(updated_rows)
-        
-        # Combine modifications back with unprocessed entries
-        if not inactive_df.empty:
-            final_df = pd.concat([updated_active_df, inactive_df], ignore_index=True)
-        else:
-            final_df = updated_active_df
-
-        print("\nAll tasks completed. Saving final aggregated dataset...")
-        OUTPUT_DATA_PARQUET.parent.mkdir(parents=True, exist_ok=True)
-        
-        # ADDED: Export to CSV and/or Parquet according to selection (default: both)
-        if args.format in ('parquet', 'both'):
-            final_table = pa.Table.from_pandas(final_df)
-            pq.write_table(final_table, OUTPUT_DATA_PARQUET)
-            print(f"Successfully saved Parquet: {OUTPUT_DATA_PARQUET}")
-            
-        if args.format in ('csv', 'both'):
-            final_df.to_csv(OUTPUT_DATA_CSV, index=False)
-            print(f"Successfully saved CSV: {OUTPUT_DATA_CSV}")
-    else:
-        print("\n[DEBUG] Pipeline completed execution. File system changes skipped in debug mode.")
 
 if __name__ == "__main__":
     main()
-
-
-'''
-import unicodedata
-
-def preprocess_text(text):
-    if not isinstance(text, str):
-        return text
-    
-    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
-    text = unicodedata.normalize('NFKC', text)
-    
-    # 2. Standardize common quotation marks and dashes (optional but recommended)
-    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
-    text = text.replace('—', '-').replace('–', '-') # Standardize em/en dashes to hyphens
-    
-    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
-    text = " ".join(text.split())
-    
-    return text
-
-# Apply this function to both datasets
-human_abstracts_cleaned = [preprocess_text(t) for t in human_abstracts]
-llm_abstracts_cleaned = [preprocess_text(t) for t in existing_llm_abstracts]
-
-'''
