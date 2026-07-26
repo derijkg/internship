@@ -1,8 +1,12 @@
 # models/svm.py
 import sys
+import os
 import optuna
 import numpy as np
+import pandas as pd
 import joblib
+from datetime import datetime
+
 from sklearn.svm import SVC, LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, f1_score, roc_auc_score, precision_score, fbeta_score, roc_curve
@@ -12,6 +16,13 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from features import get_feature_extraction_pipeline, generate_df_hash, get_cached_split_features, clear_optuna_cache
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
+
+
+# #explained Optuna callback function to report the overall best trial and score live as each trial finishes.
+def print_best_trial_callback(study, trial):
+    if trial.state == optuna.trial.TrialState.COMPLETE:
+        best = study.best_trial
+        print(f"-> [Optuna Progress] Current Best: Trial {best.number} | Value ({study.direction.name}): {best.value:.4f}")
 
 
 def get_classifier(kernel, c_val, gamma='scale', calibrate=False):
@@ -120,7 +131,6 @@ def optimize_svm_with_optuna(
 
     db_path = "sqlite:///optuna_svm.db?timeout=60"
 
-    # #explained Uses passed study_name or builds standard default if None.
     if study_name is None:
         clean_metric = score_metric.replace('-', '_').replace('.', '')
         study_name = f"svm_{kernel_choice}_{granularity}_{clean_metric}_{tuning_strategy}"
@@ -217,7 +227,8 @@ def optimize_svm_with_optuna(
             return mean_score
 
         study_s1 = safe_create_or_reset_study(study_s1_name, db_path, 'maximize', reset_study)
-        study_s1.optimize(objective_stage1, n_trials=trials_stage1, n_jobs=n_jobs_optuna)
+        # #explained Added print_best_trial_callback to report the overall best trial live upon trial completion.
+        study_s1.optimize(objective_stage1, n_trials=trials_stage1, n_jobs=n_jobs_optuna, callbacks=[print_best_trial_callback])
         best_tfidf_params = study_s1.best_params
         print(f"-> Best Preprocessing parameters found: {best_tfidf_params}")
 
@@ -322,7 +333,8 @@ def optimize_svm_with_optuna(
                 pass
 
     study_s2.set_user_attr("dataset_hash", current_hash)
-    study_s2.optimize(objective_stage2, n_trials=stage2_trials, n_jobs=n_jobs_optuna)
+    # #explained Added print_best_trial_callback to Stage 2 optimization.
+    study_s2.optimize(objective_stage2, n_trials=stage2_trials, n_jobs=n_jobs_optuna, callbacks=[print_best_trial_callback])
 
     completed_trials = [t for t in study_s2.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if len(completed_trials) > 0:
@@ -349,6 +361,22 @@ def optimize_svm_with_optuna(
     return best_overall_params
 
 
+# #explained Helper function to log complete experiment details, parameters, and multi-granularity performance into experiment_results.csv.
+def log_experiment_to_registry(record_dict, registry_path="experiment_results.csv"):
+    df_new = pd.DataFrame([record_dict])
+    if os.path.exists(registry_path):
+        try:
+            df_existing = pd.read_csv(registry_path)
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+        except Exception:
+            df_combined = df_new
+    else:
+        df_combined = df_new
+
+    df_combined.to_csv(registry_path, index=False)
+    print(f"-> Experiment metrics and metadata successfully registered in '{registry_path}'")
+
+
 def train_svm(train_df,
               test_df, c_val,
               kernel,
@@ -368,6 +396,7 @@ def train_svm(train_df,
               ):
     word_params, char_params = None, None
     gamma = 'scale'
+    best_params = {}
 
     if run_optuna:
         print("Running Hyperparameter Optimization via Optuna...")
@@ -435,16 +464,83 @@ def train_svm(train_df,
     test_scores = full_pipeline.predict_proba(X_test_raw)[:, 1]
     preds = (test_scores >= optimal_threshold).astype(int) if score_metric == 'set_fp' else full_pipeline.predict(X_test_raw)
 
-    print("\nSVM Test Performance Evaluation:")
-    print(classification_report(y_test, preds))
+    print("\n" + "=" * 50)
+    print("      OVERALL TEST PERFORMANCE EVALUATION      ")
+    print("=" * 50)
+    print(classification_report(y_test, preds, digits=4))
 
+    overall_auc = 0.0
     try:
-        auc_val = roc_auc_score(y_test, test_scores)
-        print(f"SVM Test ROC-AUC Score: {auc_val:.4f}\n")
+        overall_auc = roc_auc_score(y_test, test_scores)
+        print(f"Overall Test ROC-AUC Score: {overall_auc:.4f}\n")
     except Exception as e:
         print(f"Could not calculate ROC-AUC: {e}")
 
-    # #explained Saves calibrated pipeline directly to save_path derived from study_name.
+    # =============================================================
+    # #explained Diagnosis & Report: Performance split on Abstracts vs Sentences
+    # =============================================================
+    full_auc, sent_auc = None, None
+    full_f1, sent_f1 = None, None
+
+    if 'task_type' in test_df.columns:
+        full_mask = (test_df['task_type'] == 'full').values
+        sent_mask = (test_df['task_type'] == 'sentence').values
+
+        if full_mask.sum() > 0:
+            print("\n" + "-" * 50)
+            print("  DIAGNOSIS: FULL ABSTRACTS ONLY PERFORMANCE  ")
+            print("-" * 50)
+            print(classification_report(y_test[full_mask], preds[full_mask], digits=4))
+            full_f1 = f1_score(y_test[full_mask], preds[full_mask], pos_label=1, zero_division=0)
+            if len(np.unique(y_test[full_mask])) > 1:
+                full_auc = roc_auc_score(y_test[full_mask], test_scores[full_mask])
+                print(f"Full Abstracts ROC-AUC: {full_auc:.4f}")
+
+        if sent_mask.sum() > 0:
+            print("\n" + "-" * 50)
+            print("  DIAGNOSIS: SENTENCES ONLY PERFORMANCE      ")
+            print("-" * 50)
+            print(classification_report(y_test[sent_mask], preds[sent_mask], digits=4))
+            sent_f1 = f1_score(y_test[sent_mask], preds[sent_mask], pos_label=1, zero_division=0)
+            if len(np.unique(y_test[sent_mask])) > 1:
+                sent_auc = roc_auc_score(y_test[sent_mask], test_scores[sent_mask])
+                print(f"Sentences ROC-AUC: {sent_auc:.4f}\n")
+
+    # =============================================================
+    # #explained Log metadata and performance metrics to experiment registry CSV
+    # =============================================================
+    record = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'study_name': study_name or f"svm_{granularity}",
+        'save_path': save_path,
+        'granularity': granularity,
+        'tuning_strategy': tuning_strategy,
+        'kernel': kernel,
+        'score_metric': score_metric,
+        'tuning_sample_size': tuning_sample_size,
+        'calibrated_threshold': optimal_threshold,
+
+        # Best Hyperparameters
+        'C': c_val,
+        'word_ngram': f"({best_params.get('word_min_ngram')},{best_params.get('word_max_ngram')})" if 'word_min_ngram' in best_params else None,
+        'word_max_features': best_params.get('word_max_features', None),
+        'word_min_df': best_params.get('word_min_df', None),
+        'char_ngram': f"({best_params.get('char_min_ngram')},{best_params.get('char_max_ngram')})" if 'char_min_ngram' in best_params else None,
+        'char_max_features': best_params.get('char_max_features', None),
+        'char_min_df': best_params.get('char_min_df', None),
+
+        # Metrics
+        'overall_f1_ai': f1_score(y_test, preds, pos_label=1, zero_division=0),
+        'overall_precision_ai': precision_score(y_test, preds, pos_label=1, zero_division=0),
+        'overall_roc_auc': overall_auc,
+        'full_abstract_f1_ai': full_f1,
+        'full_abstract_roc_auc': full_auc,
+        'sentence_f1_ai': sent_f1,
+        'sentence_roc_auc': sent_auc
+    }
+
+    log_experiment_to_registry(record)
+
     joblib.dump(full_pipeline, save_path)
     print(f"Deployable probability-calibrated pipeline saved successfully to {save_path}")
 
