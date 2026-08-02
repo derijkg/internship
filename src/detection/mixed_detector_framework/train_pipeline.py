@@ -1,5 +1,7 @@
 # train_pipeline.py
 
+#TODO limit cpu usage like train_optuna
+
 import os
 import copy
 import json

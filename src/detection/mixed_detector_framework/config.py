@@ -24,9 +24,14 @@ class ModelConfig:
     hidden_dim: int = 256
     num_lstm_layers: int = 2
     dropout: float = 0.3
+    feature_input_dropout: float = 0.0     # [NEW] Regularization before RNN
+    rnn_type: str = "LSTM"                 # [NEW] "LSTM" or "GRU"
     include_w3: bool = True
     include_w5: bool = True
     aux_boundary_weight: float = 0.5
+    boundary_pos_weight: float = 5.0       # [NEW] Class imbalance weight for boundary loss
+    emission_temp: float = 1.0             # [NEW] Temperature scaling for emissions
+    use_attention: bool = True             # [NEW] Residual Multi-Head Self-Attention
 
 
 @dataclass
@@ -36,13 +41,15 @@ class TrainingConfig:
     batch_size: int = 8
     learning_rate: float = 1e-3
     weight_decay: float = 0.01
-    target_fpr: float = 0.01  # 1% Max FPR target for Neyman-Pearson calibration
+    crf_lr_mult: float = 5.0               # [NEW] Higher LR multiplier for CRF layer
+    scheduler_type: str = "cosine"         # [NEW] "cosine", "reduce_on_plateau", or "none"
+    target_fpr: float = 0.01               # 1% Max FPR target for Neyman-Pearson calibration
 
 
 @dataclass
 class OptunaConfig:
-    n_trials: int = 15          # Number of hyperparameter trials
-    search_epochs: int = 6       # Max epochs per trial during hyperparameter search
+    n_trials: int = 15                     # Number of hyperparameter trials
+    search_epochs: int = 6                 # Max epochs per trial during hyperparameter search
     study_name: str = "neural_crf_optuna"
     storage: Optional[str] = None
 
@@ -67,7 +74,7 @@ def parse_args_into_config() -> MasterConfig:
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else 'cpu',
-        help="execution device (cuda cpu or guillotine)"
+        help="execution device (cuda or cpu)"
     )
 
     # Data arguments
@@ -106,13 +113,44 @@ def parse_args_into_config() -> MasterConfig:
         "--hidden_dim",
         type=int,
         default=256,
-        help="Hidden dimension for projection and BiLSTM",
+        help="Hidden dimension for projection and BiRNN",
+    )
+    parser.add_argument(
+        "--rnn_type",
+        type=str,
+        default="LSTM",
+        choices=["LSTM", "GRU"],
+        help="Recurrent cell type (LSTM or GRU)",
+    )
+    parser.add_argument(
+        "--feature_input_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied to fused features before RNN",
     )
     parser.add_argument(
         "--aux_boundary_weight",
         type=float,
         default=0.5,
         help="Weight for auxiliary boundary loss",
+    )
+    parser.add_argument(
+        "--boundary_pos_weight",
+        type=float,
+        default=5.0,
+        help="Positive class weight for boundary BCE loss",
+    )
+    parser.add_argument(
+        "--emission_temp",
+        type=float,
+        default=1.0,
+        help="Temperature scaling factor for emissions before CRF",
+    )
+    parser.add_argument(
+        "--use_attention",
+        type=lambda x: (str(x).lower() == 'true'),
+        default=True,
+        help="Enable residual multi-head self-attention layer (True/False)",
     )
 
     # Training arguments
@@ -133,6 +171,19 @@ def parse_args_into_config() -> MasterConfig:
         type=float,
         default=1e-3,
         help="Optimizer learning rate",
+    )
+    parser.add_argument(
+        "--crf_lr_mult",
+        type=float,
+        default=5.0,
+        help="Learning rate multiplier for CRF layer parameters",
+    )
+    parser.add_argument(
+        "--scheduler_type",
+        type=str,
+        default="cosine",
+        choices=["cosine", "reduce_on_plateau", "none"],
+        help="Learning rate decay scheduler strategy",
     )
     parser.add_argument(
         "--n_splits",
@@ -172,7 +223,7 @@ def parse_args_into_config() -> MasterConfig:
     default_data_cfg = DataConfig()
     data_cfg = DataConfig(
         data_path=args.data_path if args.data_path else default_data_cfg.data_path,
-        sample_size=args.sample_size,  # Kept as None if omitted
+        sample_size=args.sample_size,
         cache_dir=args.cache_dir,
         cache_file=args.cache_file,
     )
@@ -180,14 +231,21 @@ def parse_args_into_config() -> MasterConfig:
     model_cfg = ModelConfig(
         transformer_name=args.transformer_name,
         hidden_dim=args.hidden_dim,
+        rnn_type=args.rnn_type,
+        feature_input_dropout=args.feature_input_dropout,
         aux_boundary_weight=args.aux_boundary_weight,
-        device=args.device
+        boundary_pos_weight=args.boundary_pos_weight,
+        emission_temp=args.emission_temp,
+        use_attention=args.use_attention,
+        device=args.device,
     )
 
     train_cfg = TrainingConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        crf_lr_mult=args.crf_lr_mult,
+        scheduler_type=args.scheduler_type,
         n_splits=args.n_splits,
         target_fpr=args.target_fpr,
     )

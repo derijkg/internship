@@ -20,13 +20,13 @@ class MultiTaskNeuralCRFTagger(nn.Module):
         hidden_dim: int = 256,
         num_lstm_layers: int = 2,
         dropout: float = 0.3,
-        feature_input_dropout: float = 0.0,  # [NEW] Input feature dropout
-        rnn_type: str = "LSTM",              # [NEW] "LSTM" or "GRU"
+        feature_input_dropout: float = 0.0,  
+        rnn_type: str = "LSTM",              
         aux_boundary_weight: float = 0.4,
-        boundary_pos_weight: float = 5.0,    # [NEW] BCE class imbalance weight
+        boundary_pos_weight: float = 5.0,    
         emission_temp: float = 1.0,
         use_attention: bool = True,
-        aux_pos_weight: Optional[float] = None, # Backward compatibility fallback
+        aux_pos_weight: Optional[float] = None, 
     ):
         super().__init__()
         self.dense_dim = dense_dim
@@ -156,7 +156,7 @@ class MultiTaskNeuralCRFTagger(nn.Module):
             )
             # Residual Connection + LayerNorm
             rnn_out = self.attn_layernorm(rnn_out + attn_out)
-            
+
         # Emissions & Auxiliary Boundary Predictions
         emissions = self.emission_head(rnn_out) / self.emission_temp
 

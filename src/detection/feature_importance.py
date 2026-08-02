@@ -1,6 +1,15 @@
 # evaluate_importance.py
 import sys
 import os
+import warnings
+
+# Suppress spurious BeautifulSoup url/markup locator warnings
+try:
+    from bs4 import MarkupResemblesLocatorWarning
+    warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+except ImportError:
+    pass
+
 # Ensure custom module search path is added before any local imports
 sys.path.append(os.path.abspath('src/detection'))
 
@@ -18,7 +27,7 @@ from sklearn.metrics import f1_score
 from sklearn.metrics.pairwise import euclidean_distances
 import scipy.sparse as sp
 
-from features import prepare_classification_dataset
+from features import prepare_classification_dataset, pre_lemmatize_dataset
 
 # Define default models as they were originally set up
 DEFAULT_MODELS = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
@@ -35,7 +44,6 @@ def evaluate_distance_update_chunk(chunk_id, col_indices, X_dense, X_sv, D_base,
     M = X_dense.shape[0]
     checkpoint_file = f"checkpoint_chunk_{chunk_id}.json"
     
-    # Check for existing checkpoint progress to allow resuming interrupted evaluations
     progress = {}
     if os.path.exists(checkpoint_file):
         try:
@@ -45,19 +53,15 @@ def evaluate_distance_update_chunk(chunk_id, col_indices, X_dense, X_sv, D_base,
         except Exception as e:
             print(f"[Worker {chunk_id}] Failed to load checkpoint, starting fresh: {e}")
             
-    # Pre-calculate nearest support vector coordinates for the baseline test set
     closest_sv_base = np.argmin(D_base, axis=1)
     sv_class_base = sv_class_labels[closest_sv_base]
     
-    # Resolve the base decision function (confidence values) once
     dec_base = (np.exp(-gamma * D_base) @ dual_coef.T + clf_intercept).ravel()
     
-    # Restrict BLAS/LAPACK threads to 1 per worker to prevent CPU oversubscription
     with threadpoolctl.threadpool_limits(limits=1, user_api='blas'):
         for i, col_idx in enumerate(col_indices):
             col_str = str(col_idx)
             
-            # Skip evaluation if feature metrics were already calculated and stored in the checkpoint
             if col_str in progress:
                 continue
                 
@@ -76,46 +80,36 @@ def evaluate_distance_update_chunk(chunk_id, col_indices, X_dense, X_sv, D_base,
                 x_j_perm = X_dense[perm_idx, col_idx][:, np.newaxis]
                 sv_j = X_sv[:, col_idx][np.newaxis, :]
                 
-                # Rank-1 Update of the distance matrix
                 delta = - (x_j - sv_j)**2 + (x_j_perm - sv_j)**2
                 D_new = D_base + delta
                 
-                # Recompute decision function
                 K_new = np.exp(-gamma * D_new)
                 dec_new = (K_new @ dual_coef.T + clf_intercept).ravel()
                 
-                # Reconstruct classes safely without using non-serializable lambda functions
                 if invert_class_mapping:
                     preds_new = np.where(dec_new > 0, clf_classes[0], clf_classes[1])
                 else:
                     preds_new = np.where(dec_new > 0, clf_classes[1], clf_classes[0])
                 
-                # 1. Standard F1-Score drops
                 score_new = f1_score(y_test, preds_new, average='binary')
                 f1_drops.append(float(baseline_score - score_new))
                 
-                # 2. Continuous Margin Shift (Absolute confidence delta)
                 margin_shifts.append(float(np.mean(np.abs(dec_base - dec_new))))
                 
-                # 3. Relative Confidence Loss (Confidence drop relative to original magnitude)
                 rel_loss = np.mean(np.abs(dec_base - dec_new) / (np.abs(dec_base) + 1e-9))
                 rel_losses.append(float(rel_loss))
                 
-                # 4. Neighborhood Drift (Closest SV changes)
                 closest_sv_new = np.argmin(D_new, axis=1)
                 drift_ratio = np.mean(closest_sv_base != closest_sv_new)
                 drifts.append(float(drift_ratio))
                 
-                # 5. Inter-Class Drift (Closest SV shifts to opposite class)
                 sv_class_new = sv_class_labels[closest_sv_new]
                 inter_drift_ratio = np.mean(sv_class_base != sv_class_new)
                 inter_drifts.append(float(inter_drift_ratio))
                 
-                # 6. Direction (% of samples where scrambling reduced confidence)
                 helpful_pct = np.mean(np.abs(dec_new) < np.abs(dec_base))
                 helpful_pcts.append(float(helpful_pct))
                 
-            # Store calculated arrays under the corresponding feature index key
             progress[col_str] = {
                 "f1_drop": f1_drops,
                 "margin_shift": margin_shifts,
@@ -125,7 +119,6 @@ def evaluate_distance_update_chunk(chunk_id, col_indices, X_dense, X_sv, D_base,
                 "helpful": helpful_pcts
             }
             
-            # Write metrics instantly to disk checkpoint to save progress
             with open(checkpoint_file, 'w') as f:
                 json.dump(progress, f)
                 
@@ -138,19 +131,16 @@ def parse_arguments():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Core Path Configurations
     parser.add_argument('--model_path', type=str, default="svm_full.pkl",
                         help="Path to the trained pipeline .pkl file.")
     parser.add_argument('--data_path', type=str, default="/home/gderijck/internship/data/gold/llm_added.parquet",
                         help="Path to the raw parquet dataset file.")
     
-    # Subsampling Controls
     parser.add_argument('--sample_size', type=int, default=350,
                         help="Number of test samples to use for fast evaluation. Use -1 for the full test split.")
     parser.add_argument('--n_repeats', type=int, default=2,
                         help="Number of times to shuffle each feature during permutation testing.")
     
-    # Dataset Preparation Parameters
     parser.add_argument('--models', nargs='+', default=DEFAULT_MODELS,
                         help="List of LLM model tags used to reconstruct columns.")
     parser.add_argument('--granularity', type=str, choices=['full', 'sentence', 'both'], default='full',
@@ -160,7 +150,6 @@ def parse_arguments():
     parser.add_argument('--source_filter', nargs='+', default=None,
                         help="List of sources to filter (e.g., UG, SB, HBO). Leaves unfiltered if None.")
     
-    # Evaluation Mechanics
     parser.add_argument('--scoring', type=str, default='f1',
                         help="Scoring metric to use (e.g., 'f1' or 'accuracy').")
     parser.add_argument('--n_jobs', type=int, default=-1,
@@ -170,15 +159,12 @@ def parse_arguments():
     parser.add_argument('--top_n', type=int, default=20,
                         help="Number of top features to display in the console printout.")
     
-    parser.add_argument('--method', type=str, choices=['standard', 'custom_loop', 'distance_update', 'gradient'], default='distance_update',
-                        help="The evaluation method to run: 'standard' (sklearn), 'custom_loop' (parallel), 'distance_update' (Method 1), or 'gradient' (Method 2).")
+    parser.add_argument('--method', type=str, choices=['standard', 'custom_loop', 'distance_update', 'gradient', 'linear'], default='linear',
+                        help="Evaluation method: 'linear' (exact linear weights), 'distance_update' (RBF trick), 'gradient' (RBF analytical), 'standard' (sklearn permutation), or 'custom_loop'.")
 
-    # #MODIFIED: Standardized to hook into the new `--method` argument automatically
-    #TODO remove
     parser.add_argument('--use_custom_loop', action='store_true',
-                        help="Enables the optimized, single-threaded active-feature loop (Legacy flag, sets --method=custom_loop).")
+                        help="Enables the optimized, single-threaded active-feature loop.")
 
-    #REPORT SAVING
     parser.add_argument('--output_report_path', type=str, default="svm_diagnostic_report.csv",
                         help="Path to output the final full multi-dimensional diagnostic report (CSV format).")
     parser.add_argument('--clear_checkpoints', action='store_true',
@@ -188,7 +174,6 @@ def parse_arguments():
 
 def evaluate_feature_chunk(col_indices, X_data, baseline_score, y_test, clf):
     """Evaluates a chunk of features sequentially using in-place mutation."""
-    # Each worker process makes exactly ONE copy of the matrix
     X_worker = X_data.copy()
     chunk_results = []
     
@@ -200,9 +185,18 @@ def evaluate_feature_chunk(col_indices, X_data, baseline_score, y_test, clf):
         score = f1_score(y_test, preds, average='binary')
         
         chunk_results.append((col_idx, baseline_score - score))
-        X_worker[:, col_idx] = original_col  # Restore the column
+        X_worker[:, col_idx] = original_col
         
     return chunk_results
+
+def unwrap_classifier(clf):
+    """Unwraps CalibratedClassifierCV or GridSearch wrappers to access the core estimator."""
+    if hasattr(clf, 'calibrated_classifiers_') and len(clf.calibrated_classifiers_) > 0:
+        cal_obj = clf.calibrated_classifiers_[0]
+        return getattr(cal_obj, 'estimator', getattr(cal_obj, 'base_estimator', clf))
+    if hasattr(clf, 'best_estimator_'):
+        return clf.best_estimator_
+    return clf
 
 def main():
     args = parse_arguments()
@@ -251,6 +245,9 @@ def main():
         random_state=args.random_state
     )
 
+    print("Pre-lemmatizing test split...")
+    test_df = pre_lemmatize_dataset(test_df, text_column='text')
+
     # Resolve evaluation sample size
     if args.sample_size > 0:
         eval_sample_size = min(len(test_df), args.sample_size)
@@ -266,52 +263,134 @@ def main():
         print(f"Using full test split of {len(eval_df)} rows...")
 
     y_test = eval_df['label'].values
-    X_test_raw = eval_df[['text', 'sentences']].to_dict(orient='records')
+    X_test_raw = eval_df.to_dict(orient='records')
 
-    # 3. Step-by-Step Feature Name Reconstruction
-    feature_union = pipeline.named_steps['features']
-
-    # Retrieve Word TF-IDF feature names
-    word_pipeline = dict(feature_union.transformer_list)['word_ngrams']
-    word_tfidf = word_pipeline.named_steps['tfidf']
-    word_names = [f"word_tfidf__{name}" for name in word_tfidf.get_feature_names_out()]
-
-    # Retrieve Char TF-IDF feature names
-    char_pipeline = dict(feature_union.transformer_list)['char_ngrams']
-    char_tfidf = char_pipeline.named_steps['tfidf']
-    char_names = [f"char_tfidf__{name}" for name in char_tfidf.get_feature_names_out()]
-
-    # Define the 12 hand-crafted stylometric feature names
-    stylometrics_names = [
-        'style__mean_sent_len', 'style__var_sent_len', 'style__burstiness', 
-        'style__mean_word_len', 'style__var_word_len', 'style__ttr', 'style__hapax_ratio', 
-        'style__transition_ratio', 'style__space_ratio', 'style__double_space_ratio', 
-        'style__punc_ratio', 'style__total_chars'
-    ]
-
-    all_feature_names = np.concatenate([word_names, char_names, stylometrics_names])
-
-    # 4. Transform raw test data into the sparse feature matrix
+    # 3. Transform raw test data into sparse feature matrix
     print("Extracting features from evaluation set...")
-    X_test_transformed = feature_union.transform(X_test_raw)
+    features_step = pipeline.named_steps['features']
+    X_test_transformed = features_step.transform(X_test_raw)
 
-    clf = pipeline.named_steps['classifier']
+    raw_clf = pipeline.named_steps['classifier']
+    clf = unwrap_classifier(raw_clf)
 
-    # Initialize standard arrays for backward compatibility outputs
+    # 4. Robust Step-by-Step Feature Name Reconstruction
+    all_feature_names = None
+
+    if hasattr(features_step, 'get_feature_names_out'):
+        try:
+            names = features_step.get_feature_names_out()
+            if len(names) == X_test_transformed.shape[1]:
+                all_feature_names = np.array(names)
+        except Exception:
+            all_feature_names = None
+
+    if all_feature_names is None:
+        fu = None
+        if hasattr(features_step, 'transformer_list'):
+            fu = features_step
+        elif hasattr(features_step, 'named_steps'):
+            for step_obj in features_step.named_steps.values():
+                if hasattr(step_obj, 'transformer_list'):
+                    fu = step_obj
+                    break
+
+        if fu is not None:
+            transformer_dict = dict(fu.transformer_list)
+
+            word_names = []
+            if 'word_ngrams' in transformer_dict:
+                wp = transformer_dict['word_ngrams']
+                tfidf = wp.named_steps['tfidf'] if hasattr(wp, 'named_steps') else wp
+                if hasattr(tfidf, 'get_feature_names_out'):
+                    word_names = [f"word_tfidf__{name}" for name in tfidf.get_feature_names_out()]
+
+            char_names = []
+            if 'char_ngrams' in transformer_dict:
+                cp = transformer_dict['char_ngrams']
+                tfidf = cp.named_steps['tfidf'] if hasattr(cp, 'named_steps') else cp
+                if hasattr(tfidf, 'get_feature_names_out'):
+                    char_names = [f"char_tfidf__{name}" for name in tfidf.get_feature_names_out()]
+
+            stylometrics_names = [
+                'style__mean_sent_len', 'style__var_sent_len', 'style__burstiness', 
+                'style__mean_word_len', 'style__var_word_len', 'style__ttr', 'style__hapax_ratio', 
+                'style__transition_ratio', 'style__space_ratio', 'style__double_space_ratio', 
+                'style__punc_ratio', 'style__total_chars'
+            ]
+
+            all_feature_names = np.concatenate([word_names, char_names, stylometrics_names])
+
+    n_features = X_test_transformed.shape[1]
+    if all_feature_names is None or len(all_feature_names) != n_features:
+        print(f"Warning: Reconstructed {len(all_feature_names) if all_feature_names is not None else 0} feature names, "
+              f"but matrix has {n_features} columns. Falling back to generic feature indices.")
+        all_feature_names = np.array([f"feature_{i}" for i in range(n_features)])
+
+    # Automatic Method Fallback Inspection
+    kernel_type = getattr(clf, 'kernel', None)
+    
+    if args.method == 'linear':
+        if not hasattr(clf, 'coef_') or clf.coef_ is None:
+            print(f"\n[INFO] Model kernel is '{kernel_type}' (Optuna selected non-linear kernel during tuning).")
+            print(" -> Automatically switching to '--method distance_update' for non-linear SVM evaluation...\n")
+            args.method = 'distance_update'
+
     D = len(all_feature_names)
-    importances_mean = np.zeros(D)
-    importances_std = np.zeros(D)
 
-    # #MODIFIED: Transitioned conditional logic to route tasks via the new `--method` choice
-    if args.method == 'distance_update':
+    # =========================================================================
+    # METHOD: LINEAR KERNEL DIRECT WEIGHT INSPECTION
+    # =========================================================================
+    if args.method == 'linear':
+        print("\n=== Running Linear Kernel Coefficient Inspection ===")
+        start_time = time.time()
+
+        weights = clf.coef_
+        if sp.issparse(weights):
+            weights = weights.toarray()
+        weights = weights.ravel()
+
+        if len(weights) != D:
+            raise ValueError(f"Mismatch: Extracted {len(weights)} feature weights, but expected {D} feature names.")
+
+        if sp.issparse(X_test_transformed):
+            feature_means = np.array(X_test_transformed.mean(axis=0)).ravel()
+            
+            X_sq = X_test_transformed.copy()
+            X_sq.data **= 2
+            feature_stds = np.sqrt(np.maximum(0, np.array(X_sq.mean(axis=0)).ravel() - feature_means**2))
+        else:
+            feature_means = np.mean(X_test_transformed, axis=0)
+            feature_stds = np.std(X_test_transformed, axis=0)
+
+        std_impact = weights * feature_stds
+        abs_std_impact = np.abs(std_impact)
+
+        class_1_label = clf.classes_[1] if hasattr(clf, 'classes_') else 1
+        class_0_label = clf.classes_[0] if hasattr(clf, 'classes_') else 0
+        direction = np.where(weights > 0, f"Pushes_to_{class_1_label}", f"Pushes_to_{class_0_label}")
+
+        importance_df = pd.DataFrame({
+            'feature': all_feature_names,
+            'weight': weights,
+            'abs_weight': np.abs(weights),
+            'std_impact': std_impact,
+            'abs_std_impact': abs_std_impact,
+            'feature_mean': feature_means,
+            'feature_std': feature_stds,
+            'direction': direction
+        }).sort_values(by='abs_weight', ascending=False)
+
+        print(f"Calculation complete. Instantaneous extraction elapsed: {time.time() - start_time:.3f}s")
+
+    elif args.method == 'distance_update':
         print("\n=== Running Parallelized Vectorized Distance-Update (Method 1) ===")
         start_time = time.time()
         
         if getattr(clf, 'kernel', None) != 'rbf':
-            raise ValueError("The 'distance_update' method requires an SVM with an 'rbf' kernel.")
+            raise ValueError(f"The 'distance_update' method requires an SVM with an 'rbf' kernel, but got '{kernel_type}'.")
             
         if len(clf.classes_) != 2:
-            raise ValueError("Optimized RBF SVM methods (distance_update, gradient) are designed for binary classification.")
+            raise ValueError("Optimized RBF SVM methods are designed for binary classification.")
             
         if hasattr(clf, '_gamma'):
             gamma = clf._gamma
@@ -321,7 +400,6 @@ def main():
             X_dense = X_test_transformed.toarray()
             gamma = 1.0 / (X_dense.shape[1] * X_dense.var()) if X_dense.shape[1] > 0 else 0.1
 
-        # Safely convert sparse dual coefficients to dense arrays to avoid SciPy sparse matrix multiplication overloads
         dual_coef = clf.dual_coef_
         if sp.issparse(dual_coef):
             dual_coef = dual_coef.toarray()
@@ -332,15 +410,12 @@ def main():
             
         X_dense = X_test_transformed.toarray()
         M, D = X_dense.shape
-        N_SV = X_sv.shape[0]
         
-        # Calculate base distances and resolve output classes
         D_base = euclidean_distances(X_dense, X_sv, squared=True)
         dec_base = (np.exp(-gamma * D_base) @ dual_coef.T + clf.intercept_).ravel()
         actual_preds = clf.predict(X_dense)
         preds_mapped = np.where(dec_base > 0, clf.classes_[1], clf.classes_[0])
         
-        # Determine if the sign mapping of decision outputs matches final classes
         invert_class_mapping = not np.array_equal(preds_mapped, actual_preds)
         
         sv_class_labels = np.concatenate([
@@ -354,22 +429,20 @@ def main():
         active_cols = np.where(X_dense.any(axis=0))[0]
         print(f"Active features in this subset: {len(active_cols)} / {D}")
         
-        # Chunk active columns and dispatch using Joblib (loky backend)
         from joblib import Parallel, delayed
         print(f"Dividing {len(active_cols)} features across {n_jobs} parallel workers...")
         
         chunks = np.array_split(active_cols, n_jobs)
         
-        # Run parallel evaluations with robust process-isolated checkpointing
         Parallel(n_jobs=n_jobs, backend='loky')(
             delayed(evaluate_distance_update_chunk)(
                 chunk_id, chunk, X_dense, X_sv, D_base, dual_coef, clf.intercept_, clf.classes_, 
                 baseline_score, y_test, gamma, args.n_repeats, args.random_state, invert_class_mapping, sv_class_labels
             )
-            for chunk_id, chunk in enumerate(chunks)
+            for chunk_id in range(len(chunks))
+            for chunk in [chunks[chunk_id]]
         )
         
-        #checkpoints
         print("Assembling completed metrics from checkpoints...")
         compiled_results = {}
         for chunk_id in range(n_jobs):
@@ -382,7 +455,6 @@ def main():
                 except Exception as e:
                     print(f"Warning: could not read {checkpoint_file}: {e}")
 
-        # Initialize tracking arrays for all evaluated metrics
         importances_f1_mean = np.zeros(D)
         importances_f1_std = np.zeros(D)
         margin_shift_mean = np.zeros(D)
@@ -401,7 +473,6 @@ def main():
             inter_drift_mean[col_idx] = np.mean(metrics["inter_drift"])
             helpful_mean[col_idx] = np.mean(metrics["helpful"])
             
-        # Compile multi-dimensional dataframe sorted by continuous margin shift
         importance_df = pd.DataFrame({
             'feature': all_feature_names,
             'importance_f1_mean': importances_f1_mean,
@@ -412,12 +483,7 @@ def main():
             'inter_class_drift_mean': inter_drift_mean,
             'helpful_direction_mean': helpful_mean
         }).sort_values(by='margin_shift_mean', ascending=False)
-        
-        # Display arrays under generic variables for default stdout reporting
-        importances_mean = importances_f1_mean
-        importances_std = importances_f1_std
 
-        # Clean up process-specific checkpoint files upon complete success
         if len(compiled_results) >= len(active_cols):
             print("Cleaning up temporary chunk checkpoints...")
             for chunk_id in range(n_jobs):
@@ -427,9 +493,6 @@ def main():
                         os.remove(checkpoint_file)
                     except OSError:
                         pass
-        else:
-            print("Warning: Some features were not completed. Checkpoint files preserved.")
-
         print(f"Calculation complete. (Elapsed: {time.time() - start_time:.1f}s)")
 
     elif args.method == 'gradient':
@@ -440,7 +503,7 @@ def main():
             raise ValueError("The 'gradient' method requires an SVM with an 'rbf' kernel.")
             
         if len(clf.classes_) != 2:
-            raise ValueError("Optimized RBF SVM methods (distance_update, gradient) are designed for binary classification.")
+            raise ValueError("Optimized RBF SVM methods are designed for binary classification.")
             
         if hasattr(clf, '_gamma'):
             gamma = clf._gamma
@@ -462,11 +525,10 @@ def main():
         M, D = X_dense.shape
         
         D_base = euclidean_distances(X_dense, X_sv, squared=True)
-        K = np.exp(-gamma * D_base)  # shape (M, N_SV)
+        K = np.exp(-gamma * D_base)
         
         W = -2 * gamma * K * dual_coef
         S = np.sum(W, axis=1, keepdims=True)
-        
         G = (S * X_dense) - (W @ X_sv)
         
         importances_mean = np.mean(np.abs(G * X_dense), axis=0)
@@ -480,7 +542,6 @@ def main():
         print(f"Calculation complete. (Elapsed: {time.time() - start_time:.1f}s)")
 
     elif args.method == 'custom_loop':
-        # Legacy/custom parallel active-feature loop block
         from joblib import Parallel, delayed
         
         X_dense = X_test_transformed.toarray()
@@ -493,31 +554,26 @@ def main():
         baseline_score = f1_score(y_test, baseline_preds, average='binary')
         print(f"Baseline Test F1-Score: {baseline_score:.4f}")
         
-        # Split the active column indices into balanced chunks
         chunks = np.array_split(active_cols, n_jobs)
-        
         start_time = time.time()
         
-        # Run using the 'loky' backend for safe multi-processing
         results_nested = Parallel(n_jobs=n_jobs, backend='loky')(
             delayed(evaluate_feature_chunk)(chunk, X_dense, baseline_score, y_test, clf)
             for chunk in chunks
         )
         
-        # Unpack the nested results into the main importances array
+        importances_mean = np.zeros(D)
         for chunk_results in results_nested:
             for col_idx, imp in chunk_results:
                 importances_mean[col_idx] = imp
 
         importance_df = pd.DataFrame({
             'feature': all_feature_names,
-            'importance_mean': importances_mean,
-            'importance_std': importances_std
+            'importance_mean': importances_mean
         }).sort_values(by='importance_mean', ascending=False)
         print(f"Calculation complete. (Elapsed: {time.time() - start_time:.1f}s)")
 
     else:
-        # Run standard scikit-learn permutation_importance
         print(f"Calculating feature importances using Scikit-Learn (repeats={args.n_repeats}, jobs={args.n_jobs})...")
         start_time = time.time()
         result = permutation_importance(
@@ -529,16 +585,15 @@ def main():
             random_state=args.random_state,
             n_jobs=args.n_jobs           
         )
-        importances_mean = result.importances_mean
-        importances_std = result.importances_std
         
         importance_df = pd.DataFrame({
             'feature': all_feature_names,
-            'importance_mean': importances_mean,
-            'importance_std': importances_std
+            'importance_mean': result.importances_mean,
+            'importance_std': result.importances_std
         }).sort_values(by='importance_mean', ascending=False)
         print(f"Calculation complete. (Elapsed: {time.time() - start_time:.1f}s)")
 
+    # Save Output Report
     output_path = Path(args.output_report_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     importance_df.to_csv(output_path, index=False)
@@ -550,15 +605,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-'''
-predictions using 0.01 fp threshold 
-
-pipeline = joblib.load("svmpath.pkl")
-scores = pipeline.decision_function(new_data)
-threshold = getattr(pipeline, "optimal_threshold", 0.0)
-predictions = (scores >= threshold).astype(int)
-
-
-'''

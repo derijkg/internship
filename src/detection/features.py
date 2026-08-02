@@ -18,10 +18,11 @@ import spacy
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import FeatureUnion, Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import Normalizer, StandardScaler
 from scipy.sparse import hstack, csr_matrix
 
 nltk.download('stopwords', quiet=True)
+nltk.download('punkt', quiet=True)
 from nltk.corpus import stopwords
 dutch_stopwords = stopwords.words('dutch')
 
@@ -30,7 +31,7 @@ _dutch_stopwords_lemmatized = None
 
 
 def get_nlp():
-    """Lazy loads spaCy model only when needed to save memory."""
+    """Lazy loads spaCy model with fast sentencizer enabled."""
     global _nlp
     if _nlp is None:
         try:
@@ -39,6 +40,10 @@ def get_nlp():
             import spacy.cli
             spacy.cli.download('nl_core_news_sm')
             _nlp = spacy.load("nl_core_news_sm", disable=["parser", "ner"])
+            
+        # Add lightweight rule-based sentence boundary detector
+        if "sentencizer" not in _nlp.pipe_names:
+            _nlp.add_pipe("sentencizer")
     return _nlp
 
 
@@ -55,7 +60,16 @@ def get_dutch_stopwords_lemmatized():
 
 def lemmatizing_tokenizer(text):
     nlp_model = get_nlp()
-    return [token.lemma_ for token in nlp_model(text.lower()) if not token.is_punct]
+    return [token.lemma_.lower() for token in nlp_model(text.lower()) if not token.is_punct]
+
+
+def lemmatize_text_string(text: str) -> str:
+    """Helper for on-the-fly lemmatization during pipeline deployment on raw text."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    nlp_model = get_nlp()
+    doc = nlp_model(text.lower())
+    return " ".join([token.lemma_.lower() for token in doc if not token.is_punct])
 
 
 DUTCH_TRANSITIONS = {
@@ -65,17 +79,27 @@ DUTCH_TRANSITIONS = {
 
 
 # ==========================================
-# Text Cleaning & Normalization Helpers
+# Text Cleaning, Normalization & Sentence Helpers
 # ==========================================
+def tokenize_sentences(text: str) -> list:
+    """Tokenizes Dutch text into sentences using spaCy's sentencizer."""
+    if not isinstance(text, str) or not text.strip():
+        return []
+    nlp_model = get_nlp()
+    doc = nlp_model(text)
+    return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+
+
 def pre_lemmatize_dataset(df, text_column='text', n_process=1):
-    """Lemmatizes dataset sequentially for non-parallel execution."""
+    """Lemmatizes dataset sequentially with lowercase normalized lemmas."""
     df = df.copy()
     print(f"Pre-lemmatizing {len(df)} texts sequentially...")
 
     nlp_model = get_nlp()
-    docs = nlp_model.pipe(df[text_column].astype(str).tolist(), batch_size=256)
-    lemmatized_texts = [" ".join([token.lemma_ for token in doc if not token.is_punct]) for doc in docs]
-
+    texts_to_process = df[text_column].astype(str).str.lower().tolist()
+    docs = nlp_model.pipe(texts_to_process, batch_size=256)
+    
+    lemmatized_texts = [" ".join([token.lemma_.lower() for token in doc if not token.is_punct]) for doc in docs]
     df['text_lemmatized'] = lemmatized_texts
     return df
 
@@ -147,26 +171,33 @@ def calculate_hapax_ratio(words):
 
 
 def extract_stylometric_features(text, sentences):
-    """Extracts a 12-dimensional array of statistical and syntactic metrics."""
+    """
+    Extracts a 12-dimensional array of statistical and syntactic metrics.
+    Applies np.log1p transform to heavy-tailed, un-bounded features to stabilize variance.
+    """
     words = re.findall(r'\w+', text.lower())
     total_chars = len(text)
 
     if not words or not sentences:
         return np.zeros(12)
 
-    if len(sentences) <= 1:
+    sent_lengths = [len(re.findall(r'\w+', s)) for s in sentences if len(re.findall(r'\w+', s)) > 0]
+    
+    if not sent_lengths or len(sent_lengths) <= 1:
         mean_sent_len = float(len(words))
         var_sent_len = 0.0
         burstiness = 0.0
     else:
-        sent_lengths = [len(re.findall(r'\w+', s)) for s in sentences if len(re.findall(r'\w+', s)) > 0]
-        mean_sent_len = np.mean(sent_lengths) if sent_lengths else 0.0
-        var_sent_len = np.var(sent_lengths) if sent_lengths else 0.0
-        burstiness = (np.std(sent_lengths) / mean_sent_len) if mean_sent_len > 0 else 0.0
+        mean_sent_len = float(np.mean(sent_lengths))
+        var_sent_len = float(np.var(sent_lengths))
+        std_sent_len = float(np.std(sent_lengths))
+        
+        # Goh & Barabási Burstiness B = (std - mean) / (std + mean)
+        burstiness = (std_sent_len - mean_sent_len) / (std_sent_len + mean_sent_len) if (std_sent_len + mean_sent_len) > 0 else 0.0
 
     word_lengths = [len(w) for w in words]
-    mean_word_len = np.mean(word_lengths)
-    var_word_len = np.var(word_lengths)
+    mean_word_len = float(np.mean(word_lengths))
+    var_word_len = float(np.var(word_lengths))
 
     ttr = calculate_ttr(words)
     hapax_ratio = calculate_hapax_ratio(words)
@@ -183,18 +214,29 @@ def extract_stylometric_features(text, sentences):
     punc_ratio = punc_count / total_chars if total_chars > 0 else 0.0
 
     return np.array([
-        mean_sent_len, var_sent_len, burstiness,
-        mean_word_len, var_word_len,
-        ttr, hapax_ratio,
-        transition_ratio, space_ratio, double_space_ratio, punc_ratio,
-        float(total_chars)
+        np.log1p(mean_sent_len),
+        np.log1p(var_sent_len),
+        burstiness,
+        mean_word_len,
+        np.log1p(var_word_len),
+        ttr,
+        hapax_ratio,
+        transition_ratio,
+        space_ratio,
+        double_space_ratio,
+        punc_ratio,
+        np.log1p(float(total_chars))
     ])
 
 
 # ==========================================
-# 2. Custom Scikit-Learn Transformers
+# 2. Custom Scikit-Learn Transformers (Fully Deployable)
 # ==========================================
 class TextExtractor(BaseEstimator, TransformerMixin):
+    """
+    Extracts text for TF-IDF vectorization.
+    Supports raw strings, dictionaries, pre-lemmatized keys, and on-the-fly lemmatization fallback.
+    """
     def __init__(self, key='text'):
         self.key = key
 
@@ -202,10 +244,40 @@ class TextExtractor(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
-        return [item[self.key] for item in X]
+        output = []
+        # Ensure single string input is wrapped in a list
+        items = [X] if isinstance(X, (str, dict)) else X
+
+        for item in items:
+            if isinstance(item, str):
+                raw_text = item
+                lemmatized_text = None
+            elif isinstance(item, dict):
+                raw_text = item.get('text', '')
+                lemmatized_text = item.get('text_lemmatized', None)
+            else:
+                raw_text = str(item)
+                lemmatized_text = None
+
+            cleaned_text = normalize_text(raw_text)
+
+            if self.key == 'text_lemmatized':
+                if lemmatized_text is not None and str(lemmatized_text).strip():
+                    output.append(str(lemmatized_text))
+                else:
+                    # On-the-fly lemmatization fallback for deployed raw text inputs
+                    output.append(lemmatize_text_string(cleaned_text))
+            else:
+                output.append(cleaned_text)
+
+        return output
 
 
 class StylometricExtractor(BaseEstimator, TransformerMixin):
+    """
+    Extracts 12-dimensional stylometric features.
+    Handles raw strings, auto-normalizes HTML/Markdown, and auto-tokenizes sentences if missing.
+    """
     def __init__(self, n_jobs=1):
         self.n_jobs = n_jobs
 
@@ -213,8 +285,41 @@ class StylometricExtractor(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
-        features = [extract_stylometric_features(item['text'], item['sentences']) for item in X]
+        features = []
+        items = [X] if isinstance(X, (str, dict)) else X
+
+        for item in items:
+            if isinstance(item, str):
+                raw_text = item
+                provided_sents = None
+            elif isinstance(item, dict):
+                raw_text = item.get('text', '')
+                provided_sents = item.get('sentences', None)
+            else:
+                raw_text = str(item)
+                provided_sents = None
+
+            cleaned_text = normalize_text(raw_text)
+
+            if provided_sents and isinstance(provided_sents, (list, tuple)) and len(provided_sents) > 0:
+                sentences = [normalize_text(str(s)) for s in provided_sents if s and str(s).strip()]
+            else:
+                sentences = tokenize_sentences(cleaned_text)
+
+            features.append(extract_stylometric_features(cleaned_text, sentences))
+
         return np.array(features)
+
+
+class StylometricScaler(BaseEstimator, TransformerMixin):
+    def __init__(self, weight=1.0):
+        self.weight = weight
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X * self.weight
 
 
 # ==========================================
@@ -226,22 +331,36 @@ def generate_df_hash(df):
 
 
 def safe_parse_list(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return []
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    if isinstance(val, (list, tuple)):
+        return list(val)
     if isinstance(val, str):
         val = val.strip()
         if val.startswith('[') and val.endswith(']'):
             try:
-                return ast.literal_eval(val)
+                res = ast.literal_eval(val)
+                if isinstance(res, list):
+                    return res
             except (ValueError, SyntaxError):
                 try:
-                    return json.loads(val)
+                    res = json.loads(val)
+                    if isinstance(res, list):
+                        return res
                 except Exception:
                     pass
-    return val
+        return [val] if val else []
+    return [val]
 
 
 def prepare_classification_dataset(df, selected_models, granularity='full', source_filter=None, llm_ratio=4, random_state=42):
+    """
+    Reshapes raw dataset into long classification records.
+    PRESERVES '_id' / 'doc_id' and 'text_lemmatized' if present.
+    """
     import random
-    local_rng = random.Random(random_state) if random_state is not None else random
 
     if source_filter:
         df = df[df['source'].isin(source_filter)].copy()
@@ -249,8 +368,12 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
     records = []
     active_granularities = ['full', 'sentence'] if granularity == 'both' else [granularity]
 
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         source = row.get('source', 'unknown')
+        abstract_id = row.get('_id', row.get('doc_id', row.get('id', idx)))
+        seed_val = int(hashlib.md5(str(abstract_id).encode('utf-8')).hexdigest(), 16) % (2**32)
+        local_rng = random.Random(seed_val)
+
         row_human_records = []
         row_llm_records = []
 
@@ -262,7 +385,7 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
                     if isinstance(raw_human_sents, list) and len(raw_human_sents) > 0:
                         break
 
-            human_sents = raw_human_sents if isinstance(raw_human_sents, list) else []
+            human_sents = raw_human_sents if isinstance(raw_human_sents, (list, tuple)) else []
             cleaned_human_sents = [s for s in [clean_and_normalize_value(s) for s in human_sents] if s]
 
             if gran == 'full':
@@ -270,22 +393,32 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
                 if pd.notna(human_text) and human_text != "":
                     cleaned_human_text = clean_and_normalize_value(human_text)
                     if cleaned_human_text != "":
-                        row_human_records.append({
+                        rec = {
+                            '_id': abstract_id,
+                            'doc_id': abstract_id,
                             'text': cleaned_human_text,
                             'sentences': cleaned_human_sents,
                             'label': 0,
                             'source': source,
                             'task_type': 'full'
-                        })
+                        }
+                        if 'text_lemmatized' in row and pd.notna(row['text_lemmatized']):
+                            rec['text_lemmatized'] = row['text_lemmatized']
+                        row_human_records.append(rec)
             else:
                 for sent in cleaned_human_sents:
-                    row_human_records.append({
+                    rec = {
+                        '_id': abstract_id,
+                        'doc_id': abstract_id,
                         'text': sent,
                         'sentences': [sent],
                         'label': 0,
                         'source': source,
                         'task_type': 'sentence'
-                    })
+                    }
+                    if 'text_lemmatized' in row and pd.notna(row['text_lemmatized']):
+                        rec['text_lemmatized'] = row['text_lemmatized']
+                    row_human_records.append(rec)
 
             valid_models = []
             for model in selected_models:
@@ -301,11 +434,15 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
                             break
                     if sent_col:
                         raw_sent_list = safe_parse_list(row[sent_col])
-                        if isinstance(raw_sent_list, list) and any(s for s in raw_sent_list if s):
+                        if isinstance(raw_sent_list, (list, tuple)) and any(s for s in raw_sent_list if s): 
                             valid_models.append(model)
 
-            if not valid_models:
-                continue
+            if row_human_records:
+                records.extend(row_human_records)
+
+            # Only append LLM records if valid LLM models exist for this row
+            if valid_models and row_llm_records:
+                records.extend(row_llm_records)
 
             models_to_process = local_rng.sample(valid_models, k=llm_ratio) if (llm_ratio > 0 and len(valid_models) > llm_ratio) else valid_models
 
@@ -324,22 +461,32 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
                     col_name = f"{model}_full"
                     cleaned_ai_text = clean_and_normalize_value(row[col_name])
                     if cleaned_ai_text != "":
-                        row_llm_records.append({
+                        rec = {
+                            '_id': abstract_id,
+                            'doc_id': abstract_id,
                             'text': cleaned_ai_text,
                             'sentences': cleaned_ai_sents,
                             'label': 1,
                             'source': source,
                             'task_type': 'full'
-                        })
+                        }
+                        if 'text_lemmatized' in row and pd.notna(row['text_lemmatized']):
+                            rec['text_lemmatized'] = row['text_lemmatized']
+                        row_llm_records.append(rec)
                 else:
                     for sent in cleaned_ai_sents:
-                        row_llm_records.append({
+                        rec = {
+                            '_id': abstract_id,
+                            'doc_id': abstract_id,
                             'text': sent,
                             'sentences': [sent],
                             'label': 1,
                             'source': source,
                             'task_type': 'sentence'
-                        })
+                        }
+                        if 'text_lemmatized' in row and pd.notna(row['text_lemmatized']):
+                            rec['text_lemmatized'] = row['text_lemmatized']
+                        row_llm_records.append(rec)
 
         if row_human_records:
             records.extend(row_human_records)
@@ -347,82 +494,67 @@ def prepare_classification_dataset(df, selected_models, granularity='full', sour
             records.extend(row_llm_records)
 
     final_df = pd.DataFrame(records)
-
-    if not final_df.empty and 'task_type' in final_df.columns:
-        num_full = (final_df['task_type'] == 'full').sum()
-        num_sentence = (final_df['task_type'] == 'sentence').sum()
-        total_tasks = len(final_df)
-        print(f"[Task Proportions] Granularity: {granularity} | "
-              f"Full Abstracts: {num_full} ({num_full/total_tasks*100:.1f}%) | "
-              f"Sentences: {num_sentence} ({num_sentence/total_tasks*100:.1f}%)")
-
-    if not final_df.empty and 'label' in final_df.columns:
-        num_human = (final_df['label'] == 0).sum()
-        num_llm = (final_df['label'] == 1).sum()
-        if num_human > 0:
-            print(f"[Dataset Stats] Counts: {num_human} Human, {num_llm} AI | Empirical Ratio -> 1:{num_llm/num_human:.2f}")
-
     return final_df
 
 
-def get_feature_extraction_pipeline(word_tfidf_params=None, char_tfidf_params=None, stylometrics_n_jobs=1, use_pre_lemmatized=True):
-    """Defines feature extraction blueprint for Sklearn pipelines."""
-    # #explained Hardcoded sublinear_tf=True and max_df=0.95 by default.
-    if word_tfidf_params is None:
-        word_tfidf_params = {
-            'ngram_range': (1, 3),
-            'max_features': 5000,
-            'min_df': 2,
-            'max_df': 0.95,
-            'sublinear_tf': True,
-            'analyzer': 'word',
-            'token_pattern': r'(?u)\b\w\w+\b',
-            'stop_words': get_dutch_stopwords_lemmatized()
-        }
-    else:
-        word_tfidf_params = word_tfidf_params.copy()
-        if not use_pre_lemmatized:
-            word_tfidf_params.setdefault('tokenizer', lemmatizing_tokenizer)
-            word_tfidf_params.setdefault('token_pattern', None)
-        word_tfidf_params.setdefault('sublinear_tf', True)
-        word_tfidf_params.setdefault('max_df', 0.95)
-        word_tfidf_params.setdefault('stop_words', get_dutch_stopwords_lemmatized())
+def get_feature_extraction_pipeline(word_tfidf_params=None, char_tfidf_params=None, 
+                                    sty_params=None, stylometrics_n_jobs=1, use_pre_lemmatized=True):
+    """
+    Defines deployable feature pipeline. 
+    Applies TextExtractor, CharExtractor, StylometricExtractor, standardization, and global L2 normalization.
+    """
+    sty_config = sty_params or {'use_stylometrics': True, 'sty_weight': 1.0}
 
-    if char_tfidf_params is None:
-        char_tfidf_params = {
-            'analyzer': 'char',
-            'ngram_range': (2, 5),
-            'max_features': 5000,
-            'min_df': 2,
-            'max_df': 0.95,
-            'sublinear_tf': True
-        }
-    else:
-        char_tfidf_params = char_tfidf_params.copy()
-        char_tfidf_params.setdefault('analyzer', 'char')
-        char_tfidf_params.setdefault('sublinear_tf', True)
-        char_tfidf_params.setdefault('max_df', 0.95)
+    w_params = (word_tfidf_params or {}).copy()
+    w_params.setdefault('ngram_range', (1, 3))
+    w_params.setdefault('max_features', 50000)
+    w_params.setdefault('min_df', 2)
+    w_params.setdefault('max_df', 0.95)
+    w_params.setdefault('sublinear_tf', True)
+    w_params.setdefault('norm', 'l2')
+    w_params.setdefault('analyzer', 'word')
+    w_params.setdefault('stop_words', get_dutch_stopwords_lemmatized())
 
     word_extractor_key = 'text_lemmatized' if use_pre_lemmatized else 'text'
 
-    return FeatureUnion([
+    c_params = (char_tfidf_params or {}).copy()
+    c_params.setdefault('analyzer', 'char')
+    c_params.setdefault('ngram_range', (2, 5))
+    c_params.setdefault('max_features', 50000)
+    c_params.setdefault('min_df', 2)
+    c_params.setdefault('max_df', 0.95)
+    c_params.setdefault('sublinear_tf', True)
+    c_params.setdefault('norm', 'l2')
+
+    transformers = [
         ('word_ngrams', Pipeline([
             ('extract', TextExtractor(key=word_extractor_key)),
-            ('tfidf', TfidfVectorizer(**word_tfidf_params))
+            ('tfidf', TfidfVectorizer(**w_params))
         ])),
         ('char_ngrams', Pipeline([
             ('extract', TextExtractor(key='text')),
-            ('tfidf', TfidfVectorizer(**char_tfidf_params))
-        ])),
-        ('stylometrics', Pipeline([
-            ('extractor', StylometricExtractor(n_jobs=1)),
-            ('scaler', StandardScaler())
+            ('tfidf', TfidfVectorizer(**c_params))
         ]))
+    ]
+
+    if sty_config.get('use_stylometrics', True):
+        sty_weight = sty_config.get('sty_weight', 1.0)
+        transformers.append(
+            ('stylometrics', Pipeline([
+                ('extractor', StylometricExtractor(n_jobs=1)),
+                ('scaler', StandardScaler()),
+                ('subspace_norm', Normalizer(norm='l2')),
+                ('weight', StylometricScaler(weight=sty_weight))
+            ]))
+        )
+
+    return Pipeline([
+        ('union', FeatureUnion(transformers)),
+        ('normalizer', Normalizer(norm='l2'))
     ])
 
 
 def clear_optuna_cache(cache_dir="./.optuna_temp_cache"):
-    """Deletes temporary Optuna trial feature cache."""
     if os.path.exists(cache_dir):
         try:
             shutil.rmtree(cache_dir)
@@ -431,43 +563,41 @@ def clear_optuna_cache(cache_dir="./.optuna_temp_cache"):
             print(f"Warning: Could not clear temporary Optuna cache: {e}")
 
 
-def get_cached_split_features(X_train_raw, X_val_raw, word_params, char_params, cache_dir="./.optuna_temp_cache", use_pre_lemmatized=True):
-    """Extracts features cleanly without parallel directory locking overhead."""
+def get_cached_split_features(X_train_raw, X_val_raw, word_params, char_params, 
+                               sty_params=None, cache_dir="./.optuna_temp_cache", 
+                               use_pre_lemmatized=True):
     os.makedirs(cache_dir, exist_ok=True)
 
     def get_data_hash(X_raw):
-        sample = [x['text'][:30] for x in X_raw[:50]] + [x['text'][:30] for x in X_raw[-50:]]
-        serialized = f"{len(X_raw)}_" + "".join(sample)
+        serialized = f"{len(X_raw)}_" + "".join(
+            str(x.get('_id', x.get('doc_id', x.get('text', '')[:20]))) if isinstance(x, dict) else str(x)[:20] for x in X_raw
+        )
         return hashlib.md5(serialized.encode('utf-8')).hexdigest()
-
+    
     train_hash = get_data_hash(X_train_raw)
     val_hash = get_data_hash(X_val_raw)
 
-    train_sty_path = os.path.join(cache_dir, f"tr_sty_{train_hash}.joblib")
-    val_sty_path = os.path.join(cache_dir, f"val_sty_tr_{train_hash}_val_{val_hash}.joblib")
+    has_tr_lemmatized = len(X_train_raw) > 0 and isinstance(X_train_raw[0], dict) and 'text_lemmatized' in X_train_raw[0]
+    has_va_lemmatized = len(X_val_raw) == 0 or (isinstance(X_val_raw[0], dict) and 'text_lemmatized' in X_val_raw[0])
+    actual_use_pre_lemmatized = use_pre_lemmatized and has_tr_lemmatized and has_va_lemmatized
 
-    has_lemmatized = len(X_train_raw) > 0 and 'text_lemmatized' in X_train_raw[0]
-    actual_use_pre_lemmatized = use_pre_lemmatized and has_lemmatized
-
-    # Word TF-IDF
     w_params = word_params.copy() if word_params else {}
     extractor = TextExtractor(key='text_lemmatized') if actual_use_pre_lemmatized else TextExtractor(key='text')
-    if not actual_use_pre_lemmatized:
-        w_params.setdefault('tokenizer', lemmatizing_tokenizer)
-        w_params.setdefault('token_pattern', None)
+    w_params.setdefault('analyzer', 'word')
     w_params.setdefault('sublinear_tf', True)
     w_params.setdefault('max_df', 0.95)
+    w_params.setdefault('norm', 'l2')
     w_params.setdefault('stop_words', get_dutch_stopwords_lemmatized())
 
-    vectorizer = TfidfVectorizer(**w_params)
-    X_tr_word = vectorizer.fit_transform(extractor.transform(X_train_raw))
-    X_va_word = vectorizer.transform(extractor.transform(X_val_raw))
+    vectorizer_word = TfidfVectorizer(**w_params)
+    X_tr_word = vectorizer_word.fit_transform(extractor.transform(X_train_raw))
+    X_va_word = vectorizer_word.transform(extractor.transform(X_val_raw))
 
-    # Char TF-IDF
     c_params = char_params.copy() if char_params else {}
     c_params.setdefault('analyzer', 'char')
     c_params.setdefault('sublinear_tf', True)
     c_params.setdefault('max_df', 0.95)
+    c_params.setdefault('norm', 'l2')
 
     vectorizer_char = TfidfVectorizer(**c_params)
     extractor_char = TextExtractor(key='text')
@@ -475,25 +605,44 @@ def get_cached_split_features(X_train_raw, X_val_raw, word_params, char_params, 
     X_tr_char = vectorizer_char.fit_transform(extractor_char.transform(X_train_raw))
     X_va_char = vectorizer_char.transform(extractor_char.transform(X_val_raw))
 
-    # Stylometrics
-    if os.path.exists(train_sty_path) and os.path.exists(val_sty_path):
-        X_tr_sty = joblib.load(train_sty_path)
-        X_va_sty = joblib.load(val_sty_path)
-    else:
-        extractor_sty = StylometricExtractor(n_jobs=1)
+    feature_blocks_tr = [X_tr_word, X_tr_char]
+    feature_blocks_va = [X_va_word, X_va_char]
+
+    sty_config = sty_params or {'use_stylometrics': True, 'sty_weight': 1.0}
+    if sty_config.get('use_stylometrics', True):
+        train_sty_raw_path = os.path.join(cache_dir, f"tr_sty_raw_{train_hash}.joblib")
+        val_sty_raw_path = os.path.join(cache_dir, f"val_sty_raw_tr_{train_hash}_val_{val_hash}.joblib")
+
+        if os.path.exists(train_sty_raw_path) and os.path.exists(val_sty_raw_path):
+            raw_tr = joblib.load(train_sty_raw_path)
+            raw_va = joblib.load(val_sty_raw_path)
+        else:
+            extractor_sty = StylometricExtractor(n_jobs=1)
+            raw_tr = extractor_sty.transform(X_train_raw)
+            raw_va = extractor_sty.transform(X_val_raw)
+            joblib.dump(raw_tr, train_sty_raw_path)
+            joblib.dump(raw_va, val_sty_raw_path)
+
         scaler = StandardScaler()
+        tr_scaled = scaler.fit_transform(raw_tr)
+        va_scaled = scaler.transform(raw_va)
 
-        raw_tr = extractor_sty.transform(X_train_raw)
-        raw_va = extractor_sty.transform(X_val_raw)
+        sty_normalizer = Normalizer(norm='l2')
+        tr_unit = sty_normalizer.fit_transform(tr_scaled)
+        va_unit = sty_normalizer.transform(va_scaled)
 
-        X_tr_sty = csr_matrix(scaler.fit_transform(raw_tr))
-        X_va_sty = csr_matrix(scaler.transform(raw_va))
+        sty_weight = sty_config.get('sty_weight', 1.0)
+        X_tr_sty = csr_matrix(tr_unit * sty_weight)
+        X_va_sty = csr_matrix(va_unit * sty_weight)
 
-        joblib.dump(X_tr_sty, train_sty_path)
-        joblib.dump(X_va_sty, val_sty_path)
+        feature_blocks_tr.append(X_tr_sty)
+        feature_blocks_va.append(X_va_sty)
 
-    # Concatenate features
-    X_tr_combined = hstack([X_tr_word, X_tr_char, X_tr_sty]).tocsr()
-    X_va_combined = hstack([X_va_word, X_va_char, X_va_sty]).tocsr()
+    X_tr_combined = hstack(feature_blocks_tr).tocsr()
+    X_va_combined = hstack(feature_blocks_va).tocsr()
+
+    global_normalizer = Normalizer(norm='l2')
+    X_tr_combined = global_normalizer.fit_transform(X_tr_combined)
+    X_va_combined = global_normalizer.transform(X_va_combined)
 
     return X_tr_combined, X_va_combined

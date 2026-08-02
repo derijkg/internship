@@ -1,6 +1,7 @@
 inter/
 data/
 old/
+logs/
 essay preprocessing/
 notebooks/
 __pycache__/

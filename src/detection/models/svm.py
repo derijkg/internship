@@ -6,100 +6,600 @@ import numpy as np
 import pandas as pd
 import joblib
 from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple, Union
+
+from optuna.study import Study
+from optuna.trial import Trial, FrozenTrial, TrialState
 
 from sklearn.svm import SVC, LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import classification_report, f1_score, roc_auc_score, precision_score, fbeta_score, roc_curve
+from sklearn.metrics import (
+    classification_report, f1_score, roc_auc_score, precision_score, 
+    recall_score, fbeta_score, roc_curve, confusion_matrix, 
+    average_precision_score, brier_score_loss, matthews_corrcoef
+)
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 
-from features import get_feature_extraction_pipeline, generate_df_hash, get_cached_split_features, clear_optuna_cache
+from features import (
+    get_feature_extraction_pipeline,
+    get_cached_split_features,
+    clear_optuna_cache,
+    get_dutch_stopwords_lemmatized
+)
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
 
 
-# #explained Optuna callback function to report the overall best trial and score live as each trial finishes.
-def print_best_trial_callback(study, trial):
-    if trial.state == optuna.trial.TrialState.COMPLETE:
-        best = study.best_trial
-        print(f"-> [Optuna Progress] Current Best: Trial {best.number} | Value ({study.direction.name}): {best.value:.4f}")
+def extract_doc_ids(df: pd.DataFrame) -> np.ndarray:
+    """Helper to extract unique abstract group IDs from DataFrame."""
+    for col in ['_id', 'doc_id', 'id']:
+        if col in df.columns:
+            return df[col].values
+    return np.arange(len(df))
 
 
-def get_classifier(kernel, c_val, gamma='scale', calibrate=False):
-    """Instantiates appropriate classifier (LinearSVC for linear, SVC for non-linear)."""
-    if kernel == 'linear':
-        base_clf = LinearSVC(C=c_val, random_state=42, class_weight='balanced', dual='auto', max_iter=2000)
+def predict_pipeline(pipeline: Pipeline, X_raw: Union[List[str], str, List[Dict]], threshold: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Inference helper for production deployment on raw strings or dicts.
+    Applies text normalization, feature extraction, and optimal calibrated thresholding.
+    
+    Returns:
+        (binary_predictions, probability_or_decision_scores)
+    """
+    is_calibrated = hasattr(pipeline, "predict_proba")
+    default_thresh = 0.5 if is_calibrated else 0.0
+    
+    if threshold is None:
+        threshold = getattr(pipeline, "optimal_threshold", default_thresh)
+
+    items = [X_raw] if isinstance(X_raw, (str, dict)) else X_raw
+
+    if is_calibrated:
+        scores = pipeline.predict_proba(items)[:, 1]
     else:
-        base_clf = SVC(C=c_val, kernel=kernel, gamma=gamma, random_state=42, class_weight='balanced', cache_size=500)
+        scores = pipeline.decision_function(items)
 
-    if calibrate:
-        return CalibratedClassifierCV(estimator=base_clf, cv=3, method='sigmoid')
-    return base_clf
+    preds = (scores >= threshold).astype(int)
+    return preds, scores
 
 
-def safe_create_or_reset_study(study_name, storage, direction='maximize', reset_study=False, pruner=None):
-    """Safely handles study creation or resetting in SQLite storage with pruning support."""
-    if reset_study:
+# ==========================================
+# 1. Classifier & Parameter Builders
+# ==========================================
+class ClassifierFactory:
+    """Instantiates SVM classifiers with support for loss functions, class weighting, and calibration."""
+
+    @staticmethod
+    def create(kernel: str, c_val: float, gamma: str = 'scale', coef0: float = 0.0,
+               linear_loss: str = 'squared_hinge', class_weight: Any = 'balanced', 
+               calibrate: bool = False, cv: Optional[Any] = None, 
+               cv_groups: Optional[np.ndarray] = None):
+        
+        if kernel == 'linear':
+            dual_mode = True if linear_loss == 'hinge' else False
+            base_clf = LinearSVC(
+                C=c_val,
+                loss=linear_loss,
+                dual=dual_mode,
+                random_state=42,
+                class_weight=class_weight,
+                max_iter=5000
+            )
+        else:
+            base_clf = SVC(
+                C=c_val,
+                kernel=kernel,
+                gamma=gamma,
+                coef0=coef0,
+                random_state=42,
+                class_weight=class_weight,
+                cache_size=500
+            )
+
+        if calibrate:
+            if cv is not None:
+                return CalibratedClassifierCV(estimator=base_clf, cv=cv, method='sigmoid')
+            elif cv_groups is not None:
+                n_groups = len(np.unique(cv_groups))
+                n_splits = max(2, min(3, n_groups))
+                sgkf = StratifiedGroupKFold(n_splits=n_splits)
+                return CalibratedClassifierCV(estimator=base_clf, cv=sgkf, method='sigmoid')
+            else:
+                return CalibratedClassifierCV(estimator=base_clf, cv=3, method='sigmoid')
+
+        return base_clf
+
+
+class TFIDFParamBuilder:
+    """Samples expanded TF-IDF, Stylometric, and Class Weight parameters from Optuna trials."""
+
+    @staticmethod
+    def sample_tfidf(trial: Trial, prefix: str) -> Dict[str, Any]:
+        min_ngram = trial.suggest_int(f'{prefix}_min_ngram', 1, 2 if prefix == 'word' else 3)
+        max_ngram_limit = 3 if prefix == 'word' else 5
+        max_ngram = trial.suggest_int(f'{prefix}_max_ngram', 2 if prefix == 'word' else 3, max_ngram_limit)
+        
+        if min_ngram > max_ngram:
+            min_ngram = max_ngram
+
+        return {
+            'ngram_range': (min_ngram, max_ngram),
+            'max_features': trial.suggest_int(f'{prefix}_max_features', 20000, 120000, step=10000),
+            'min_df': trial.suggest_int(f'{prefix}_min_df', 1, 5),
+            'max_df': 0.95,
+            'norm': 'l2',
+            'sublinear_tf': trial.suggest_categorical(f'{prefix}_sublinear_tf', [True, False]),
+            'binary': trial.suggest_categorical(f'{prefix}_binary', [True, False]),
+            'analyzer': 'word' if prefix == 'word' else 'char'
+        }
+
+    @staticmethod
+    def sample_stylometrics(trial: Trial) -> Dict[str, Any]:
+        use_sty = trial.suggest_categorical('use_stylometrics', [True, False])
+        sty_weight = trial.suggest_float('sty_weight', 0.01, 10.0, log=True) if use_sty else 0.0
+        return {'use_stylometrics': use_sty, 'sty_weight': sty_weight}
+
+    @staticmethod
+    def sample_model_params(trial: Trial, kernel_choice: str) -> Dict[str, Any]:
+        kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'sigmoid']) if kernel_choice == 'all' else kernel_choice
+        c_val = trial.suggest_float('C', 1e-2, 1e2, log=True)
+        
+        linear_loss = trial.suggest_categorical('linear_loss', ['squared_hinge', 'hinge']) if kernel == 'linear' else 'squared_hinge'
+        gamma = trial.suggest_float('gamma', 1e-4, 1e1, log=True) if kernel in ['rbf', 'sigmoid'] else 'scale'
+        coef0 = trial.suggest_float('coef0', -1.0, 1.0) if kernel == 'sigmoid' else 0.0
+
+        weight_mode = trial.suggest_categorical('weight_mode', ['balanced', 'custom'])
+        if weight_mode == 'custom':
+            human_w = trial.suggest_float('human_class_weight', 1.0, 20.0)
+            class_weight = {0: human_w, 1: 1.0}
+        else:
+            class_weight = 'balanced'
+
+        return {
+            'kernel': kernel,
+            'C': c_val,
+            'linear_loss': linear_loss,
+            'gamma': gamma,
+            'coef0': coef0,
+            'class_weight': class_weight
+        }
+
+    @staticmethod
+    def from_best_params(best_params: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        params = {}
+
+        if f'{prefix}_min_ngram' in best_params and f'{prefix}_max_ngram' in best_params:
+            params['ngram_range'] = (
+                int(best_params[f'{prefix}_min_ngram']),
+                int(best_params[f'{prefix}_max_ngram'])
+            )
+        else:
+            params['ngram_range'] = (1, 2) if prefix == 'word' else (3, 5)
+
+        key_mapping = {
+            'max_features': 'max_features',
+            'min_df': 'min_df',
+            'max_df': 'max_df',
+            'norm': 'norm',
+            'sublinear_tf': 'sublinear_tf',
+            'binary': 'binary',
+            'analyzer': 'analyzer'
+        }
+
+        for param_name, tfidf_arg in key_mapping.items():
+            optuna_key = f'{prefix}_{param_name}'
+            if optuna_key in best_params:
+                params[tfidf_arg] = best_params[optuna_key]
+
+        params.setdefault('max_features', 50000)
+        params.setdefault('min_df', 2)
+        params.setdefault('sublinear_tf', True)
+        params.setdefault('max_df', 0.95)
+        params.setdefault('norm', 'l2')
+        params.setdefault('binary', False)
+
+        if prefix == 'word':
+            params.setdefault('analyzer', 'word')
+            params.setdefault('stop_words', get_dutch_stopwords_lemmatized())
+        else:
+            params.setdefault('analyzer', 'char')
+
+        return params
+
+    @staticmethod
+    def extract_sty_params(best_params: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'use_stylometrics': best_params.get('use_stylometrics', True),
+            'sty_weight': best_params.get('sty_weight', 1.0)
+        }
+
+
+# ==========================================
+# 2. Metric & Threshold Evaluators
+# ==========================================
+class ScoreEvaluator:
+    """Calculates classification evaluation metrics cleanly and robustly."""
+
+    @staticmethod
+    def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_score: Optional[np.ndarray], metric_name: str) -> float:
+        metric = metric_name.lower().replace('-', '_')
+
         try:
-            optuna.delete_study(study_name=study_name, storage=storage)
-            print(f"-> Cleared existing Optuna study: '{study_name}'")
+            if metric in ['roc_auc', 'rocauc']:
+                if y_score is None or len(np.unique(y_true)) < 2:
+                    return 0.0
+                return float(roc_auc_score(y_true, y_score))
+            elif metric in ['pr_auc', 'prauc', 'average_precision']:
+                if y_score is None or len(np.unique(y_true)) < 2:
+                    return 0.0
+                return float(average_precision_score(y_true, y_score, pos_label=1))
+            elif metric == 'precision':
+                return float(precision_score(y_true, y_pred, pos_label=1, zero_division=0))
+            elif metric == 'recall':
+                return float(recall_score(y_true, y_pred, pos_label=1, zero_division=0))
+            elif metric in ['f0.5', 'f0_5']:
+                return float(fbeta_score(y_true, y_pred, beta=0.5, pos_label=1, zero_division=0))
+            elif metric == 'f1':
+                return float(f1_score(y_true, y_pred, pos_label=1, zero_division=0))
+            elif metric == 'mcc':
+                return float(matthews_corrcoef(y_true, y_pred))
+            elif metric in ['brier_score', 'brier']:
+                if y_score is None:
+                    return 1.0
+                return float(brier_score_loss(y_true, y_score))
+            elif metric == 'set_fp':
+                if y_score is None or len(np.unique(y_true)) < 2:
+                    return 0.0
+                fpr, tpr, _ = roc_curve(y_true, y_score)
+                valid_indices = np.where(fpr <= 0.01)[0]
+                return float(tpr[valid_indices[-1]]) if len(valid_indices) > 0 else 0.0
+            else:
+                return float(f1_score(y_true, y_pred, average='macro'))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def find_threshold_for_max_fpr(y_true: np.ndarray, y_score: np.ndarray, target_fpr: float = 0.01) -> float:
+        try:
+            fpr, tpr, thresholds = roc_curve(y_true, y_score)
+            valid_indices = np.where(fpr <= target_fpr)[0]
+            if len(valid_indices) > 0:
+                return float(thresholds[valid_indices[-1]])
         except Exception:
             pass
-
-    if pruner is None:
-        pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
-
-    return optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        direction=direction,
-        pruner=pruner,
-        load_if_exists=True
-    )
+        return 0.5
 
 
-def find_threshold_for_max_fpr(y_true, y_score, target_fpr=0.01):
-    """Finds decision threshold corresponding to target maximum FPR."""
-    fpr, tpr, thresholds = roc_curve(y_true, y_score)
-    valid_indices = np.where(fpr <= target_fpr)[0]
-    if len(valid_indices) > 0:
-        best_index = valid_indices[-1]
-        return thresholds[best_index]
-    return 0.5
+# ==========================================
+# 3. Optuna Objectives (Group-Aware CV)
+# ==========================================
+class Stage1Objective:
+    """Stage 1 Optuna objective using StratifiedGroupKFold to prevent _id data leakage."""
+
+    def __init__(self, X_raw: List[Dict], y: np.ndarray, groups: np.ndarray, 
+                 cv: StratifiedGroupKFold, kernel_choice: str, metric_name: str):
+        self.X_raw = X_raw
+        self.y = y
+        self.groups = groups
+        self.cv = cv
+        self.kernel_choice = kernel_choice
+        self.metric_name = metric_name
+
+    def __call__(self, trial: Trial) -> float:
+        word_params = TFIDFParamBuilder.sample_tfidf(trial, 'word')
+        char_params = TFIDFParamBuilder.sample_tfidf(trial, 'char')
+        sty_params = TFIDFParamBuilder.sample_stylometrics(trial)
+
+        fold_scores = []
+        eval_kernel = self.kernel_choice if self.kernel_choice != 'all' else 'linear'
+
+        for fold, (train_idx, val_idx) in enumerate(self.cv.split(self.X_raw, self.y, groups=self.groups)):
+            X_tr_raw = [self.X_raw[i] for i in train_idx]
+            X_va_raw = [self.X_raw[i] for i in val_idx]
+            y_tr, y_va = self.y[train_idx], self.y[val_idx]
+
+            X_tr, X_va = get_cached_split_features(
+                X_tr_raw, X_va_raw, word_params, char_params, sty_params=sty_params, use_pre_lemmatized=True
+            )
+
+            clf = ClassifierFactory.create(kernel=eval_kernel, c_val=1.0, calibrate=False)
+            clf.fit(X_tr, y_tr)
+
+            preds = clf.predict(X_va)
+            decision_scores = clf.decision_function(X_va)
+
+            score = ScoreEvaluator.evaluate(y_va, preds, decision_scores, self.metric_name)
+            fold_scores.append(score)
+
+            trial.report(score, step=fold)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return float(np.mean(fold_scores))
 
 
-def evaluate_metric(y_true, y_pred, y_score, metric_name):
-    """Calculates target metric score based on argparse configuration."""
-    if metric_name == 'precision':
-        return precision_score(y_true, y_pred, pos_label=1, zero_division=0)
-    elif metric_name == 'f0.5':
-        return fbeta_score(y_true, y_pred, beta=0.5, pos_label=1, zero_division=0)
-    elif metric_name == 'f1':
-        return f1_score(y_true, y_pred, pos_label=1, zero_division=0)
-    elif metric_name in ['roc-auc', 'roc_auc']:
-        return roc_auc_score(y_true, y_score)
-    elif metric_name == 'set_fp':
-        if y_score is None:
-            return 0.0
-        fpr, tpr, _ = roc_curve(y_true, y_score)
-        valid_indices = np.where(fpr <= 0.01)[0]
-        return tpr[valid_indices[-1]] if len(valid_indices) > 0 else 0.0
-    else:
-        return f1_score(y_true, y_pred, average='macro')
+class Stage2Objective:
+    """Stage 2 Optuna objective using StratifiedGroupKFold to prevent _id data leakage."""
+
+    def __init__(self, X_raw: List[Dict], y: np.ndarray, groups: np.ndarray,
+                 cv: StratifiedGroupKFold, kernel_choice: str, metric_name: str, 
+                 tuning_strategy: str, best_tfidf_params: Optional[Dict] = None):
+        self.X_raw = X_raw
+        self.y = y
+        self.groups = groups
+        self.cv = cv
+        self.kernel_choice = kernel_choice
+        self.metric_name = metric_name
+        self.tuning_strategy = tuning_strategy
+        self.best_tfidf_params = best_tfidf_params or {}
+
+        self.precomputed_folds: List[Tuple[Any, Any, np.ndarray, np.ndarray]] = []
+        if self.tuning_strategy in ['2stage', 'model']:
+            word_params = TFIDFParamBuilder.from_best_params(self.best_tfidf_params, 'word')
+            char_params = TFIDFParamBuilder.from_best_params(self.best_tfidf_params, 'char')
+            sty_params = TFIDFParamBuilder.extract_sty_params(self.best_tfidf_params)
+
+            for train_idx, val_idx in self.cv.split(self.X_raw, self.y, groups=self.groups):
+                X_tr_raw = [self.X_raw[i] for i in train_idx]
+                X_va_raw = [self.X_raw[i] for i in val_idx]
+                y_tr, y_va = self.y[train_idx], self.y[val_idx]
+
+                X_tr, X_va = get_cached_split_features(
+                    X_tr_raw, X_va_raw, word_params, char_params, sty_params=sty_params, use_pre_lemmatized=True
+                )
+                self.precomputed_folds.append((X_tr, X_va, y_tr, y_va))
+
+    def __call__(self, trial: Trial) -> float:
+        model_params = TFIDFParamBuilder.sample_model_params(trial, self.kernel_choice)
+        fold_scores = []
+
+        if self.tuning_strategy in ['2stage', 'model']:
+            for fold, (X_tr, X_va, y_tr, y_va) in enumerate(self.precomputed_folds):
+                clf = ClassifierFactory.create(
+                    kernel=model_params['kernel'],
+                    c_val=model_params['C'],
+                    gamma=model_params['gamma'],
+                    coef0=model_params['coef0'],
+                    linear_loss=model_params['linear_loss'],
+                    class_weight=model_params['class_weight'],
+                    calibrate=False
+                )
+                clf.fit(X_tr, y_tr)
+
+                preds = clf.predict(X_va)
+                decision_scores = clf.decision_function(X_va)
+
+                score = ScoreEvaluator.evaluate(y_va, preds, decision_scores, self.metric_name)
+                fold_scores.append(score)
+
+                trial.report(score, step=fold)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+        else:
+            word_params = TFIDFParamBuilder.sample_tfidf(trial, 'word')
+            char_params = TFIDFParamBuilder.sample_tfidf(trial, 'char')
+            sty_params = TFIDFParamBuilder.sample_stylometrics(trial)
+
+            for fold, (train_idx, val_idx) in enumerate(self.cv.split(self.X_raw, self.y, groups=self.groups)):
+                X_tr_raw = [self.X_raw[i] for i in train_idx]
+                X_va_raw = [self.X_raw[i] for i in val_idx]
+                y_tr, y_va = self.y[train_idx], self.y[val_idx]
+
+                X_tr, X_va = get_cached_split_features(
+                    X_tr_raw, X_va_raw, word_params, char_params, sty_params=sty_params, use_pre_lemmatized=True
+                )
+
+                clf = ClassifierFactory.create(
+                    kernel=model_params['kernel'],
+                    c_val=model_params['C'],
+                    gamma=model_params['gamma'],
+                    coef0=model_params['coef0'],
+                    linear_loss=model_params['linear_loss'],
+                    class_weight=model_params['class_weight'],
+                    calibrate=False
+                )
+                clf.fit(X_tr, y_tr)
+
+                preds = clf.predict(X_va)
+                decision_scores = clf.decision_function(X_va)
+
+                score = ScoreEvaluator.evaluate(y_va, preds, decision_scores, self.metric_name)
+                fold_scores.append(score)
+
+                trial.report(score, step=fold)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+        return float(np.mean(fold_scores))
 
 
-def compute_oof_scores(X_train_raw, y_train, word_params, char_params, c_val, kernel, gamma, calibrate=True, n_splits=3):
-    """Computes unbiased Out-of-Fold (OOF) scores across training set."""
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+# ==========================================
+# 4. Optuna Tuning Orchestrator
+# ==========================================
+class OptunaTuner:
+    @staticmethod
+    def print_best_trial_callback(study: Study, trial: FrozenTrial):
+        if trial.state == TrialState.COMPLETE:
+            best = study.best_trial
+            print(f"-> [Optuna Progress] Best Trial {best.number} | Score ({study.direction.name}): {best.value:.4f}")
+
+    @classmethod
+    def get_or_create_study(cls, study_name: str, storage: str, score_metric: str, reset: bool = False) -> Study:
+        if reset:
+            try:
+                optuna.delete_study(study_name=study_name, storage=storage)
+                print(f"-> Cleared existing Optuna study: '{study_name}'")
+            except Exception:
+                pass
+
+        sampler = optuna.samplers.TPESampler(
+            multivariate=True,
+            group=True,
+            n_startup_trials=5,
+            seed=42
+        )
+
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=5,
+            n_warmup_steps=1,
+            interval_steps=1
+        )
+
+        direction = 'minimize' if score_metric.lower() in ['brier_score', 'brier'] else 'maximize'
+
+        return optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            direction=direction,
+            sampler=sampler,
+            pruner=pruner,
+            load_if_exists=True
+        )
+
+    @classmethod
+    def run(cls, train_df: pd.DataFrame, granularity: str, kernel_choice: str = 'linear',
+            tuning_strategy: str = '2stage', tuning_sample_size: int = 3000,
+            trials: int = 15, trials_stage1: int = 10, trials_stage2: int = 10,
+            reset_study: bool = False, score_metric: str = 'roc_auc',
+            study_name: Optional[str] = None, n_jobs_optuna: int = 1) -> Dict[str, Any]:
+
+        db_path = "sqlite:///optuna_svm.db?timeout=60"
+        clean_metric = score_metric.replace('-', '_').replace('.', '')
+        if study_name is None:
+            study_name = f"svm_{kernel_choice}_{granularity}_{clean_metric}_{tuning_strategy}"
+
+        unique_groups = train_df['_id'].unique() if '_id' in train_df.columns else train_df['doc_id'].unique() if 'doc_id' in train_df.columns else train_df['id'].unique()
+        target_rows = max(1, int(len(train_df) * tuning_sample_size)) if isinstance(tuning_sample_size, float) else min(tuning_sample_size, len(train_df))
+        
+        if len(train_df) > target_rows:
+            avg_rows_per_group = len(train_df) / max(1, len(unique_groups))
+            target_num_groups = max(1, int(target_rows / avg_rows_per_group))
+            
+            rng = np.random.default_rng(42)
+            sampled_groups = set(rng.choice(unique_groups, size=min(target_num_groups, len(unique_groups)), replace=False))
+            
+            id_col = '_id' if '_id' in train_df.columns else ('doc_id' if 'doc_id' in train_df.columns else 'id')
+            train_sub = train_df[train_df[id_col].isin(sampled_groups)].copy()
+            print(f"Group-subsampled training set down to {len(train_sub)} rows ({len(sampled_groups)} unique abstract IDs) for CV tuning...")
+        else:
+            train_sub = train_df
+
+        # Safe dictionary record extraction
+        cols = [c for c in ['text', 'sentences', 'text_lemmatized'] if c in train_sub.columns]
+        X_raw_all = train_sub[cols].to_dict(orient='records')
+        y_all = train_sub['label'].values
+        groups_all = extract_doc_ids(train_sub)
+
+        min_class_count = pd.Series(y_all).value_counts().min()
+        num_unique_groups = len(np.unique(groups_all))
+        n_splits = max(2, min(3, min_class_count, num_unique_groups))
+        
+        cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        best_tfidf_params = {}
+
+        if tuning_strategy == '2stage':
+            print(f"\n>>> [Stage 1] Tuning Preprocessing and TF-IDF via {n_splits}-Fold Group CV ({trials_stage1} trials)...")
+            study_s1 = cls.get_or_create_study(f"{study_name}_stage1", db_path, score_metric, reset=reset_study)
+            
+            study_s1.enqueue_trial({
+                'word_min_ngram': 1, 'word_max_ngram': 2, 'word_max_features': 50000, 'word_min_df': 2,
+                'word_norm': 'l2', 'word_sublinear_tf': True, 'word_binary': False,
+                'char_min_ngram': 3, 'char_max_ngram': 5, 'char_max_features': 50000, 'char_min_df': 2,
+                'char_norm': 'l2', 'char_sublinear_tf': True, 'char_binary': False,
+                'use_stylometrics': True, 'sty_weight': 1.0
+            })
+            
+            objective_s1 = Stage1Objective(X_raw_all, y_all, groups_all, cv, kernel_choice, score_metric)
+            study_s1.optimize(objective_s1, n_trials=trials_stage1, n_jobs=max(1, n_jobs_optuna), callbacks=[cls.print_best_trial_callback])
+            best_tfidf_params = study_s1.best_params
+            print(f"-> Best Preprocessing parameters found: {best_tfidf_params}")
+
+        stage2_trials = trials_stage2 if tuning_strategy in ['2stage', 'model'] else trials
+        print(f"\n>>> [Stage 2] Tuning SVM Parameters via {n_splits}-Fold Group CV ({stage2_trials} trials)...")
+
+        study_s2 = cls.get_or_create_study(study_name, db_path, score_metric, reset=reset_study)
+        
+        if tuning_strategy == 'merged':
+            study_s2.enqueue_trial({
+                'word_min_ngram': 1, 'word_max_ngram': 2, 'word_max_features': 50000, 'word_min_df': 2,
+                'word_norm': 'l2', 'word_sublinear_tf': True, 'word_binary': False,
+                'char_min_ngram': 3, 'char_max_ngram': 5, 'char_max_features': 50000, 'char_min_df': 2,
+                'char_norm': 'l2', 'char_sublinear_tf': True, 'char_binary': False,
+                'use_stylometrics': True, 'sty_weight': 1.0,
+                'C': 1.0, 'kernel': 'linear' if kernel_choice == 'all' else kernel_choice, 
+                'linear_loss': 'squared_hinge', 'weight_mode': 'balanced'
+            })
+        else:
+            study_s2.enqueue_trial({
+                'C': 1.0, 'kernel': 'linear' if kernel_choice == 'all' else kernel_choice, 
+                'linear_loss': 'squared_hinge', 'weight_mode': 'balanced'
+            })
+        
+        objective_s2 = Stage2Objective(X_raw_all, y_all, groups_all, cv, kernel_choice, score_metric, tuning_strategy, best_tfidf_params)
+        study_s2.optimize(objective_s2, n_trials=stage2_trials, n_jobs=max(1, n_jobs_optuna), callbacks=[cls.print_best_trial_callback])
+
+        completed_trials = [t for t in study_s2.trials if t.state == TrialState.COMPLETE]
+        if completed_trials:
+            best_value = study_s2.best_value
+            top_trials = [t for t in completed_trials if abs(t.value - best_value) < 5e-3]
+            best_trial = min(top_trials, key=lambda t: t.params.get('C', float('inf')))
+            best_s2_params = best_trial.params
+            print(f"\n[Tie-Breaker Applied] Best trial chosen (lowest C within tolerance of {best_value:.4f}): {best_s2_params}")
+        else:
+            best_s2_params = study_s2.best_params
+
+        best_overall = {}
+        if tuning_strategy == '2stage':
+            best_overall.update(best_tfidf_params)
+        best_overall.update(best_s2_params)
+        if kernel_choice != 'all':
+            best_overall['kernel'] = kernel_choice
+
+        return best_overall
+
+
+# ==========================================
+# 5. Out-of-Fold Score Calculation
+# ==========================================
+def compute_oof_scores(X_train_raw: List[Dict], y_train: np.ndarray, doc_ids: np.ndarray,
+                       word_params: Optional[Dict], char_params: Optional[Dict], 
+                       sty_params: Optional[Dict], c_val: float, kernel: str, gamma: str, 
+                       coef0: float = 0.0, linear_loss: str = 'squared_hinge',
+                       class_weight: Any = 'balanced', calibrate: bool = True, n_splits: int = 3) -> np.ndarray:
+    """Computes unbiased Out-of-Fold (OOF) scores across the training set using StratifiedGroupKFold on doc_ids."""
+    min_class_count = pd.Series(y_train).value_counts().min()
+    num_unique_groups = len(np.unique(doc_ids))
+    actual_splits = max(2, min(n_splits, min_class_count, num_unique_groups))
+
+    sgkf = StratifiedGroupKFold(n_splits=actual_splits, shuffle=True, random_state=42)
     oof_scores = np.zeros(len(y_train))
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw, y_train)):
+    for fold, (train_idx, val_idx) in enumerate(sgkf.split(X_train_raw, y_train, groups=doc_ids)):
         X_tr_raw = [X_train_raw[i] for i in train_idx]
         X_va_raw = [X_train_raw[i] for i in val_idx]
         y_tr_fold = y_train[train_idx]
+        doc_ids_fold = doc_ids[train_idx]
 
-        X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
-        clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=calibrate)
+        X_tr, X_va = get_cached_split_features(
+            X_tr_raw, X_va_raw, word_params, char_params, sty_params=sty_params, use_pre_lemmatized=True
+        )
+
+        inner_cv = None
+        if calibrate:
+            min_class_count_fold = pd.Series(y_tr_fold).value_counts().min()
+            num_unique_groups_fold = len(np.unique(doc_ids_fold))
+            inner_splits = max(2, min(3, min_class_count_fold, num_unique_groups_fold))
+            
+            inner_sgkf = StratifiedGroupKFold(n_splits=inner_splits, shuffle=True, random_state=42)
+            inner_cv = list(inner_sgkf.split(X_tr, y_tr_fold, groups=doc_ids_fold))
+
+        clf = ClassifierFactory.create(
+            kernel=kernel, c_val=c_val, gamma=gamma, coef0=coef0, 
+            linear_loss=linear_loss, class_weight=class_weight, calibrate=calibrate, 
+            cv=inner_cv, cv_groups=doc_ids_fold
+        )
+        
         clf.fit(X_tr, y_tr_fold)
 
         if calibrate or not hasattr(clf, 'decision_function'):
@@ -110,297 +610,43 @@ def compute_oof_scores(X_train_raw, y_train, word_params, char_params, c_val, ke
     return oof_scores
 
 
-def optimize_svm_with_optuna(
-        train_df,
-        granularity, kernel_choice='rbf',
-        tuning_strategy='2stage',
-        tuning_sample_size=3000,
-        trials=15,
-        trials_stage1=10,
-        trials_stage2=10,
-        reset_study=False,
-        score_metric='f1',
-        study_name=None,
-        n_jobs_optuna=1
-):
-    """Finds best SVM and TF-IDF parameters using 3-Fold Stratified CV with Trial Pruning."""
-    print(f"\n--- Optuna Optimization Initialized (3-Fold Stratified CV with Pruning) ---")
-
-    if n_jobs_optuna <= 0:
-        n_jobs_optuna = 1
-
-    db_path = "sqlite:///optuna_svm.db?timeout=60"
-
-    if study_name is None:
-        clean_metric = score_metric.replace('-', '_').replace('.', '')
-        study_name = f"svm_{kernel_choice}_{granularity}_{clean_metric}_{tuning_strategy}"
-
-    study_s1_name = f"{study_name}_stage1"
-
-    if isinstance(tuning_sample_size, float):
-        sample_size = max(1, int(len(train_df) * tuning_sample_size))
-    else:
-        sample_size = min(tuning_sample_size, len(train_df))
-
-    stratify_train = train_df['label'] if ('label' in train_df.columns and train_df['label'].value_counts().min() > 1) else None
-    if len(train_df) > sample_size:
-        print(f"Subsampling training set from {len(train_df)} down to {sample_size} for 3-fold tuning...")
-        train_sub, _ = train_test_split(
-            train_df,
-            train_size=sample_size,
-            random_state=42,
-            stratify=stratify_train
-        )
-    else:
-        train_sub = train_df
-
-    X_train_raw_all = train_sub[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
-    y_train_all = train_sub['label'].values
-
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-    best_tfidf_params = {}
-
-    # ==========================================
-    # STAGE 1: Preprocessing & TF-IDF Parameter Optimization
-    # ==========================================
-    if tuning_strategy == '2stage':
-        print(f"\n>>> [Stage 1] Tuning Preprocessing and TF-IDF Parameters via 3-Fold CV ({trials_stage1} trials)...")
-
-        def objective_stage1(trial):
-            word_min = trial.suggest_int('word_min_ngram', 1, 2)
-            word_max = trial.suggest_int('word_max_ngram', max(word_min, 2), 3)
-            word_ngram = (word_min, word_max)
-            word_max_feat = trial.suggest_int('word_max_features', 1000, 10000, step=1000)
-            word_min_df = trial.suggest_int('word_min_df', 1, 5)
-
-            char_min = trial.suggest_int('char_min_ngram', 1, 3)
-            char_max = trial.suggest_int('char_max_ngram', max(char_min, 3), 5)
-            char_ngram = (char_min, char_max)
-            char_max_feat = trial.suggest_int('char_max_features', 1000, 10000, step=1000)
-            char_min_df = trial.suggest_int('char_min_df', 1, 5)
-
-            word_params = {
-                'ngram_range': word_ngram,
-                'max_features': word_max_feat,
-                'min_df': word_min_df,
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-            char_params = {
-                'ngram_range': char_ngram,
-                'max_features': char_max_feat,
-                'min_df': char_min_df,
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-
-            print(f"\n[Trial {trial.number}] Stage 1 - Evaluating Extraction Parameters (3 Folds):")
-            print(f"  -> Word NGrams: {word_ngram} | Max Feat: {word_max_feat} | Min DF: {word_min_df}")
-            print(f"  -> Char NGrams: {char_ngram} | Max Feat: {char_max_feat} | Min DF: {char_min_df}")
-
-            fold_scores = []
-            for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw_all, y_train_all)):
-                X_tr_raw = [X_train_raw_all[i] for i in train_idx]
-                X_va_raw = [X_train_raw_all[i] for i in val_idx]
-                y_tr_fold = y_train_all[train_idx]
-                y_va_fold = y_train_all[val_idx]
-
-                X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
-
-                eval_kernel = kernel_choice if kernel_choice != 'all' else 'linear'
-                clf = get_classifier(kernel=eval_kernel, c_val=1.0, calibrate=False)
-                clf.fit(X_tr, y_tr_fold)
-                preds = clf.predict(X_va)
-                decision_scores = clf.decision_function(X_va)
-
-                fold_score = evaluate_metric(y_va_fold, preds, decision_scores, score_metric)
-                fold_scores.append(fold_score)
-
-                intermediate_mean = float(np.mean(fold_scores))
-                trial.report(intermediate_mean, step=fold)
-                if trial.should_prune():
-                    print(f"-> [Trial {trial.number}] Stage 1 PRUNED at Fold {fold + 1} (Score: {intermediate_mean:.4f})")
-                    raise optuna.TrialPruned()
-
-            mean_score = float(np.mean(fold_scores))
-            print(f"-> [Trial {trial.number}] Stage 1 Mean 3-Fold Score: {mean_score:.4f}")
-            return mean_score
-
-        study_s1 = safe_create_or_reset_study(study_s1_name, db_path, 'maximize', reset_study)
-        # #explained Added print_best_trial_callback to report the overall best trial live upon trial completion.
-        study_s1.optimize(objective_stage1, n_trials=trials_stage1, n_jobs=n_jobs_optuna, callbacks=[print_best_trial_callback])
-        best_tfidf_params = study_s1.best_params
-        print(f"-> Best Preprocessing parameters found: {best_tfidf_params}")
-
-    # ==========================================
-    # STAGE 2: SVM Classifier Parameter Optimization
-    # ==========================================
-    stage2_trials = trials_stage2 if tuning_strategy in ['2stage', 'model'] else trials
-    print(f"\n>>> [Stage 2] Tuning SVM Parameters via 3-Fold CV ({stage2_trials} trials)...")
-
-    def objective_stage2(trial):
-        if tuning_strategy == '2stage':
-            word_params = {
-                'ngram_range': (best_tfidf_params['word_min_ngram'], best_tfidf_params['word_max_ngram']),
-                'max_features': best_tfidf_params['word_max_features'],
-                'min_df': best_tfidf_params.get('word_min_df', 1),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-            char_params = {
-                'ngram_range': (best_tfidf_params['char_min_ngram'], best_tfidf_params['char_max_ngram']),
-                'max_features': best_tfidf_params['char_max_features'],
-                'min_df': best_tfidf_params.get('char_min_df', 1),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-        elif tuning_strategy == 'model':
-            word_params = None
-            char_params = None
-        else:  # 'merged'
-            word_min = trial.suggest_int('word_min_ngram', 1, 2)
-            word_max = trial.suggest_int('word_max_ngram', max(word_min, 2), 3)
-            word_params = {
-                'ngram_range': (word_min, word_max),
-                'max_features': trial.suggest_int('word_max_features', 1000, 10000, step=1000),
-                'min_df': trial.suggest_int('word_min_df', 1, 5),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-            char_min = trial.suggest_int('char_min_ngram', 1, 3)
-            char_max = trial.suggest_int('char_max_ngram', max(char_min, 3), 5)
-            char_params = {
-                'ngram_range': (char_min, char_max),
-                'max_features': trial.suggest_int('char_max_features', 1000, 10000, step=1000),
-                'min_df': trial.suggest_int('char_min_df', 1, 5),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-
-        c_val = trial.suggest_float('C', 1e-2, 1e2, log=True)
-        kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'sigmoid']) if kernel_choice == 'all' else kernel_choice
-        gamma = trial.suggest_categorical('gamma', ['scale', 'auto']) if kernel != 'linear' else 'scale'
-
-        print(f"\n[Trial {trial.number}] Stage 2 - Evaluating SVM Parameters (3 Folds):")
-        print(f"  -> SVM: C: {c_val:.4f} | Kernel: {kernel} | Gamma: {gamma}")
-
-        fold_scores = []
-        for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw_all, y_train_all)):
-            X_tr_raw = [X_train_raw_all[i] for i in train_idx]
-            X_va_raw = [X_train_raw_all[i] for i in val_idx]
-            y_tr_fold = y_train_all[train_idx]
-            y_va_fold = y_train_all[val_idx]
-
-            X_tr, X_va = get_cached_split_features(X_tr_raw, X_va_raw, word_params, char_params, use_pre_lemmatized=True)
-
-            clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=False)
-            clf.fit(X_tr, y_tr_fold)
-
-            preds = clf.predict(X_va)
-            decision_scores = clf.decision_function(X_va)
-
-            fold_score = evaluate_metric(y_va_fold, preds, decision_scores, score_metric)
-            fold_scores.append(fold_score)
-
-            intermediate_mean = float(np.mean(fold_scores))
-            trial.report(intermediate_mean, step=fold)
-            if trial.should_prune():
-                print(f"-> [Trial {trial.number}] Stage 2 PRUNED at Fold {fold + 1} (Score: {intermediate_mean:.4f})")
-                raise optuna.TrialPruned()
-
-        mean_score = float(np.mean(fold_scores))
-        print(f"-> [Trial {trial.number}] Stage 2 Mean 3-Fold Score: {mean_score:.4f}")
-        return mean_score
-
-    current_hash = generate_df_hash(train_df)
-    study_s2 = safe_create_or_reset_study(study_name, db_path, 'maximize', reset_study)
-
-    stored_hash = study_s2.user_attrs.get("dataset_hash")
-    if stored_hash is not None and stored_hash != current_hash:
-        print("\n⚠️ WARNING: Training dataset changed since last Optuna run!")
-        if not reset_study and sys.stdin.isatty():
-            try:
-                response = input("Would you like to reset the database? [y/N]: ").strip().lower()
-                if response in ['y', 'yes']:
-                    optuna.delete_study(study_name=study_name, storage=db_path)
-                    if tuning_strategy == '2stage':
-                        try:
-                            optuna.delete_study(study_name=study_s1_name, storage=db_path)
-                        except Exception:
-                            pass
-                    study_s2 = optuna.create_study(study_name=study_name, storage=db_path, direction='maximize')
-            except Exception:
-                pass
-
-    study_s2.set_user_attr("dataset_hash", current_hash)
-    # #explained Added print_best_trial_callback to Stage 2 optimization.
-    study_s2.optimize(objective_stage2, n_trials=stage2_trials, n_jobs=n_jobs_optuna, callbacks=[print_best_trial_callback])
-
-    completed_trials = [t for t in study_s2.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    if len(completed_trials) > 0:
-        best_value = study_s2.best_value
-        tolerance = 5e-3
-        top_trials = [t for t in completed_trials if abs(t.value - best_value) < tolerance]
-        best_trial = min(top_trials, key=lambda t: t.params.get('C', float('inf')))
-        best_s2_params = best_trial.params
-
-        print(f"\n[Tie-Breaker Applied] Best trial chosen (lowest C within tolerance of {best_value:.4f}):")
-        for key, value in best_s2_params.items():
-            print(f"  {key}: {value}")
-    else:
-        best_s2_params = study_s2.best_params
-
-    best_overall_params = {}
-    if tuning_strategy == '2stage':
-        best_overall_params.update(best_tfidf_params)
-
-    best_overall_params.update(best_s2_params)
-    if kernel_choice != 'all':
-        best_overall_params['kernel'] = kernel_choice
-
-    return best_overall_params
-
-
-# #explained Helper function to log complete experiment details, parameters, and multi-granularity performance into experiment_results.csv.
-def log_experiment_to_registry(record_dict, registry_path="experiment_results.csv"):
-    df_new = pd.DataFrame([record_dict])
-    if os.path.exists(registry_path):
-        try:
-            df_existing = pd.read_csv(registry_path)
-            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-        except Exception:
-            df_combined = df_new
-    else:
-        df_combined = df_new
-
-    df_combined.to_csv(registry_path, index=False)
-    print(f"-> Experiment metrics and metadata successfully registered in '{registry_path}'")
-
-
-def train_svm(train_df,
-              test_df, c_val,
-              kernel,
-              save_path,
-              granularity,
-              val_df=None,
-              run_optuna=False,
-              reset_study=False,
-              trials=15,
-              trials_stage1=10,
-              trials_stage2=10,
-              tuning_strategy='2stage',
-              tuning_sample_size=3000,
-              score_metric='f1',
-              study_name=None,
-              n_jobs_optuna=1
-              ):
+# ==========================================
+# 6. Main Pipeline Runner
+# ==========================================
+def train_svm(train_df: pd.DataFrame,
+              test_df: pd.DataFrame,
+              c_val: float,
+              kernel: str,
+              save_path: str,
+              granularity: str,
+              test_raw_df: Optional[pd.DataFrame] = None,
+              val_df: Optional[pd.DataFrame] = None,
+              run_optuna: bool = False,
+              reset_study: bool = False,
+              trials: int = 15,
+              trials_stage1: int = 10,
+              trials_stage2: int = 10,
+              tuning_strategy: str = '2stage',
+              tuning_sample_size: int = 3000,
+              score_metric: str = 'roc_auc',
+              study_name: Optional[str] = None,
+              n_jobs_optuna: int = 1,
+              eval_mode: str = 'both',
+              mixed_ratios: list = [0.25, 0.50, 0.75],
+              selected_models: list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b'],
+              calibrate: bool = True):
+    
     word_params, char_params = None, None
+    sty_params = {'use_stylometrics': True, 'sty_weight': 1.0}
     gamma = 'scale'
+    coef0 = 0.0
+    linear_loss = 'squared_hinge'
+    class_weight = 'balanced'
     best_params = {}
 
     if run_optuna:
-        print("Running Hyperparameter Optimization via Optuna...")
-        best_params = optimize_svm_with_optuna(
+        print("Running Hyperparameter Optimization via Optuna (Group-Aware CV)...")
+        best_params = OptunaTuner.run(
             train_df=train_df,
             granularity=granularity,
             kernel_choice=kernel,
@@ -417,100 +663,89 @@ def train_svm(train_df,
         c_val = best_params.get('C', c_val)
         kernel = best_params.get('kernel', kernel)
         gamma = best_params.get('gamma', 'scale')
+        coef0 = best_params.get('coef0', 0.0)
+        linear_loss = best_params.get('linear_loss', 'squared_hinge')
 
-        if 'word_min_ngram' in best_params:
-            word_params = {
-                'ngram_range': (best_params['word_min_ngram'], best_params['word_max_ngram']),
-                'max_features': best_params['word_max_features'],
-                'min_df': best_params.get('word_min_df', 1),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
-        if 'char_min_ngram' in best_params:
-            char_params = {
-                'ngram_range': (best_params['char_min_ngram'], best_params['char_max_ngram']),
-                'max_features': best_params['char_max_features'],
-                'min_df': best_params.get('char_min_df', 1),
-                'max_df': 0.95,
-                'sublinear_tf': True
-            }
+        weight_mode = best_params.get('weight_mode', 'balanced')
+        if weight_mode == 'custom':
+            human_w = best_params.get('human_class_weight', 1.0)
+            class_weight = {0: human_w, 1: 1.0}
+        else:
+            class_weight = 'balanced'
 
-    X_train_raw = train_df[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
-    X_test_raw = test_df[['text', 'sentences', 'text_lemmatized']].to_dict(orient='records')
+        word_params = TFIDFParamBuilder.from_best_params(best_params, 'word')
+        char_params = TFIDFParamBuilder.from_best_params(best_params, 'char')
+        sty_params = TFIDFParamBuilder.extract_sty_params(best_params)
+    else:
+        word_params = TFIDFParamBuilder.from_best_params({}, 'word')
+        char_params = TFIDFParamBuilder.from_best_params({}, 'char')
+
+    # Safe record extraction
+    cols = [c for c in ['text', 'sentences', 'text_lemmatized'] if c in train_df.columns]
+    X_train_raw = train_df[cols].to_dict(orient='records')
     y_train = train_df['label'].values
-    y_test = test_df['label'].values
 
-    feature_pipeline = get_feature_extraction_pipeline(word_params, char_params, stylometrics_n_jobs=1, use_pre_lemmatized=True)
-    calibrated_clf = get_classifier(kernel=kernel, c_val=c_val, gamma=gamma, calibrate=True)
+
+    doc_ids = extract_doc_ids(train_df)
+
+    feature_pipeline = get_feature_extraction_pipeline(
+        word_tfidf_params=word_params,
+        char_tfidf_params=char_params,
+        sty_params=sty_params, 
+        stylometrics_n_jobs=1, 
+        use_pre_lemmatized=True
+    )
+    
+    # 1. Pre-compute group-isolated inner splits for full training set calibration
+    final_cv = None
+    if calibrate:
+        min_class_count = pd.Series(y_train).value_counts().min()
+        num_unique_groups = len(np.unique(doc_ids))
+        n_splits = max(2, min(3, min_class_count, num_unique_groups))
+        
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        final_cv = list(sgkf.split(X_train_raw, y_train, groups=doc_ids))
+
+    # 2. Instantiate classifier with pre-computed final_cv
+    clf = ClassifierFactory.create(
+        kernel=kernel, c_val=c_val, gamma=gamma, coef0=coef0, 
+        linear_loss=linear_loss, class_weight=class_weight, 
+        calibrate=calibrate, cv=final_cv
+    )
 
     full_pipeline = Pipeline([
         ('features', feature_pipeline),
-        ('classifier', calibrated_clf)
+        ('classifier', clf)
     ])
 
     optimal_threshold = 0.5
     if score_metric == 'set_fp':
-        print("\nCalculating Out-of-Fold (OOF) probability scores across training set for threshold calibration...")
-        oof_scores = compute_oof_scores(X_train_raw, y_train, word_params, char_params, c_val, kernel, gamma, calibrate=True)
-        optimal_threshold = find_threshold_for_max_fpr(y_train, oof_scores, target_fpr=0.01)
+        print("\nCalculating Out-of-Fold (OOF) probability scores using StratifiedGroupKFold...")
+        oof_scores = compute_oof_scores(
+            X_train_raw=X_train_raw, 
+            y_train=y_train, 
+            doc_ids=doc_ids,
+            word_params=word_params, 
+            char_params=char_params, 
+            sty_params=sty_params, 
+            c_val=c_val, 
+            kernel=kernel, 
+            gamma=gamma, 
+            coef0=coef0, 
+            linear_loss=linear_loss, 
+            class_weight=class_weight, 
+            calibrate=calibrate
+        )
+        optimal_threshold = ScoreEvaluator.find_threshold_for_max_fpr(y_train, oof_scores, target_fpr=0.01)
         print(f"-> Calibrated Threshold (OOF 1% Max FPR Probability): {optimal_threshold:.6f}")
 
+    # Store threshold directly on the deployable pipeline
     full_pipeline.optimal_threshold = optimal_threshold
 
     print(f"Training final probability-calibrated SVM pipeline on 100% of training data...")
     full_pipeline.fit(X_train_raw, y_train)
 
-    # Evaluate on Test Set
-    test_scores = full_pipeline.predict_proba(X_test_raw)[:, 1]
-    preds = (test_scores >= optimal_threshold).astype(int) if score_metric == 'set_fp' else full_pipeline.predict(X_test_raw)
-
-    print("\n" + "=" * 50)
-    print("      OVERALL TEST PERFORMANCE EVALUATION      ")
-    print("=" * 50)
-    print(classification_report(y_test, preds, digits=4))
-
-    overall_auc = 0.0
-    try:
-        overall_auc = roc_auc_score(y_test, test_scores)
-        print(f"Overall Test ROC-AUC Score: {overall_auc:.4f}\n")
-    except Exception as e:
-        print(f"Could not calculate ROC-AUC: {e}")
-
-    # =============================================================
-    # #explained Diagnosis & Report: Performance split on Abstracts vs Sentences
-    # =============================================================
-    full_auc, sent_auc = None, None
-    full_f1, sent_f1 = None, None
-
-    if 'task_type' in test_df.columns:
-        full_mask = (test_df['task_type'] == 'full').values
-        sent_mask = (test_df['task_type'] == 'sentence').values
-
-        if full_mask.sum() > 0:
-            print("\n" + "-" * 50)
-            print("  DIAGNOSIS: FULL ABSTRACTS ONLY PERFORMANCE  ")
-            print("-" * 50)
-            print(classification_report(y_test[full_mask], preds[full_mask], digits=4))
-            full_f1 = f1_score(y_test[full_mask], preds[full_mask], pos_label=1, zero_division=0)
-            if len(np.unique(y_test[full_mask])) > 1:
-                full_auc = roc_auc_score(y_test[full_mask], test_scores[full_mask])
-                print(f"Full Abstracts ROC-AUC: {full_auc:.4f}")
-
-        if sent_mask.sum() > 0:
-            print("\n" + "-" * 50)
-            print("  DIAGNOSIS: SENTENCES ONLY PERFORMANCE      ")
-            print("-" * 50)
-            print(classification_report(y_test[sent_mask], preds[sent_mask], digits=4))
-            sent_f1 = f1_score(y_test[sent_mask], preds[sent_mask], pos_label=1, zero_division=0)
-            if len(np.unique(y_test[sent_mask])) > 1:
-                sent_auc = roc_auc_score(y_test[sent_mask], test_scores[sent_mask])
-                print(f"Sentences ROC-AUC: {sent_auc:.4f}\n")
-
-    # =============================================================
-    # #explained Log metadata and performance metrics to experiment registry CSV
-    # =============================================================
-    record = {
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    metadata = {
         'study_name': study_name or f"svm_{granularity}",
         'save_path': save_path,
         'granularity': granularity,
@@ -518,30 +753,37 @@ def train_svm(train_df,
         'kernel': kernel,
         'score_metric': score_metric,
         'tuning_sample_size': tuning_sample_size,
-        'calibrated_threshold': optimal_threshold,
-
-        # Best Hyperparameters
         'C': c_val,
-        'word_ngram': f"({best_params.get('word_min_ngram')},{best_params.get('word_max_ngram')})" if 'word_min_ngram' in best_params else None,
-        'word_max_features': best_params.get('word_max_features', None),
-        'word_min_df': best_params.get('word_min_df', None),
-        'char_ngram': f"({best_params.get('char_min_ngram')},{best_params.get('char_max_ngram')})" if 'char_min_ngram' in best_params else None,
-        'char_max_features': best_params.get('char_max_features', None),
-        'char_min_df': best_params.get('char_min_df', None),
-
-        # Metrics
-        'overall_f1_ai': f1_score(y_test, preds, pos_label=1, zero_division=0),
-        'overall_precision_ai': precision_score(y_test, preds, pos_label=1, zero_division=0),
-        'overall_roc_auc': overall_auc,
-        'full_abstract_f1_ai': full_f1,
-        'full_abstract_roc_auc': full_auc,
-        'sentence_f1_ai': sent_f1,
-        'sentence_roc_auc': sent_auc
+        'linear_loss': linear_loss,
+        'weight_mode': best_params.get('weight_mode', 'balanced'),
+        'human_class_weight': best_params.get('human_class_weight', 1.0),
+        'use_stylometrics': sty_params.get('use_stylometrics', True),
+        'sty_weight': sty_params.get('sty_weight', 1.0),
+        'word_ngram': f"({word_params.get('ngram_range', (1,2))[0]},{word_params.get('ngram_range', (1,2))[1]})",
+        'word_max_features': word_params.get('max_features', 50000),
+        'word_min_df': word_params.get('min_df', 2),
+        'char_ngram': f"({char_params.get('ngram_range', (3,5))[0]},{char_params.get('ngram_range', (3,5))[1]})",
+        'char_max_features': char_params.get('max_features', 50000),
+        'char_min_df': char_params.get('min_df', 2),
     }
 
-    log_experiment_to_registry(record)
+    # RUN CONSOLIDATED FULL EVALUATION
+    from evaluation import run_full_evaluation
+    run_full_evaluation(
+        model_pipeline=full_pipeline,
+        test_raw_df=test_raw_df if test_raw_df is not None else test_df,
+        test_df=test_df,
+        metadata=metadata,
+        selected_models=selected_models,
+        mixed_ratios=mixed_ratios,
+        eval_mode=eval_mode,
+        experiments_dir="experiments"
+    )
+
+    if os.path.dirname(save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     joblib.dump(full_pipeline, save_path)
-    print(f"Deployable probability-calibrated pipeline saved successfully to {save_path}")
+    print(f"Deployable pipeline saved successfully to {save_path}")
 
     clear_optuna_cache()

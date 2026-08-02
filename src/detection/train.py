@@ -1,17 +1,47 @@
 # train.py
+import sys
+import os
 import argparse
+import random
+import re
+import zlib
+import joblib
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
 
 from features import prepare_classification_dataset, pre_lemmatize_dataset
 from models.svm import train_svm
 from models.robbert import train_transformer
+from evaluation import run_full_evaluation
 
 DEFAULT_MODELS = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
 
 
+def generate_setup_name(args) -> str:
+    parts = ["svm"]
+    parts.append(f"gran-{args.granularity}")
+    parts.append(f"tune-{args.tuning}")
+    
+    samp = args.tuning_sample_size
+    samp_str = f"{samp // 1000}k" if isinstance(samp, int) and samp >= 1000 and samp % 1000 == 0 else str(samp)
+    parts.append(f"samp-{samp_str}")
+    
+    parts.append(f"kernel-{args.kernel}")
+    parts.append(f"score-{args.score}")
+    
+    if args.llm_ratio != -1:
+        parts.append(f"ratio-{args.llm_ratio}")
+        
+    default_sources = {'UG', 'SB', 'HBO'}
+    if set(args.source) != default_sources:
+        src_str = "-".join(sorted(args.source))
+        parts.append(f"src-{src_str}")
+
+    return "_".join(parts)
+
+
 def parse_sample_size(value):
-    """Parses training sample size as an absolute integer or float percentage."""
     try:
         if '.' in value:
             val = float(value)
@@ -33,10 +63,10 @@ def parse_sample_size(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM Detection Training Orchestrator (Auto-Tuned)")
+    parser = argparse.ArgumentParser(description="LLM Detection Training & Evaluation Orchestrator")
 
     # Core Controls
-    parser.add_argument('--data_path', type=str, required=True, help="Path to raw parquet or csv file")
+    parser.add_argument('--data_path', type=str, default='/home/gderijck/internship/data/gold/llm_added.parquet', help="Path to raw parquet or csv file")
     parser.add_argument('--classifier', type=str, choices=['svm', 'bert', 'both'], default='both', help="Model type to train")
     parser.add_argument('--granularity', type=str, choices=['full', 'sentence', 'both'], default='full', help="Train on full abstracts, split sentences, or both")
 
@@ -47,33 +77,31 @@ def main():
     parser.add_argument('--reset_study', action='store_true', help="Clear and restart the Optuna hyperparameter study database")
 
     # Hyperparameter Tuning Controls
-    parser.add_argument('--trials', type=int, default=50, help="Number of trials to execute during tuning (if single-stage)")
-    parser.add_argument(
-        '--tuning',
-        type=str,
-        choices=['model', '2stage', 'merged'],
-        default='2stage',
-        help="Tuning strategy: 'model', '2stage', or 'merged'."
-    )
-    parser.add_argument(
-        '--tuning_sample_size',
-        type=parse_sample_size,
-        default=3000,
-        help="Subsample size for tuning (absolute int or float percentage)."
-    )
+    parser.add_argument('--trials', type=int, default=50, help="Number of trials to execute during tuning")
+    parser.add_argument('--tuning', type=str, choices=['model', '2stage', 'merged'], default='2stage', help="Tuning strategy")
+    parser.add_argument('--tuning_sample_size', type=parse_sample_size, default=3000, help="Subsample size for tuning")
     parser.add_argument('--trials_stage1', type=int, default=30, help="Stage 1 trials (TF-IDF)")
     parser.add_argument('--trials_stage2', type=int, default=30, help="Stage 2 trials (SVM)")
 
-    # #explained Collapsed --studyname and --svmname into a single consolidated --study_name argument.
-    parser.add_argument('--study_name', type=str, default=None, help="Name for the Optuna study database entry and saved .pkl model file.")
-
-    parser.add_argument('--kernel', type=str, choices=['linear', 'rbf', 'sigmoid', 'poly', 'all'], default='all', help="SVM kernel choice")
+    parser.add_argument('--study_name', type=str, default=None, help="Name for the Optuna study entry and saved .pkl file.")
+    parser.add_argument('--kernel', type=str, choices=['linear', 'rbf', 'sigmoid', 'all'], default='all', help="SVM kernel choice") #TODO add poly support
     parser.add_argument('--transformer_name', type=str, default='pdelobelle/robbert-2023-dutch-base', help="HuggingFace model string")
-
     parser.add_argument('--score', type=str, choices=['f1', 'precision', 'f0.5', 'roc_auc', 'set_fp'], default='f0.5', help="Metric to optimize")
-    parser.add_argument('--n_jobs_optuna', type=int, default=1, help="Number of parallel jobs for Optuna tuning (default 1)")
+    parser.add_argument('--n_jobs_optuna', type=int, default=1, help="Number of parallel jobs for Optuna tuning")
 
+    # --- Refined Model Loading & Evaluation Arguments ---
+    parser.add_argument('--load_model', type=str, default=None, help="Path to existing model .pkl. Automatically skips training and evaluates.")
+    parser.add_argument('--eval_only', action='store_true', help="Skip training phase and run evaluation.")
+    parser.add_argument('--eval_mode', type=str, choices=['both', 'standard', 'synth'], default='both', help="Evaluation target: 'both' (default), 'standard', or 'synth'")
+    parser.add_argument('--mixed_ratios', nargs='+', type=float, default=[0.25, 0.50, 0.75], help="LLM substitution ratios for synthetic data testing")
+
+    parser.add_argument('--calibrate', action=argparse.BooleanOptionalAction, default=None, 
+                    help="Enable/disable probability calibration (defaults to True if score=='set_fp' or classifier=='both')")
+    
     args = parser.parse_args()
+
+    # Determine whether training should be skipped
+    is_eval_only = args.eval_only or (args.load_model is not None)
 
     print(f"Loading data from: {args.data_path}")
     if args.data_path.endswith('.csv'):
@@ -91,8 +119,9 @@ def main():
         else:
             print("Warning: 'source' column not found in dataset. Skipping early filtering.")
 
-    stratify_col = raw_df['source'] if 'source' in raw_df.columns else None
+    stratify_col = raw_df['source'] if 'source' in raw_df.columns else None #TODO add _id col
 
+    # Strict isolation: 80% train / 20% test (1 row per abstract _id = zero leakage)
     train_raw_df, test_raw_df = train_test_split(
         raw_df,
         test_size=0.20,
@@ -100,34 +129,57 @@ def main():
         stratify=stratify_col
     )
 
-    # Dataset Shaping
-    train_df = prepare_classification_dataset(
-        train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
-    )
-    test_df = prepare_classification_dataset(
-        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
-    )
+    #model loading and saving
+    models_dir = 'trained_models'
+    os.makedirs(models_dir, exist_ok=True)
 
-    # Sequential Pre-Lemmatization
-    train_df = pre_lemmatize_dataset(train_df, text_column='text')
+    if args.study_name:
+        study_name_clean = args.study_name[:-4] if args.study_name.endswith('.pkl') else args.study_name
+    else:
+        study_name_clean = generate_setup_name(args)
+
+    if args.load_model:
+        save_path = args.load_model
+    else:
+        save_path = os.path.join(models_dir, f"{study_name_clean}.pkl")
+
+    # Shape and Lemmatize Test Split
+    test_df = prepare_classification_dataset(
+        test_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=-1
+    )
     test_df = pre_lemmatize_dataset(test_df, text_column='text')
 
-    print(f"\nDataset compiled successfully:")
-    print(f"-> Combined Train Split: {len(train_df)} rows")
-    print(f"-> Test Split:           {len(test_df)} rows\n")
 
-    if args.classifier in ['svm', 'both']:
-        # #explained Automatically derives save_path (.pkl) and study_name from the consolidated --study_name CLI argument.
-        if args.study_name:
-            study_name_clean = args.study_name[:-4] if args.study_name.endswith('.pkl') else args.study_name
-            save_path = f"{study_name_clean}.pkl"
-        else:
-            study_name_clean = None
-            save_path = f"svm_{args.granularity}.pkl"
+    if args.calibrate is not None:
+        do_calibrate = args.calibrate
+    else:
+        # Default to True so all saved models output probabilities natively
+        do_calibrate = True
+
+    print(f"-> Probability Calibration: {do_calibrate}")
+
+    # ==========================================
+    # 1. TRAINING PHASE (Skipped if is_eval_only)
+    # ==========================================
+    if not is_eval_only:
+        train_df = prepare_classification_dataset(
+            train_raw_df, selected_models=args.models, granularity=args.granularity, source_filter=None, llm_ratio=args.llm_ratio
+        )
+        train_df = pre_lemmatize_dataset(train_df, text_column='text')
+
+        print(f"\nDataset compiled successfully:")
+        print(f"-> Combined Train Split: {len(train_df)} rows")
+        print(f"-> Test Split:           {len(test_df)} rows\n")
+
+        if args.classifier in ['svm', 'both']:
+            print(f"\n[Experiment Identity]")
+            print(f"-> Optuna Study Name: {study_name_clean}")
+            print(f"-> Model Save Path:   {save_path}\n")
 
         train_svm(
             train_df=train_df,
             test_df=test_df,
+            test_raw_df=test_raw_df,
             c_val=1.0,
             kernel=args.kernel,
             save_path=save_path,
@@ -141,21 +193,55 @@ def main():
             tuning_sample_size=args.tuning_sample_size,
             score_metric=args.score,
             study_name=study_name_clean,
-            n_jobs_optuna=args.n_jobs_optuna
+            n_jobs_optuna=args.n_jobs_optuna,
+            eval_mode=args.eval_mode,
+            mixed_ratios=args.mixed_ratios,
+            selected_models=args.models,
+            calibrate=do_calibrate
         )
 
-    if args.classifier in ['bert', 'both']:
-        train_transformer(
-            train_df=train_df,
-            val_df=None,
-            test_df=test_df,
-            model_name=args.transformer_name,
-            epochs=3,
-            batch_size=8,
-            lr=2e-5,
-            save_path=f"./transformer_{args.granularity}_model",
-            run_optuna=True
-        )
+        if args.classifier in ['bert', 'both']:
+            train_transformer(
+                train_df=train_df,
+                val_df=None,
+                test_df=test_df,
+                model_name=args.transformer_name,
+                epochs=3,
+                batch_size=8,
+                lr=2e-5,
+                save_path=f"./transformer_{args.granularity}_model",
+                run_optuna=True
+            )
+    else:
+        # ==========================================
+        # 2. EVALUATION PHASE ONLY (Existing Model)
+        # ==========================================
+        print(f"\n[INFO] Skipping training. Loading model from: {save_path}")
+        try:
+            loaded_model = joblib.load(save_path)
+            
+            metadata = {
+                'study_name': study_name_clean,
+                'save_path': save_path,
+                'granularity': args.granularity,
+                'tuning_strategy': args.tuning,
+                'kernel': args.kernel,
+                'score_metric': args.score,
+                'tuning_sample_size': args.tuning_sample_size,
+            }
+
+            run_full_evaluation(
+                model_pipeline=loaded_model,
+                test_raw_df=test_raw_df,
+                test_df=test_df,
+                metadata=metadata,
+                selected_models=args.models,
+                mixed_ratios=args.mixed_ratios,
+                eval_mode=args.eval_mode,
+                experiments_dir="experiments"
+            )
+        except Exception as e:
+            print(f"Error loading model from '{save_path}': {e}")
 
 
 if __name__ == "__main__":

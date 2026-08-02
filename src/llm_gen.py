@@ -1037,54 +1037,112 @@ def generation_main(
         tasks = [t for t in tasks if t['type'] != 'percentage']
 
     if priority:
-        print("\n[PRIORITY MODE ACTIVE] Filtering tasks to exactly 1 random model 'full_abstract' rewrite per abstract.")
+        print("\n[PRIORITY MODE ACTIVE] Filtering tasks for priority generation...")
         import binascii
         import random
-        
+
         all_possible_models = ['gemma4:26b', 'gemma4:e4b', 'qwen3.6:27b', 'qwen3.5:4b']
         id_key = next((k for k in ['_id', 'id', 'page_link', 'synthetic_id'] if rows and k in rows[0]), None)
         rows_map = {str(row[id_key]): row for row in rows} if id_key else {}
-        
+
         prioritized_tasks = []
-        processed_row_ids = set()
-        
-        for t in tasks:
-            if t["type"] == "full_abstract":
-                row_id_str = str(t["id"])
-                if row_id_str in processed_row_ids:
+
+        # -------------------------------------------------------------
+        # 1. SENTENCE REWRITE PRIORITY
+        # -------------------------------------------------------------
+        has_sentence_tasks = any(t["type"] == "sentence" for t in tasks)
+        if has_sentence_tasks:
+            print("  -> Processing Priority for: Sentence Rewrites")
+            processed_sentence_ids = set()
+
+            for row_id_str, row in rows_map.items():
+                if row_id_str in processed_sentence_ids:
                     continue
-                
-                row = rows_map.get(row_id_str)
-                
+                processed_sentence_ids.add(row_id_str)
+
+                abstract_sentences = row.get("abstract_sentence")
+                if not isinstance(abstract_sentences, list) or not abstract_sentences:
+                    continue
+                num_sents = len(abstract_sentences)
+
+                # Count completed sentence rewrites per model
+                model_completion = {}
+                for model in all_possible_models:
+                    col_name = f"{model}_single"
+                    col_val = row.get(col_name)
+                    if isinstance(col_val, list) and len(col_val) == num_sents:
+                        completed = sum(
+                            1 for s in col_val
+                            if s is not None and s not in ("FAILED_GENERATION", "FAILED_VALIDATION")
+                        )
+                    else:
+                        completed = 0
+                    model_completion[model] = completed
+
+                # Skip if at least 1 model already has 100% of sentences rewritten
+                already_complete = any(count == num_sents for count in model_completion.values())
+                if already_complete:
+                    continue
+
+                # Find max completion count & candidate models tied for top
+                max_completed = max(model_completion.values())
+                candidate_models = [m for m, count in model_completion.items() if count == max_completed]
+
+                # Deterministically select model (tie-breaker)
+                seed_str = f"sentence_priority_{row_id_str}".encode("utf-8")
+                row_seed = binascii.crc32(seed_str)
+                row_rng = random.Random(row_seed)
+                selected_model = row_rng.choice(candidate_models)
+
+                # Queue missing sentence tasks for selected_model
+                matching_sentence_tasks = [
+                    t for t in tasks
+                    if t["type"] == "sentence"
+                    and str(t["id"]) == row_id_str
+                    and t["model"] == selected_model
+                ]
+                prioritized_tasks.extend(matching_sentence_tasks)
+
+        # -------------------------------------------------------------
+        # 2. FULL ABSTRACT REWRITE PRIORITY
+        # -------------------------------------------------------------
+        has_full_tasks = any(t["type"] == "full_abstract" for t in tasks)
+        if has_full_tasks:
+            print("  -> Processing Priority for: Full Abstract Rewrites")
+            processed_full_ids = set()
+
+            for row_id_str, row in rows_map.items():
+                if row_id_str in processed_full_ids:
+                    continue
+                processed_full_ids.add(row_id_str)
+
+                # Check if ANY model already has a full abstract rewrite
                 already_has_rewrite = False
                 if row:
-                    for col_name, col_val in row.items():
-                        if col_name.endswith("_full") and col_val:
+                    for model in all_possible_models:
+                        col_val = row.get(f"{model}_full")
+                        if col_val and col_val not in ("FAILED_GENERATION", "FAILED_VALIDATION"):
                             already_has_rewrite = True
                             break
-                
+
                 if already_has_rewrite:
-                    processed_row_ids.add(row_id_str)
                     continue
-                
-                seed_str = f"priority_split_{row_id_str}".encode("utf-8")
+
+                # Deterministically pick 1 model out of 4 for full abstract
+                seed_str = f"full_priority_{row_id_str}".encode("utf-8")
                 row_seed = binascii.crc32(seed_str)
                 row_rng = random.Random(row_seed)
                 selected_model = row_rng.choice(all_possible_models)
-                
-                matching_task = None
-                for candidate_t in tasks:
-                    if (candidate_t["type"] == "full_abstract" and 
-                        str(candidate_t["id"]) == row_id_str and 
-                        candidate_t["model"] == selected_model):
-                        matching_task = candidate_t
-                        break
-                
-                if matching_task:
-                    prioritized_tasks.append(matching_task)
-                
-                processed_row_ids.add(row_id_str)
-                
+
+                # Queue full abstract task for selected_model
+                matching_full_tasks = [
+                    t for t in tasks
+                    if t["type"] == "full_abstract"
+                    and str(t["id"]) == row_id_str
+                    and t["model"] == selected_model
+                ]
+                prioritized_tasks.extend(matching_full_tasks)
+
         tasks = prioritized_tasks
 
     if not models_list:
@@ -1229,7 +1287,7 @@ def main():
     if 'percentage' in args.tasks:
         percentages = [25, 50, 75]
 
-    if args.debug or args.debug_pct_compare:
+    if args.debug or args.debug_pct_compare or args.priority:
         print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
         active_models_list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
     else:
