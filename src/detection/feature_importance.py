@@ -27,7 +27,7 @@ from sklearn.metrics import f1_score
 from sklearn.metrics.pairwise import euclidean_distances
 import scipy.sparse as sp
 
-from features import prepare_classification_dataset, pre_lemmatize_dataset
+from src.detection.svm.features import prepare_classification_dataset, pre_lemmatize_dataset
 
 # Define default models as they were originally set up
 DEFAULT_MODELS = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']

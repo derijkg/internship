@@ -14,6 +14,7 @@ from sklearn.metrics import (
     recall_score, roc_curve, confusion_matrix, average_precision_score, 
     brier_score_loss, matthews_corrcoef
 )
+from sklearn.svm import LinearSVC
 
 from features import clean_and_normalize_value, pre_lemmatize_dataset, safe_parse_list
 
@@ -32,10 +33,6 @@ def split_sentences(text: str) -> list:
 
 
 def generate_mixed_test_dataset(test_raw_df: pd.DataFrame, selected_models: list, ratios: list, seed: int = 42) -> pd.DataFrame:
-    """
-    Generates synthetic mixed abstracts by positional sentence substitution between human and LLM texts.
-    Assumes positional alignment between sentences[:min_len].
-    """
     mixed_records = []
     human_col = 'text' if 'text' in test_raw_df.columns else ('abstract' if 'abstract' in test_raw_df.columns else 'original_text')
 
@@ -120,7 +117,6 @@ def extract_feature_importance(pipeline, top_n: int = 15) -> Tuple[str, pd.DataF
 
         weights = None
 
-        # SCIENTIFIC FIX: Average feature weights across ALL calibrated estimators in ensemble
         if hasattr(raw_clf, 'calibrated_classifiers_') and len(raw_clf.calibrated_classifiers_) > 0:
             coef_list = []
             for cal_obj in raw_clf.calibrated_classifiers_:
@@ -145,15 +141,30 @@ def extract_feature_importance(pipeline, top_n: int = 15) -> Tuple[str, pd.DataF
         union_step = features_step.named_steps.get('union', features_step) if hasattr(features_step, 'named_steps') else features_step
 
         if hasattr(union_step, 'transformer_list'):
+            # Pre-calculate TF-IDF feature count to derive stylometrics feature count
+            tfidf_feature_count = 0
+            for name, trans_pipe in union_step.transformer_list:
+                if hasattr(trans_pipe, 'named_steps') and 'tfidf' in trans_pipe.named_steps:
+                    if hasattr(trans_pipe.named_steps['tfidf'], 'get_feature_names_out'):
+                        tfidf_feature_count += len(trans_pipe.named_steps['tfidf'].get_feature_names_out())
+
+            sty_feature_count = len(weights) - tfidf_feature_count
+
             for name, trans_pipe in union_step.transformer_list:
                 if hasattr(trans_pipe, 'named_steps'):
                     if 'tfidf' in trans_pipe.named_steps and hasattr(trans_pipe.named_steps['tfidf'], 'get_feature_names_out'):
                         names = [f"{name}_{fn}" for fn in trans_pipe.named_steps['tfidf'].get_feature_names_out()]
                         feature_names.extend(names)
                     elif name == 'stylometrics':
-                        sty_cols = ['mean_sent_len', 'var_sent_len', 'burstiness', 'mean_word_len', 
-                                    'var_word_len', 'ttr', 'hapax_ratio', 'transition_ratio', 
-                                    'space_ratio', 'double_space_ratio', 'punc_ratio', 'total_chars']
+                        # FIX: Match exact 8 vs 11 stylometric feature length
+                        if sty_feature_count == 8:
+                            sty_cols = ['mean_word_len', 'var_word_len', 'ttr', 'hapax_ratio', 
+                                        'transition_ratio', 'space_ratio', 'double_space_ratio', 'punc_ratio']
+                        else:
+                            sty_cols = ['mean_sent_len', 'var_sent_len', 'burstiness', 'mean_word_len', 
+                                        'var_word_len', 'ttr', 'hapax_ratio', 'transition_ratio', 
+                                        'space_ratio', 'double_space_ratio', 'punc_ratio']
+                            
                         feature_names.extend([f"sty_{col}" for col in sty_cols])
 
         if len(feature_names) == len(weights):
@@ -184,10 +195,6 @@ def extract_feature_importance(pipeline, top_n: int = 15) -> Tuple[str, pd.DataF
 # 3. Consolidated Master Evaluation Runner
 # ==========================================
 def save_or_update_csv(df_new: pd.DataFrame, csv_path: str, match_cols: Optional[List[str]] = None):
-    """
-    Saves df_new to csv_path. If csv_path exists, updates rows matching match_cols 
-    (defaults to ['study_name']) with the new data instead of appending duplicate rows.
-    """
     if match_cols is None:
         match_cols = ['study_name']
 
@@ -195,16 +202,13 @@ def save_or_update_csv(df_new: pd.DataFrame, csv_path: str, match_cols: Optional
         try:
             existing_df = pd.read_csv(csv_path)
 
-            # Check if all match columns exist in both DataFrames
             valid_match = all(c in existing_df.columns for c in match_cols) and \
                           all(c in df_new.columns for c in match_cols)
 
             if valid_match:
-                # Create tuples of keys to replace
                 keys_to_replace = set(zip(*[df_new[c] for c in match_cols]))
                 existing_keys = zip(*[existing_df[c] for c in match_cols])
 
-                # Filter out existing rows that match the new records
                 keep_mask = [k not in keys_to_replace for k in existing_keys]
                 filtered_df = existing_df[keep_mask]
 
@@ -229,20 +233,14 @@ def run_full_evaluation(
     eval_mode: str = 'both',
     experiments_dir: str = "experiments"
 ) -> Dict[str, Any]:
-    """
-    Consolidated testing method supporting eval_mode: 'both', 'standard', or 'synth'.
-    Calculates metrics, synthetic sensitivity curves, and extracts feature importances.
-    """
     os.makedirs(experiments_dir, exist_ok=True)
     study_name = metadata.get('study_name', f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-    # FIX 1: Robust calibration check directly on the inner classifier step
     clf = model_pipeline.named_steps.get('classifier', model_pipeline)
     is_calibrated = hasattr(clf, 'calibrated_classifiers_') or (
         hasattr(clf, 'predict_proba') and not isinstance(clf, LinearSVC)
     )
 
-    # Set correct default boundary: 0.5 for probabilities, 0.0 for raw decision functions
     default_threshold = 0.5 if is_calibrated else 0.0
     optimal_threshold = getattr(model_pipeline, "optimal_threshold", default_threshold)
 
@@ -252,15 +250,11 @@ def run_full_evaluation(
     test_record = {}
     ratio_flagged_map = {}
 
-    # -------------------------------------------------------------------------
-    # PART 1: STANDARD TEST SET EVALUATION
-    # -------------------------------------------------------------------------
     if run_standard:
         print("\n" + "=" * 60)
         print("      PART 1: STANDARD TEST SET EVALUATION      ")
         print("=" * 60)
 
-        # Safe dictionary record extraction
         cols = [c for c in ['text', 'sentences', 'text_lemmatized'] if c in test_df.columns]
         X_test_raw = test_df[cols].to_dict(orient='records')
         y_test = test_df['label'].values
@@ -270,7 +264,7 @@ def run_full_evaluation(
             brier_loss = float(brier_score_loss(y_test, test_scores))
         else:
             test_scores = model_pipeline.decision_function(X_test_raw)
-            brier_loss = None  # N/A for raw decision function margins
+            brier_loss = None
 
         preds = (test_scores >= optimal_threshold).astype(int)
 
@@ -341,9 +335,6 @@ def run_full_evaluation(
         save_or_update_csv(pd.DataFrame([test_record]), test_csv_path, match_cols=['study_name'])
         print(f"-> Standard Test Set metrics saved to '{test_csv_path}'")
 
-    # -------------------------------------------------------------------------
-    # PART 2: SYNTHETIC MIXED DATASET EVALUATION
-    # -------------------------------------------------------------------------
     if run_synth:
         print("\n" + "=" * 60)
         print("      PART 2: SYNTHETIC MIXED DATASET EVALUATION      ")
@@ -394,9 +385,6 @@ def run_full_evaluation(
         save_or_update_csv(synth_summary_df, synth_csv_path, match_cols=['study_name', 'target_ratio'])
         print(f"\n-> Synthetic Mixed metrics saved to '{synth_csv_path}'")
 
-    # -------------------------------------------------------------------------
-    # PART 3: FEATURE IMPORTANCE EXTRACTION
-    # -------------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("      PART 3: FEATURE IMPORTANCE EXTRACTION      ")
     print("=" * 60)
@@ -408,9 +396,6 @@ def run_full_evaluation(
         print(f"Top 15 Features: {top_features_str}")
         print(f"-> Full feature importance report saved to '{feat_csv_path}'")
 
-    # -------------------------------------------------------------------------
-    # PART 4: CONSOLIDATED MASTER REPORT (experiment_results.csv)
-    # -------------------------------------------------------------------------
     consolidated_record = {}
     consolidated_record.update(metadata)
     consolidated_record.update({
