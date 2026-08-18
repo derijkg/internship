@@ -1,5 +1,4 @@
 inter/
-data/
 old/
 logs/
 essay preprocessing/
@@ -22,8 +21,7 @@ test*
 # 2. Ignore all folders starting with "old"
 old*/
 src/old/
-# 3. Ignore all folders starting with "data"
-data*/
+
 
 # 4. Ignore all files starting with "output" 
 output*
@@ -39,3 +37,27 @@ src/detectors/
 
 monitor*
 cp_*
+
+
+
+lem_text_*
+tr_sty_*
+val_sty_*
+X_test_*
+X_train_*
+X_val_*
+
+
+*.pkl
+*.npy
+*.npz
+*.parquet
+*.h5
+
+raw_html/
+backup/
+old/
+*.db-shm
+*.db
+*.db-wal
+*.pt
