@@ -1,4 +1,8 @@
 # train.py
+
+# TODO !!!!! 'FAILED_GENERATION' / 'FAILED_VALIDATION' GUARD!!!!!
+
+
 import sys
 import os
 import argparse
@@ -229,16 +233,13 @@ def main():
         print(f"\n[INFO] Skipping training. Loading model from: {save_path}")
         try:
             loaded_model = joblib.load(save_path)
-            
-            metadata = {
+            clf = loaded_model.named_steps.get('classifier', loaded_model)
+            metadata = getattr(loaded_model, 'metadata', {
                 'study_name': study_name_clean,
                 'save_path': save_path,
-                'granularity': args.granularity,
-                'tuning_strategy': args.tuning,
-                'kernel': args.kernel,
-                'score_metric': args.score,
-                'tuning_sample_size': args.tuning_sample_size,
-            }
+                'granularity': getattr(loaded_model, 'granularity', args.granularity),
+                'calibrated_threshold': getattr(loaded_model, 'optimal_threshold', 0.5),
+            })
 
             run_full_evaluation(
                 model_pipeline=loaded_model,

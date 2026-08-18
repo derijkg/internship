@@ -243,7 +243,7 @@ def run_full_evaluation(
 
     default_threshold = 0.5 if is_calibrated else 0.0
     optimal_threshold = getattr(model_pipeline, "optimal_threshold", default_threshold)
-
+    print(f"-> Active Decision Threshold: {optimal_threshold:.6f} (Is Calibrated: {is_calibrated})")
     run_standard = eval_mode in ['both', 'standard']
     run_synth = eval_mode in ['both', 'synth']
 

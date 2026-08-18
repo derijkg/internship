@@ -519,16 +519,22 @@ def prepare_classification_dataset(
   return pd.DataFrame(records)
 
 
-def get_feature_extraction_pipeline(word_tfidf_params=None, char_tfidf_params=None, 
-                                    sty_params=None, stylometrics_n_jobs=1, use_pre_lemmatized=True,
-                                    granularity='full'):
+def get_feature_extraction_pipeline(
+    word_tfidf_params=None,
+    char_tfidf_params=None,
+    sty_params=None,
+    stylometrics_n_jobs=1,
+    use_pre_lemmatized=True,
+    granularity='full',
+):
     sty_config = sty_params or {'use_stylometrics': True, 'sty_weight': 1.0}
+    default_max_df = 1.0 if granularity == 'sentence' else 0.95  # <--- DYNAMIC DEFAULT
 
     w_params = (word_tfidf_params or {}).copy()
     w_params.setdefault('ngram_range', (1, 3))
     w_params.setdefault('max_features', 50000)
     w_params.setdefault('min_df', 2)
-    w_params.setdefault('max_df', 0.95)
+    w_params.setdefault('max_df', default_max_df)
     w_params.setdefault('sublinear_tf', True)
     w_params.setdefault('norm', 'l2')
     w_params.setdefault('analyzer', 'word')
@@ -541,7 +547,7 @@ def get_feature_extraction_pipeline(word_tfidf_params=None, char_tfidf_params=No
     c_params.setdefault('ngram_range', (2, 5))
     c_params.setdefault('max_features', 50000)
     c_params.setdefault('min_df', 2)
-    c_params.setdefault('max_df', 0.95)
+    c_params.setdefault('max_df', default_max_df)
     c_params.setdefault('sublinear_tf', True)
     c_params.setdefault('norm', 'l2')
 
@@ -607,11 +613,12 @@ def get_cached_split_features(
     has_va_lemmatized = len(X_val_raw) == 0 or (isinstance(X_val_raw[0], dict) and 'text_lemmatized' in X_val_raw[0])
     actual_use_pre_lemmatized = use_pre_lemmatized and has_tr_lemmatized and has_va_lemmatized
 
+    default_max_df = 1.0 if granularity == 'sentence' else 0.95
     w_params = word_params.copy() if word_params else {}
     extractor = TextExtractor(key='text_lemmatized') if actual_use_pre_lemmatized else TextExtractor(key='text')
     w_params.setdefault('analyzer', 'word')
     w_params.setdefault('sublinear_tf', True)
-    w_params.setdefault('max_df', 0.95)
+    w_params.setdefault('max_df', default_max_df)
     w_params.setdefault('norm', 'l2')
     w_params.setdefault('stop_words', get_dutch_stopwords_lemmatized())
 
@@ -622,7 +629,7 @@ def get_cached_split_features(
     c_params = char_params.copy() if char_params else {}
     c_params.setdefault('analyzer', 'char')
     c_params.setdefault('sublinear_tf', True)
-    c_params.setdefault('max_df', 0.95)
+    c_params.setdefault('max_df', default_max_df)
     c_params.setdefault('norm', 'l2')
 
     vectorizer_char = TfidfVectorizer(**c_params)
