@@ -51,7 +51,7 @@ X_val_*
 *.pkl
 *.npy
 *.npz
-*.parquet
+
 *.h5
 
 raw_html/
