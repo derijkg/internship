@@ -61,3 +61,7 @@ old/
 *.db
 *.db-wal
 *.pt
+best_mdeberta_detector/
+cached_tokenized_dataset/
+optuna_trials/
+*.egg-info/

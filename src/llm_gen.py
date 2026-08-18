@@ -1,68 +1,46 @@
-import re
-import time
-import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
-import pandas as pd
-from tqdm import tqdm
-from bs4 import BeautifulSoup
-import nltk
-nltk.download('punkt', quiet=True)
-nltk.download('punkt_tab', quiet=True)
-from langdetect import detect, LangDetectException
-import string
-import random
-import argparse
-import json
-import pyarrow as pa
-import pyarrow.json as pj
-import pyarrow.parquet as pq
-import pyarrow.csv as pv
-import pyarrow.compute as pc
 import os
-import subprocess
-import atexit
+import sys
+import json
+import time
 import socket
+import random
+import re
 import binascii
-from ollama import Client
 import unicodedata
+import argparse
+from pathlib import Path
+from typing import List
+from collections import defaultdict
+from ollama import Client
+import subprocess
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
+import atexit
 
 # GLOBAL VARS
-BASE_DIR = Path(__file__).resolve().parent.parent
+
+BASE_DIR = Path(__file__).resolve().parent.parent #this script is in /home/gderijck/internship/src/llm_gen.py
 INPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "merged_publications.csv"
 INPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "merged_publications.parquet"
 OUTPUT_DATA_CSV = BASE_DIR / "data" / "gold" / "llm_added.csv"
 OUTPUT_DATA_PARQUET = BASE_DIR / "data" / "gold" / "llm_added.parquet"
 CHECKPOINT_PATH = BASE_DIR / "data" / "gold" / "checkpoint_rewrites.jsonl"
 
-
-# ==========================================
-# Text Normalization & Basic Cleaners
-# ==========================================
-
-def normalize_text(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    
-    # 1. Normalize unicode (compatibility decomposition followed by canonical composition)
-    text = unicodedata.normalize('NFKC', text)
-    
-    # 2. Standardize common quotation marks and dashes
-    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
-    text = text.replace('—', '-').replace('–', '-')  # Standardize em/en dashes to hyphens
-    
-    # 3. Collapse multiple whitespaces and strip leading/trailing spaces
-    text = " ".join(text.split())
-    return text
-
-
-# ==========================================
-# Ollama Server Management
-# ==========================================
-
+# generation
+# ollama server functions
 def kill_process_on_port(port: int):
-    """Attempts to find and terminate any process listening on the specified port."""
+    """
+    Attempts to find and terminate any process listening on the specified port.
+    Safely targets only your specific port to avoid affecting other shared processes.
+    """
+    import subprocess
+    import os
+    import signal
+    import time
+    
     try:
+        # 'lsof -t' returns only the raw PID(s) bound to the port
         result = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, check=False)
         pids = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
         
@@ -70,12 +48,12 @@ def kill_process_on_port(port: int):
             pid = int(pid_str)
             print(f"Found active process (PID {pid}) on port {port}. Force-terminating...")
             try:
-                os.kill(pid, subprocess.signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)
             except OSError as e:
                 print(f"Could not kill PID {pid}: {e}")
         
         if pids:
-            time.sleep(1.5)
+            time.sleep(1.5)  # Give the operating system a brief moment to release the port socket
     except Exception as e:
         print(f"Warning: Port cleanup helper failed: {e}")
 
@@ -111,7 +89,8 @@ def start_ollama_server(port: int = 11435, gpu_id: str = None) -> subprocess.Pop
         ollama_executable = str(system_bin_alt)
     else:
         ollama_executable = "ollama"
-        print("Warning: GPU-enabled native Ollama binary not found in standard locations. Falling back to PATH.")
+        print("Warning: GPU-enabled native Ollama binary not found in standard locations.")
+        print("Falling back to PATH.")
 
     cuda_libs = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
     user_libs = str(Path.home() / ".local" / "lib" / "ollama")
@@ -180,10 +159,8 @@ def unload_model(model_name: str):
         print(f"Warning: Could not explicitly unload '{model_name}': {e}")
 
 
-# ==========================================
-# Checkpoint Utilities
-# ==========================================
-
+# GENERATION proper
+# after generation add to checkpoint.jsonl
 def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str):
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,342 +184,53 @@ def append_to_checkpoint(checkpoint_path: Path, task: dict, rewritten_text: str)
             pass
 
 
-# ==========================================
-# Percentage Task Verification & Strategies
-# ==========================================
-
+# MODIFIED: Redesigned validator for continuous segment percentage rewriting and context leakage prevention
 def validate_percentage_rewrite(
     original_sents: list[str], 
-    raw_output_text: str, 
-    tagged_groups: list[list[int]]
+    candidate_rewrite: str, 
+    start_idx: int,
+    end_idx: int
 ) -> tuple[bool, str, str | None]:
-    """Fallback standard validator for baseline XML strategy."""
-    if not raw_output_text:
+    if not candidate_rewrite or not candidate_rewrite.strip():
         return False, "Empty response from the model", None
 
-    matches = re.findall(r'<target_(\d+)>(.*?)</target_\1>', raw_output_text, re.DOTALL | re.IGNORECASE)
-    
-    rewrites_map = {}
-    for t_id_str, text in matches:
-        text_clean = text.strip()
-        if t_id_str and text_clean:
-            try:
-                parsed_id = int(t_id_str)
-                rewrites_map[parsed_id] = text_clean
-            except (ValueError, TypeError):
-                continue
+    candidate_clean = candidate_rewrite.strip()
+    target_block = " ".join([original_sents[i].strip() for i in range(start_idx, end_idx)]).strip()
 
-    stitched_sentences = list(original_sents)
-    
-    for idx, group in enumerate(tagged_groups, 1):
-        rewrite_text = rewrites_map.get(idx)
-        if not rewrite_text:
-            return False, f"Missing target rewrite for target ID {idx} (Verify tag syntax in LLM output)", None
+    # 1. Verify changes were made compared to the normalized original block
+    if normalize_text(candidate_clean) == normalize_text(target_block):
+        return False, "Target segment was not modified by the model.", None
 
-        original_block = " ".join([original_sents[s_idx].strip() for s_idx in group])
-        original_clean = original_block.strip()
-        
-        if normalize_text(rewrite_text) == normalize_text(original_clean):
-            return False, f"Target block {idx} was not modified by the model.", None
-            
-        stitched_sentences[group[0]] = rewrite_text
-        for subsequent_idx in group[1:]:
-            stitched_sentences[subsequent_idx] = ""
+    # 2. Check for context leakage (untargeted surrounding sentences included in output)
+    prefix_sents = original_sents[:start_idx]
+    suffix_sents = original_sents[end_idx:]
+    norm_candidate = normalize_text(candidate_clean)
 
-    final_abstract = " ".join([sent for sent in stitched_sentences if sent])
+    for prefix in prefix_sents:
+        clean_pref = normalize_text(prefix)
+        if len(clean_pref) >= 15 and clean_pref in norm_candidate:
+            return False, f"Output leaked untargeted preceding sentence: '{prefix[:30]}...'", None
+
+    for suffix in suffix_sents:
+        clean_suff = normalize_text(suffix)
+        if len(clean_suff) >= 15 and clean_suff in norm_candidate:
+            return False, f"Output leaked untargeted succeeding sentence: '{suffix[:30]}...'", None
+
+    # 3. Check for full-abstract rewrite over-generation when only a partial segment was targeted
+    total_sentences = len(original_sents)
+    targeted_sentences = end_idx - start_idx
+    if targeted_sentences < total_sentences:
+        full_abstract_len = len(" ".join(original_sents))
+        if len(candidate_clean) > 0.85 * full_abstract_len and len(candidate_clean) > 2.0 * len(target_block):
+            return False, "Output appears to rewrite the entire abstract instead of just the target segment.", None
+
+    # ADDED: Stitch original untargeted sentences and new rewritten segment into final abstract
+    stitched_sentences = list(original_sents[:start_idx]) + [candidate_clean] + list(original_sents[end_idx:])
+    final_abstract = " ".join([sent.strip() for sent in stitched_sentences if sent.strip()])
     return True, "Success", final_abstract
 
 
-def validate_json_method(
-    original_sents: list[str], 
-    raw_output_text: str, 
-    tagged_groups: list[list[int]]
-) -> tuple[bool, str, str | None]:
-    """Validates and parses JSON structured map output strategy."""
-    try:
-        clean_output = raw_output_text.strip()
-        # Clean markdown wrappers if present
-        if clean_output.startswith("```"):
-            clean_output = re.sub(r'^```(?:json)?\s*', '', clean_output)
-            clean_output = re.sub(r'\s*```$', '', clean_output)
-        
-        data = json.loads(clean_output)
-    except Exception as e:
-        return False, f"JSON parsing failed: {e}", None
-
-    rewrites_map = {}
-    for k, v in data.items():
-        try:
-            rewrites_map[int(k)] = str(v).strip()
-        except (ValueError, TypeError):
-            continue
-
-    stitched_sentences = list(original_sents)
-    for idx, group in enumerate(tagged_groups, 1):
-        rewrite_text = rewrites_map.get(idx)
-        if not rewrite_text:
-            return False, f"Missing target ID {idx} in JSON mapping.", None
-            
-        original_block = " ".join([original_sents[s_idx].strip() for s_idx in group])
-        if normalize_text(rewrite_text) == normalize_text(original_block):
-            return False, f"Target block {idx} was not modified.", None
-            
-        stitched_sentences[group[0]] = rewrite_text
-        for sub_idx in group[1:]:
-            stitched_sentences[sub_idx] = ""
-
-    final_abstract = " ".join([s for s in stitched_sentences if s])
-    return True, "Success", final_abstract
-
-
-def run_isolated_blocks_method(
-    client, 
-    model: str, 
-    original_sents: list[str], 
-    tagged_groups: list[list[int]], 
-    context: str, 
-    seed: int = 42
-) -> tuple[bool, str, str | None]:
-    """Processes each segment individually in context to enforce precise edits."""
-    stitched_sentences = list(original_sents)
-    
-    for idx, group in enumerate(tagged_groups, 1):
-        target_text = " ".join([original_sents[s_idx].strip() for s_idx in group])
-        
-        prompt = (
-            f"You are a professional Dutch editor.\n"
-            f"We are editing a Dutch scientific abstract. Below is the full abstract context:\n"
-            f"\"\"\"\n{context}\n\"\"\"\n\n"
-            f"Please rewrite the following specific segment from this abstract to improve style, flow, or grammar, while maintaining its original meaning and context:\n"
-            f"\"\"\"\n{target_text}\n\"\"\"\n\n"
-            f"Provide ONLY the rewritten segment. Do not include any tags, conversational intros, or explanations."
-        )
-        
-        try:
-            response = client.generate(
-                model=model,
-                prompt=prompt,
-                think=False,
-                options={"seed": seed}
-            )
-            rewrite_text = response['response'].strip()
-            rewrite_text = rewrite_text.replace('\x00','').replace('\u0000','')
-            if rewrite_text.startswith('"') and rewrite_text.endswith('"'):
-                rewrite_text = rewrite_text[1:-1]
-            rewrite_text = normalize_text(rewrite_text)
-            
-            if not rewrite_text or rewrite_text == normalize_text(target_text):
-                return False, f"Isolated target block {idx} was not modified or was empty", None
-            
-            stitched_sentences[group[0]] = rewrite_text
-            for sub_idx in group[1:]:
-                stitched_sentences[sub_idx] = ""
-        except Exception as e:
-            return False, f"Error generating block {idx}: {e}", None
-            
-    final_abstract = " ".join([s for s in stitched_sentences if s])
-    return True, "Success", final_abstract
-
-
-# ==========================================
-# Debug & Validation Comparison Suite
-# ==========================================
-
-def run_percentage_comparison_suite(
-    table: pa.Table, 
-    models_list: list[str], 
-    debug_count: int, 
-    port: int = 11435, 
-    gpu_id: str = None
-):
-    """Executes different strategies on raw lines side-by-side and prints/saves a compared report."""
-    start_ollama_server(port=port, gpu_id=gpu_id)
-    host_env = os.environ.get("OLLAMA_HOST", "127.0.0.1:11435")
-    if not host_env.startswith("http://"):
-        host_env = f"http://{host_env}"
-        
-    client = Client(host=host_env, timeout=300)
-    df = table.to_pandas()
-    
-    # Filter rows with at least 3 sentences so percentage tagging is meaningful
-    valid_rows = []
-    for _, row in df.iterrows():
-        sents = row.get('abstract_sentence')
-        if isinstance(sents, list) and len(sents) >= 3:
-            valid_rows.append(row)
-            if len(valid_rows) >= debug_count:
-                break
-                
-    if not valid_rows:
-        print("Error: No valid rows containing at least 3 sentences were located for comparisons.")
-        return
-
-    print(f"\nEvaluating {len(valid_rows)} row samples using: {models_list}")
-    comparison_records = []
-    pct = 50  # Fix comparative percentage bounds at 50%
-    
-    for row in valid_rows:
-        row_id = row.get('_id') or row.get('id') or "N/A"
-        abstract_sentence = row['abstract_sentence']
-        abstract = row.get('abstract', '')
-        num_sentences = len(abstract_sentence)
-        
-        # Setup targets indices
-        seed_str = f"{row_id}_{pct}".encode("utf-8")
-        seed = binascii.crc32(seed_str)
-        rng = random.Random(seed)
-        num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
-        tagged_indices = set(rng.sample(range(num_sentences), num_to_tag))
-
-        groups = []
-        sorted_indices = sorted(list(tagged_indices))
-        if sorted_indices:
-            current_group = [sorted_indices[0]]
-            for idx in sorted_indices[1:]:
-                if idx == current_group[-1] + 1:
-                    current_group.append(idx)
-                else:
-                    groups.append(current_group)
-                    current_group = [idx]
-            groups.append(current_group)
-            
-        # Strategy A preparation: Tagged inline segments
-        annotated_parts = []
-        group_starts = {g[0]: g for g in groups}
-        group_to_id = {g[0]: idx + 1 for idx, g in enumerate(groups)}
-        i = 0
-        while i < num_sentences:
-            if i in group_starts:
-                group = group_starts[i]
-                t_id = group_to_id[i]
-                block_text = " ".join([abstract_sentence[idx] for idx in group])
-                annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
-                i += len(group)
-            else:
-                annotated_parts.append(abstract_sentence[i])
-                i += 1
-        annotated_abstract = " ".join(annotated_parts)
-
-        # Strategy B preparation: Raw mapping targets
-        targets_desc = []
-        for idx, g in enumerate(groups, 1):
-            block_text = " ".join([abstract_sentence[pi] for pi in g])
-            targets_desc.append(f"Target {idx}: \"{block_text}\"")
-        targets_list_str = "\n".join(targets_desc)
-
-        for model in models_list:
-            # --- Method 1: Inline XML ---
-            xml_prompt = (
-                "You are a professional Dutch editor.\n"
-                "Your task is to rewrite only the text segments enclosed in numbered target tags (e.g., <target_1>...</target_1>) to improve them.\n"
-                "Ensure you retain the XML target tags in your final response precisely where the modifications were placed."
-            )
-            print(f"Evaluating row ID {row_id} with model {model} (Method: Inline XML)...")
-            t0 = time.time()
-            try:
-                xml_response = client.generate(
-                    model=model,
-                    system=xml_prompt,
-                    prompt=annotated_abstract,
-                    think=False,
-                    options={"seed": 42}
-                )
-                raw_xml = xml_response['response'].strip()
-                duration = time.time() - t0
-                is_valid, reason, final_text = validate_percentage_rewrite(abstract_sentence, raw_xml, groups)
-            except Exception as e:
-                raw_xml, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
-                duration = time.time() - t0
-
-            comparison_records.append({
-                "row_id": row_id,
-                "model": model,
-                "method": "inline_xml",
-                "duration_sec": duration,
-                "raw_response": raw_xml,
-                "stitched_output": final_text,
-                "is_valid": is_valid,
-                "error_reason": reason
-            })
-
-            # --- Method 2: Structured JSON ---
-            json_prompt = (
-                "You are a professional Dutch editor.\n"
-                "Your task is to rewrite the text segments corresponding to the following target IDs to improve grammar, vocabulary, and flow:\n"
-                f"{targets_list_str}\n\n"
-                "Provide your edits strictly in a raw JSON dictionary format where keys are the target IDs as strings (e.g., \"1\", \"2\") and values are the edited text. Do not output anything else."
-            )
-            print(f"Evaluating row ID {row_id} with model {model} (Method: Structured JSON)...")
-            t0 = time.time()
-            try:
-                json_response = client.generate(
-                    model=model,
-                    prompt=json_prompt,
-                    think=False,
-                    options={"seed": 42}
-                )
-                raw_json = json_response['response'].strip()
-                duration = time.time() - t0
-                is_valid, reason, final_text = validate_json_method(abstract_sentence, raw_json, groups)
-            except Exception as e:
-                raw_json, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
-                duration = time.time() - t0
-
-            comparison_records.append({
-                "row_id": row_id,
-                "model": model,
-                "method": "structured_json",
-                "duration_sec": duration,
-                "raw_response": raw_json,
-                "stitched_output": final_text,
-                "is_valid": is_valid,
-                "error_reason": reason
-            })
-
-            # --- Method 3: Isolated Blocks (Query-per-block) ---
-            print(f"Evaluating row ID {row_id} with model {model} (Method: Isolated Blocks)...")
-            t0 = time.time()
-            try:
-                is_valid, reason, final_text = run_isolated_blocks_method(
-                    client, model, abstract_sentence, groups, abstract, seed=42
-                )
-                duration = time.time() - t0
-                raw_isolated = "[MULTIPLE SEGMENT QUERIES RUN]"
-            except Exception as e:
-                raw_isolated, is_valid, reason, final_text = f"ERROR: {e}", False, str(e), None
-                duration = time.time() - t0
-
-            comparison_records.append({
-                "row_id": row_id,
-                "model": model,
-                "method": "isolated_blocks",
-                "duration_sec": duration,
-                "raw_response": raw_isolated,
-                "stitched_output": final_text,
-                "is_valid": is_valid,
-                "error_reason": reason
-            })
-            
-    comp_df = pd.DataFrame(comparison_records)
-    comparison_out_csv = BASE_DIR / "data" / "gold" / "pct_method_comparison.csv"
-    comparison_out_csv.parent.mkdir(parents=True, exist_ok=True)
-    comp_df.to_csv(comparison_out_csv, index=False)
-    
-    print("\n====================================================")
-    print("          PERCENTAGE TASK METHOD COMPARISON")
-    print("====================================================")
-    summary_cols = ["row_id", "model", "method", "duration_sec", "is_valid", "error_reason"]
-    print(comp_df[summary_cols].to_string(index=False))
-    print("====================================================")
-    print(f"Full evaluation details saved to: {comparison_out_csv}")
-    
-    for model in models_list:
-        unload_model(model)
-
-
-# ==========================================
-# Task Alignment & Queue Utilities
-# ==========================================
+ALL_MODELS = ['gemma4:e4b', 'qwen3.5:4b', 'qwen3.6:27b', 'gemma4:26b']
 
 def prepare_tasks(
     table: pa.Table, 
@@ -685,9 +373,11 @@ def prepare_tasks(
         print(f" Discarded (Corrupted/Malformed lines)     : {corrupted_count}")
         print("====================================================\n")
 
+
+    # CREATE TASKS FOR REMAINING
     tasks = []
     for row in rows:
-        row_id = row.get(id_key)
+        row_id = str(row.get(id_key))
         abstract = row.get('abstract')
         abstract_sentence = row.get('abstract_sentence')
 
@@ -696,6 +386,7 @@ def prepare_tasks(
 
         num_sentences = len(abstract_sentence)
 
+        # 1. Sentence tasks (if sentence tasks are enabled)
         for model in models_list:
             col_name = f'{model}_single'
             if col_name not in row or not isinstance(row[col_name], list) or len(row[col_name]) != num_sentences:
@@ -712,55 +403,40 @@ def prepare_tasks(
                         "context": abstract
                     })
 
-            for pct in percentages:
-                col_name = f"{model}_{pct}"
-                if col_name not in row or not row[col_name]:
-                    row[col_name] = None
-                    seed_str = f"{row_id}_{pct}".encode("utf-8")
-                    seed = binascii.crc32(seed_str)
-                    rng = random.Random(seed)
-                    num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
-                    tagged_indices = set(rng.sample(range(num_sentences), num_to_tag))
+        # 2. Percentage tasks: DETERMINISTICALLY ASSIGN EXACTLY 1 MODEL PER (ROW, PCT)
+        for pct in percentages:
+            seed_str = f"{row_id}_{pct}".encode("utf-8")
+            seed = binascii.crc32(seed_str)
+            
+            # Pick exactly ONE model deterministically based on seed
+            assigned_model = ALL_MODELS[seed % len(ALL_MODELS)]
+            col_name = f"{assigned_model}_{pct}"
 
-                    groups = []
-                    sorted_indices = sorted(list(tagged_indices))
-                    if sorted_indices:
-                        current_group = [sorted_indices[0]]
-                        for idx in sorted_indices[1:]:
-                            if idx == current_group[-1] + 1:
-                                current_group.append(idx)
-                            else:
-                                groups.append(current_group)
-                                current_group = [idx]
-                        groups.append(current_group)
-                    
-                    annotated_parts = []
-                    group_starts = {g[0]: g for g in groups}
-                    group_to_id = {g[0]: idx + 1 for idx, g in enumerate(groups)}
-                    
-                    i = 0
-                    while i < num_sentences:
-                        if i in group_starts:
-                            group = group_starts[i]
-                            t_id = group_to_id[i]
-                            block_text = " ".join([abstract_sentence[idx] for idx in group])
-                            annotated_parts.append(f"<target_{t_id}>{block_text}</target_{t_id}>")
-                            i += len(group)
-                        else:
-                            annotated_parts.append(abstract_sentence[i])
-                            i += 1
-                    
-                    annotated_abstract = " ".join(annotated_parts)
+            if col_name not in row or not row[col_name]:
+                row[col_name] = None
+                rng = random.Random(seed)
+                
+                num_to_tag = max(1, round(num_sentences * (pct / 100.0)))
+                num_to_tag = min(num_to_tag, num_sentences)
+                max_start_idx = num_sentences - num_to_tag
+                start_idx = rng.randint(0, max_start_idx)
+                end_idx = start_idx + num_to_tag
 
-                    tasks.append({
-                        "id": row_id,
-                        "type": "percentage",
-                        "model": model,
-                        "percentage": pct,
-                        "text": annotated_abstract,
-                        'tagged_groups': groups
-                    })
+                target_segment = " ".join([abstract_sentence[i].strip() for i in range(start_idx, end_idx)])
 
+                tasks.append({
+                    "id": row_id,
+                    "type": "percentage",
+                    "model": assigned_model, # Only create task for assigned model
+                    "percentage": pct,
+                    "text": target_segment,
+                    "full_context": abstract,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx
+                })
+
+        # 3. Full abstract tasks (if full tasks are enabled)
+        for model in models_list:
             col_name = f"{model}_full"
             if col_name not in row or not row[col_name]:
                 row[col_name] = None
@@ -772,6 +448,7 @@ def prepare_tasks(
                 })
 
     return tasks, rows
+
 
 
 def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
@@ -795,12 +472,8 @@ def apply_rewrite_to_row(row: dict, task: dict, rewritten: str):
         row[f"{model}_full"] = rewritten
 
 
-# ==========================================
-# Core Engine Runners
-# ==========================================
-
-def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42):
-    """Sends text to Ollama for rewriting."""
+def rewrite_sentence(client, model_to_run, system_prompt, sentence, seed=42, response_format=None):
+    """Sends text to Ollama for rewriting with optional JSON schema constraints."""
     response = client.generate(
         model=model_to_run,
         system=system_prompt,
@@ -870,11 +543,20 @@ def run_generation(
             current_seed = 42 + attempt
                 
             try:
+                # MODIFIED: Format user prompt dynamically for percentage rewrite vs standard sentence/full abstract
+                if t_type == "percentage":
+                    prompt_input = (
+                        f"FULL ABSTRACT (FOR CONTEXT ONLY):\n{task['full_context']}\n\n"
+                        f"SEGMENT TO REWRITE:\n{task['text']}"
+                    )
+                else:
+                    prompt_input = text
+
                 candidate_rewrite = rewrite_sentence(
                     client, 
                     model, 
                     system_prompt, 
-                    text, 
+                    prompt_input, 
                     seed=current_seed,
                 )
             except Exception as e:
@@ -890,13 +572,16 @@ def run_generation(
             
             if t_type == 'percentage':
                 original_sentences = row['abstract_sentence']
-                tagged_groups = task['tagged_groups']
+                start_idx = task['start_idx']
+                end_idx = task['end_idx']
                 
                 try:
+                    # MODIFIED: Updated validator arguments for bounds-based validation
                     is_valid, reason, stitched_text = validate_percentage_rewrite(
                         original_sentences, 
                         candidate_rewrite,  
-                        tagged_groups
+                        start_idx,
+                        end_idx
                     )
                 except Exception as eval_err:
                     is_valid = False
@@ -905,12 +590,12 @@ def run_generation(
 
                 if is_valid:
                     rewritten = stitched_text
-                    print(f'ORIGINAL: {text}\n')
-                    print(f'REWRITTEN: {rewritten}')
+                    print(f'ORIGINAL SEGMENT ({start_idx}:{end_idx}): {text}\n')
+                    print(f'REWRITTEN STITCHED ABSTRACT: {rewritten}')
                     break
                 else:
                     print(f"  [Warning - Attempt {attempt+1}/{max_attempts} Failed] {reason}.")
-                    print(f"  [DEBUG - Prompt Sent to LLM]:\n{text}")
+                    print(f"  [DEBUG - Prompt Sent to LLM]:\n{prompt_input}")
                     print(f"  [DEBUG - Raw Candidate Response]:\n{candidate_rewrite}")
                     print("-" * 50)
                     
@@ -962,10 +647,22 @@ def run_generation(
     return rows
 
 
+def normalize_text(text):
+    if not isinstance(text, str):
+        return text
+    
+    text = unicodedata.normalize('NFKC', text)
+    text = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+    text = text.replace('—', '-').replace('–', '-')
+    text = " ".join(text.split())
+    
+    return text
+
+
 def get_models_list():
     CALC_MODEL_MAPPING = {
         'calc12': ['gemma4:e4b', 'qwen3.5:4b'],
-        'calc11': ['qwen3.6:27b','gemma4:26b'],
+        'calc11': ['gemma4:e4b', 'qwen3.5:4b', 'qwen3.6:27b', 'gemma4:26b'],
     }
     try:
         current_host = socket.gethostname().split('.')[0]
@@ -982,6 +679,57 @@ def get_models_list():
     return selected_models
 
 
+def generate_priority(tasks: list[dict], rows: list[dict], models_list: list[str]) -> list[dict]:
+    if not tasks:
+        return []
+
+    # Filter tasks assigned to models active on this host
+    host_tasks = [t for t in tasks if t["model"] in models_list]
+
+    model_order = {model: idx for idx, model in enumerate(models_list)}
+
+    def get_column_rank(task: dict) -> int:
+        t_type = task.get("type")
+        pct = task.get("percentage")
+        if t_type == "percentage":
+            if pct == 25:
+                return 1
+            elif pct == 50:
+                return 2
+            elif pct == 75:
+                return 3
+            return 4
+        elif t_type == "sentence":
+            return 5
+        elif t_type == "full_abstract":
+            return 6
+        return 99
+
+    ordered_tasks = sorted(
+        host_tasks,
+        key=lambda t: (
+            model_order.get(t["model"], 999),
+            get_column_rank(t),
+            str(t.get("id")),
+            t.get("sent_idx") if t.get("sent_idx") is not None else -1
+        )
+    )
+
+    print(f"\n[DETERMINISTIC BALANCED PRIORITY] Re-ordered {len(ordered_tasks)} tasks on host:")
+    seen_groups = []
+    for t in ordered_tasks:
+        group_key = f"{t['model']} (Type: {t['type']}, Pct: {t.get('percentage')})"
+        if not seen_groups or seen_groups[-1][0] != group_key:
+            seen_groups.append([group_key, 1])
+        else:
+            seen_groups[-1][1] += 1
+
+    for group, count in seen_groups:
+        print(f"  --> {group}: {count} tasks")
+
+    return ordered_tasks
+
+
 def generation_main(
     table: pa.Table,
     models_list: list[str] = None,
@@ -995,6 +743,7 @@ def generation_main(
     task_steps: List = None,
     priority: bool = False
 ) -> list[dict]:
+    # MODIFIED: Updated system prompt instructions for percentage rewrites
     system_prompts = {
         "sentence": (
             "You are a professional Dutch editor.\n"
@@ -1003,7 +752,9 @@ def generation_main(
         ),
         "percentage": (
             "You are a professional Dutch editor.\n"
-            "Your task is to rewrite only the text segments enclosed in numbered target tags (e.g., <target_1>...</target_1>, <target_3>...</target_3>) so as to improve them.\n"
+            "Your task is to rewrite ONLY the target segment of the abstract provided to improve its phrasing, flow, and quality.\n"
+            "You are provided with the full abstract for contextual background only.\n"
+            "CRITICAL: Output ONLY the rewritten target segment. Do NOT output any other sentences, conversational filler, or tags."
         ),
         "full_abstract": (
             "You are a professional Dutch editor.\n"
@@ -1037,124 +788,20 @@ def generation_main(
         tasks = [t for t in tasks if t['type'] != 'percentage']
 
     if priority:
-        print("\n[PRIORITY MODE ACTIVE] Filtering tasks for priority generation...")
-        import binascii
-        import random
-
-        all_possible_models = ['gemma4:26b', 'gemma4:e4b', 'qwen3.6:27b', 'qwen3.5:4b']
-        id_key = next((k for k in ['_id', 'id', 'page_link', 'synthetic_id'] if rows and k in rows[0]), None)
-        rows_map = {str(row[id_key]): row for row in rows} if id_key else {}
-
-        prioritized_tasks = []
-
-        # -------------------------------------------------------------
-        # 1. SENTENCE REWRITE PRIORITY
-        # -------------------------------------------------------------
-        has_sentence_tasks = any(t["type"] == "sentence" for t in tasks)
-        if has_sentence_tasks:
-            print("  -> Processing Priority for: Sentence Rewrites")
-            processed_sentence_ids = set()
-
-            for row_id_str, row in rows_map.items():
-                if row_id_str in processed_sentence_ids:
-                    continue
-                processed_sentence_ids.add(row_id_str)
-
-                abstract_sentences = row.get("abstract_sentence")
-                if not isinstance(abstract_sentences, list) or not abstract_sentences:
-                    continue
-                num_sents = len(abstract_sentences)
-
-                # Count completed sentence rewrites per model
-                model_completion = {}
-                for model in all_possible_models:
-                    col_name = f"{model}_single"
-                    col_val = row.get(col_name)
-                    if isinstance(col_val, list) and len(col_val) == num_sents:
-                        completed = sum(
-                            1 for s in col_val
-                            if s is not None and s not in ("FAILED_GENERATION", "FAILED_VALIDATION")
-                        )
-                    else:
-                        completed = 0
-                    model_completion[model] = completed
-
-                # Skip if at least 1 model already has 100% of sentences rewritten
-                already_complete = any(count == num_sents for count in model_completion.values())
-                if already_complete:
-                    continue
-
-                # Find max completion count & candidate models tied for top
-                max_completed = max(model_completion.values())
-                candidate_models = [m for m, count in model_completion.items() if count == max_completed]
-
-                # Deterministically select model (tie-breaker)
-                seed_str = f"sentence_priority_{row_id_str}".encode("utf-8")
-                row_seed = binascii.crc32(seed_str)
-                row_rng = random.Random(row_seed)
-                selected_model = row_rng.choice(candidate_models)
-
-                # Queue missing sentence tasks for selected_model
-                matching_sentence_tasks = [
-                    t for t in tasks
-                    if t["type"] == "sentence"
-                    and str(t["id"]) == row_id_str
-                    and t["model"] == selected_model
-                ]
-                prioritized_tasks.extend(matching_sentence_tasks)
-
-        # -------------------------------------------------------------
-        # 2. FULL ABSTRACT REWRITE PRIORITY
-        # -------------------------------------------------------------
-        has_full_tasks = any(t["type"] == "full_abstract" for t in tasks)
-        if has_full_tasks:
-            print("  -> Processing Priority for: Full Abstract Rewrites")
-            processed_full_ids = set()
-
-            for row_id_str, row in rows_map.items():
-                if row_id_str in processed_full_ids:
-                    continue
-                processed_full_ids.add(row_id_str)
-
-                # Check if ANY model already has a full abstract rewrite
-                already_has_rewrite = False
-                if row:
-                    for model in all_possible_models:
-                        col_val = row.get(f"{model}_full")
-                        if col_val and col_val not in ("FAILED_GENERATION", "FAILED_VALIDATION"):
-                            already_has_rewrite = True
-                            break
-
-                if already_has_rewrite:
-                    continue
-
-                # Deterministically pick 1 model out of 4 for full abstract
-                seed_str = f"full_priority_{row_id_str}".encode("utf-8")
-                row_seed = binascii.crc32(seed_str)
-                row_rng = random.Random(row_seed)
-                selected_model = row_rng.choice(all_possible_models)
-
-                # Queue full abstract task for selected_model
-                matching_full_tasks = [
-                    t for t in tasks
-                    if t["type"] == "full_abstract"
-                    and str(t["id"]) == row_id_str
-                    and t["model"] == selected_model
-                ]
-                prioritized_tasks.extend(matching_full_tasks)
-
-        tasks = prioritized_tasks
+        print("\n[PRIORITY MODE ACTIVE] Re-ordering tasks to dynamically rebalance dataset and minimize model swaps...")
+        tasks = generate_priority(tasks, rows, models_list)
 
     if not models_list:
         models_list = list(dict.fromkeys([t["model"] for t in tasks]))
         
-    model_order = {model: idx for idx, model in enumerate(models_list)}
-    type_order = {"sentence": 0, "percentage": 2, "full_abstract": 1}
-    
-    tasks.sort(key=lambda x: (
-        model_order.get(x["model"], 99),
-        type_order.get(x["type"], 99)
-    ))
+    if not priority:
+        model_order = {model: idx for idx, model in enumerate(models_list)}
+        type_order = {"sentence": 0, "percentage": 2, "full_abstract": 1}
+        
+        tasks.sort(key=lambda x: (
+            model_order.get(x["model"], 99),
+            type_order.get(x["type"], 99)
+        ))
     
     if debug_mode:
         print(f"\n[DEBUG MODE ACTIVE] Filtering tasks: Keeping exactly {debug_count} tasks of each combination.")
@@ -1178,10 +825,6 @@ def generation_main(
     return updated_rows
 
 
-# ==========================================
-# Orchestrator Entrypoint
-# ==========================================
-
 def main():
     parser = argparse.ArgumentParser(description="Multi-source NLP pipeline orchestrator")
     parser.add_argument(
@@ -1195,7 +838,7 @@ def main():
     parser.add_argument(
         '--priority',
         action='store_true',
-        help='Prioritize 1 full abstract rewrite per row with random model.'
+        help='Prioritize rewrites using deficit balancing, grouped into continuous model blocks.'
     )
     parser.add_argument(
         '--tasks', 
@@ -1205,18 +848,7 @@ def main():
         choices=['sentence', 'percentage', 'full'], 
         help="Type of tasks to perform."
     )
-    parser.add_argument('--debug', action='store_true', help="Run in standard debug mode (fewer tasks)")
-    parser.add_argument(
-        '--debug-pct-compare', 
-        action='store_true', 
-        help="Run structural percentage task strategies comparison suite."
-    )
-    parser.add_argument(
-        '--debug-count', 
-        type=int, 
-        default=3, 
-        help="Number of samples to run during debug comparisons. Default: 3"
-    )
+    parser.add_argument('--debug', action='store_true', help="Run the LLM generation in debug mode (fewer tasks)")
     parser.add_argument(
         '--format', 
         type=str, 
@@ -1244,28 +876,14 @@ def main():
         sys.exit(1)
 
     df = table.to_pandas()
-    
-    # -------------------------------------------------------------
-    # Parsing List Elements (JSON Lists or ' | ' pipe-separated)
-    # -------------------------------------------------------------
     for col in df.columns:
         if df[col].dtype == object:
-            non_nulls = df[col].dropna()
-            first_val = non_nulls.iloc[0] if not non_nulls.empty else None
-            
-            if isinstance(first_val, str):
-                first_val_stripped = first_val.strip()
-                if first_val_stripped.startswith('['):
-                    try:
-                        df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
-                    except Exception:
-                        pass
-                # #AD: Safely parses lists that were written to CSV formatted with the ' | ' pipe delimiter
-                elif col in ['abstract_sentence', 'keywords'] or col.endswith('_single'):
-                    df[col] = df[col].apply(
-                        lambda x: [s.strip() for s in x.split('|')] if isinstance(x, str) and '|' in x
-                        else (x if isinstance(x, list) else ([x] if pd.notna(x) and x != "" else []))
-                    )
+            first_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+            if isinstance(first_val, str) and first_val.strip().startswith('['):
+                try:
+                    df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
+                except Exception:
+                    pass
 
     if args.source:
         print(f"Filtering dataset for source: {args.source}")
@@ -1287,21 +905,11 @@ def main():
     if 'percentage' in args.tasks:
         percentages = [25, 50, 75]
 
-    if args.debug or args.debug_pct_compare or args.priority:
+    if args.debug:
         print("[DEBUG CONFIG] Allocating complete multi-model test suite.")
         active_models_list = ['qwen3.5:4b', 'qwen3.6:27b', 'gemma4:e4b', 'gemma4:26b']
     else:
         active_models_list = get_models_list()
-
-    # #AD: Activates comparative validation execution path if debug comparative suite is specified
-    if args.debug_pct_compare:
-        print(f"Running comparative percentage rewrite suite on {args.debug_count} abstracts.")
-        run_percentage_comparison_suite(
-            table=active_table,
-            models_list=active_models_list,
-            debug_count=args.debug_count
-        )
-        sys.exit(0)
 
     print("Starting LLM generation pipeline...")
     updated_rows = generation_main(
